@@ -10,7 +10,7 @@
 A single Tampermonkey userscript for **XenForo 2** forums that adds two tools to thread pages:
 
 1. **Reaction sort** — fetches every page of the thread (sequentially, politely, cached in IndexedDB), then reorders the posts you see by reaction count, descending. Zero-reaction posts go last; equal counts keep thread order. Click again to restore the exact original order.
-2. **Media panel** — a right-docked drawer panel with two tabs: **Media** (grid of embedded images + videos, with **All / Image / Video** sub-tabs) and **Links** (external http(s) links from post bodies, same-host/profile/permalink links filtered out, grouped per post, with search + user/domain column filters). Items are labeled `[post#] author` and fill in progressively while pages download.
+2. **Media panel** — a right-docked drawer panel with two tabs: **Media** (grid of embedded images + videos, with **All / Image / Video** sub-tabs) and **Links** (external http(s) links from post bodies, same-host/profile/permalink links filtered out, grouped per post, with search + user/domain column filters). Items are labeled `[post#] author` and fill in progressively while pages download. Media and links are collected from each post's **own content only** — anything inside a quote block is skipped, so a reply quoting media does not duplicate it.
 
 Built and validated against XenForo 2 markup (probe date 2026-10-29). No admin access, no API keys, no server — everything runs client-side in your browser.
 
@@ -80,6 +80,7 @@ Validated against stock XF2 markup. If your style/add-ons rename a class, overri
 | `reactionsLink` | `a.reactionsBar-link` | Element whose text holds the count ("A, B and 12 others" / "A, B và 12 người khác") |
 | `image` | `img.bbImage` | Embedded image |
 | `attachment` | `a[href*="attachments"]` | XF attachment link — scanned across the whole post (XF renders attachment blocks outside `.bbWrapper`); video extensions route to Videos |
+| `quote` | `blockquote.bbCodeBlock--quote` | Quoted content inside a post — media/links inside it are skipped (they belong to the quoted post, not this one) |
 | `pageNav` | `.pageNav` | Pagination block (page count = highest page number found) |
 | `pageNavPage` | `.pageNav-page` | A single page-number element |
 | `toolbar` | `.p-title-pageAction, .p-title .buttonGroup, .p-title` | Primary toolbar button anchor (first match wins) |

@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         xf-thread-tools
 // @namespace    xf-thread-tools
-// @version      0.6.2
+// @version      0.6.3
 // @description  XenForo 2: sort thread posts by reaction count across all pages (cached) + floating media panel (images / external links).
 // @author       xf-thread-tools
 // @match        *://*/threads/*
@@ -47,6 +47,7 @@
     reactionsLink: 'a.reactionsBar-link',
     image: 'img.bbImage',
     attachment: 'a[href*="attachments"]',
+    quote: 'blockquote.bbCodeBlock--quote',
     pageNav: '.pageNav',
     pageNavPage: '.pageNav-page',
     toolbar: '.p-title-pageAction, .p-title .buttonGroup, .p-title',
@@ -348,14 +349,22 @@
       const rawLinks = [];
       const images = [];
       const videos = [];
+      // Quoted content is a COPY of another post's media/links — collect only
+      // what THIS post authored (probe 2026-10-29: 9 of 19 bbImage were inside
+      // blockquote.bbCodeBlock--quote on a live page)
+      const inQuote = (el) => !!(el.closest && el.closest(SEL.quote));
       if (body) {
-        body.querySelectorAll('a[href]').forEach((a) => rawLinks.push(a.getAttribute('href') || ''));
+        body.querySelectorAll('a[href]').forEach((a) => {
+          if (!inQuote(a)) rawLinks.push(a.getAttribute('href') || '');
+        });
         body.querySelectorAll(SEL.image).forEach((im) => {
+          if (inQuote(im)) return;
           const s = im.getAttribute('src') || im.getAttribute('data-src') || '';
           if (s) images.push(absolutize(s));
         });
         // HTML5 videos: <video class="videotag"><source src> (site media threads)
         body.querySelectorAll('video').forEach((v) => {
+          if (inQuote(v)) return;
           const srcEl = v.querySelector('source');
           const s = (srcEl && srcEl.getAttribute('src')) || v.getAttribute('src') || '';
           if (s) videos.push(absolutize(s));
@@ -364,6 +373,7 @@
       // XF2 attachment blocks (.message-attachments) sit OUTSIDE .bbWrapper —
       // scan the whole article; video-file attachments go to Videos by extension
       art.querySelectorAll(SEL.attachment).forEach((a) => {
+        if (inQuote(a)) return;
         const h = a.getAttribute('href') || '';
         if (!h) return;
         const abs = absolutize(h);

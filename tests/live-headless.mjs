@@ -126,12 +126,30 @@ try {
     open: document.getElementById('xft-panel').classList.contains('xft-open'),
     subtabs: Array.from(document.querySelectorAll('#xft-panel .xft-subtab')).map((b) => b.textContent.trim()),
     unfurlSrcs: Array.from(document.images).filter((i) => i.classList.contains('bbCodeBlockUnfurl-image')).map((i) => i.src),
+    // media a post AUTHORED itself: outside every blockquote.bbCodeBlock--quote
+    ownSrcs: Array.from(document.querySelectorAll('article img.bbImage, article video'))
+      .filter((el) => !el.closest('blockquote.bbCodeBlock--quote'))
+      .map((el) => el.src || (el.querySelector('source') || {}).src || '')
+      .filter(Boolean),
+    quotedSrcs: Array.from(document.querySelectorAll('article blockquote.bbCodeBlock--quote img.bbImage')).map((i) => i.src),
     cellSrcs: Array.from(document.querySelectorAll('#xft-panel .xft-cell img, #xft-panel .xft-cell video')).map((el) => el.src)
   })`);
   check('panel opens', panel.open === true);
   check('sub-tabs All/Image/Video present', panel.subtabs.length === 3 && panel.subtabs.every((t) => /^(All|Image|Video) \d+$/.test(t)), panel.subtabs.join(' | '));
   const leak = panel.cellSrcs.filter((s) => panel.unfurlSrcs.includes(s));
   check('no unfurl-logo media in grid', leak.length === 0, leak.length + ' leaked of ' + panel.unfurlSrcs.length + ' unfurl imgs on page');
+  // quote exclusion: grid == exactly the non-quote media (originals in, copies out).
+  // A quoted URL legitimately still appears via its ORIGINAL post, so the test
+  // is set equality against own media, not emptiness against quoted media.
+  // video cells carry a #t=0.1 seek fragment — compare hashless
+  const norm = (s) => String(s).split('#')[0];
+  const cells = new Set(panel.cellSrcs.map(norm));
+  const own = new Set(panel.ownSrcs.map(norm));
+  const missing = [...own].filter((s) => !cells.has(s));
+  const extra = [...cells].filter((s) => !own.has(s));
+  check('media grid = own-post media only (quotes excluded)',
+    missing.length === 0 && extra.length === 0,
+    'grid=' + cells.size + ' own=' + own.size + ' missing=' + missing.length + ' extra=' + extra.length + ' (quoted copies on page: ' + panel.quotedSrcs.length + ')');
 
   // 4. Sort on partial cache: click 1 starts the fetch, click 2 aborts + sorts
   const firstArticleBefore = await ev(cdp, `(document.querySelector('article[data-content^="post-"]') || {}).dataset ? document.querySelector('article[data-content^="post-"]').dataset.content : ''`);
