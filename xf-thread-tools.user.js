@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         xf-thread-tools
 // @namespace    xf-thread-tools
-// @version      0.7.12
+// @version      0.7.13
 // @description  XenForo 2: sort thread posts by reaction count across all pages (cached) + floating media panel (images / external links).
 // @author       xf-thread-tools
 // @match        *://*/threads/*
@@ -911,6 +911,12 @@
     const vrowCache = new Map();
     let vRowHMeasured = 0;
     let vGrid = null; // live media-grid state {topPad,vrows,bottomPad,items,identity,renderRange}
+    // Smilies/stickers rehosted on image hosts carry NO url/class marker —
+    // only their size gives them away (measured: forum smilies 24px, imgur
+    // stickers 50–56px, real photos 320px+). Detected at render; the next
+    // panel pass drops them, so stale caches heal without a Refresh.
+    const tinyMediaUrls = new Set();
+    const TINY_MEDIA_MAX = 120;
     let settingsView = null;
     let panelTab = 'files';
     let panelSubTab = 'all';        // media sub-tab: all | image | video
@@ -988,11 +994,25 @@
       // A failure cached by Chrome replays instantly with NO error event, and
       // 1×1 placeholders (svg data-URIs, hotlink-block pixels) "load" as a
       // single stretched pixel = a blank cell. nw<=1 + complete = dead either
-      // way — probe for both, or the cell renders blank forever
-      if (im.complete && im.naturalWidth <= 1) markMediaBroken(im);
+      // way — probe for both, or the cell renders blank forever.
+      const checkDead = () => { if (im.complete && im.naturalWidth <= 1) markMediaBroken(im); };
+      const checkTiny = () => {
+        // 2..120px square-ish = smilie/sticker (no URL marker exists) —
+        // retire the item. A mid-list removal invalidates every cached row
+        // index, so drop the live-grid state too; the render pass rebuilds.
+        if (im.naturalWidth > 1 && im.naturalWidth <= TINY_MEDIA_MAX
+          && im.naturalHeight > 1 && im.naturalHeight <= TINY_MEDIA_MAX
+          && !tinyMediaUrls.has(url)) {
+          tinyMediaUrls.add(url);
+          vrowCache.clear();
+          vGrid = null;
+          schedulePanelRender();
+        }
+      };
+      if (im.complete) { checkDead(); checkTiny(); }
       else {
-        im.addEventListener('load', () => { if (im.naturalWidth <= 1) markMediaBroken(im); });
-        setTimeout(() => { if (im.complete && im.naturalWidth <= 1) markMediaBroken(im); }, 800);
+        im.addEventListener('load', () => { checkDead(); checkTiny(); });
+        setTimeout(() => { checkDead(); checkTiny(); }, 800);
       }
       return im;
     }
@@ -1133,7 +1153,7 @@
         // their real URLs (attachment-scan twins) — drop the placeholders so
         // already-cached threads heal without a Refresh; smilies and
         // signature/footer boilerplate are filtered the same way
-        const real = (list) => (list || []).filter((u) => !/^(data|blob):/i.test(u || '') && !isSmilieUrl(u) && !boiler.has(String(u || '')));
+        const real = (list) => (list || []).filter((u) => !/^(data|blob):/i.test(u || '') && !isSmilieUrl(u) && !boiler.has(String(u || '')) && !tinyMediaUrls.has(String(u || '')));
         for (const r of ordered) {
           for (const url of real(r.images)) all.push({ r: r, url: url, pos: posMap.get(r.postId) || 0, kind: 'image' });
           for (const url of real(r.videos)) all.push({ r: r, url: url, pos: posMap.get(r.postId) || 0, kind: 'video' });
