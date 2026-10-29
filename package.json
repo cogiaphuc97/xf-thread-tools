@@ -1,6 +1,6 @@
 {
   "name": "xf-thread-tools",
-  "version": "0.6.0",
+  "version": "0.6.2",
   "private": true,
   "description": "XenForo 2 userscript: thread reaction-sort + media panel (dev scaffolding; the deliverable is xf-thread-tools.user.js)",
   "scripts": {

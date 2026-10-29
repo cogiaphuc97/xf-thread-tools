@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         xf-thread-tools
 // @namespace    xf-thread-tools
-// @version      0.6.1
+// @version      0.6.2
 // @description  XenForo 2: sort thread posts by reaction count across all pages (cached) + floating media panel (images / external links).
 // @author       xf-thread-tools
 // @match        *://*/threads/*
@@ -47,7 +47,6 @@
     reactionsLink: 'a.reactionsBar-link',
     image: 'img.bbImage',
     attachment: 'a[href*="attachments"]',
-    unfurlImage: 'img.bbCodeBlockUnfurl-image',
     pageNav: '.pageNav',
     pageNavPage: '.pageNav-page',
     toolbar: '.p-title-pageAction, .p-title .buttonGroup, .p-title',
@@ -355,12 +354,6 @@
           const s = im.getAttribute('src') || im.getAttribute('data-src') || '';
           if (s) images.push(absolutize(s));
         });
-        // link-preview (unfurl) images — rendered as attachment-like cards;
-        // favicons (bbCodeBlockUnfurl-icon) and smilies stay excluded
-        body.querySelectorAll(SEL.unfurlImage).forEach((im) => {
-          const s = im.getAttribute('src') || im.getAttribute('data-src') || '';
-          if (s) images.push(absolutize(s));
-        });
         // HTML5 videos: <video class="videotag"><source src> (site media threads)
         body.querySelectorAll('video').forEach((v) => {
           const srcEl = v.querySelector('source');
@@ -651,8 +644,10 @@
 
     function ensure(force) {
       if (currentRun) return currentRun;
-      // Partial data is usable as-is: never auto-refetch after a cancel or
-      // mid-run failure. Explicit refresh (force=true) is the only refetch path.
+      // Partial data is usable as-is for the PANEL: never auto-refetch after a
+      // cancel or mid-run failure. Explicit refresh (force=true) is the only
+      // refetch path. (The SORTER uses ensureForSort — it must not sort a
+      // subset silently.)
       if (!force && (hub.meta.complete || hub.records.size > 0)) {
         if (!hub.progress || (!hub.progress.total && hub.meta.pageCount)) {
           hub.progress = { done: hub.meta.complete ? hub.meta.pageCount : hub.pagesDone.size, total: hub.meta.pageCount };
@@ -661,6 +656,15 @@
         return Promise.resolve();
       }
       currentRun = runFetch(force).catch(() => {}).then(() => { currentRun = null; });
+      return currentRun;
+    }
+
+    // Sort path: complete data or RESUME the fetch of missing pages (pagesDone
+    // skips already-cached pages, so a canceled run never restarts from page 1).
+    function ensureForSort() {
+      if (hub.meta.complete) return Promise.resolve();
+      if (currentRun) return currentRun;
+      currentRun = runFetch(false).catch(() => {}).then(() => { currentRun = null; });
       return currentRun;
     }
 
@@ -719,9 +723,11 @@
           return;
         }
         sorterPending = true;
-        setSortBtn('⚡ …', true);
+        // NOT disabled: a second click while pending cancels the fetch and
+        // sorts the partial data (toggle's abort branch above)
+        setSortBtn('⚡ …', false);
         updateProgressText();
-        const p = ensure(false);
+        const p = ensureForSort();
         if (!hub.fetchRunning) {
           // data already complete: runFetch resolved synchronously-ish, or cached
           p.then(() => {
@@ -755,7 +761,9 @@
         }, { rootMargin: '800px' });
         this.observer.observe(this.moreBtn);
         this.renderChunk();
-        setSortBtn('↕ Chronological', false);
+        // label partial sorts: records exist but the thread is not fully fetched
+        // (canceled fetch / HTTP stop / cache cap) — the view is a subset
+        setSortBtn(hub.meta.complete ? '↕ Chronological' : '↕ Chronological (partial)', false);
       },
 
       renderChunk() {
@@ -842,10 +850,46 @@
       return b;
     }
 
+    // Build the <img>/<video> element for a grid cell, viewer, or filmstrip
+    // thumb. An <img> that fails to load is retried once as <video> —
+    // extension-based classification cannot know a URL's real bytes (video
+    // links without .mp4 extensions exist); if the video also fails, the
+    // element is marked .xft-broken.
+    function buildMediaEl(kind, url, thumb) {
+      if (kind === 'video') {
+        const v = document.createElement('video');
+        if (thumb) {
+          v.preload = 'metadata';
+          v.muted = true;
+          v.src = url + (url.indexOf('#') === -1 ? '#t=0.1' : '');
+        } else {
+          v.controls = true;
+          v.autoplay = true;
+          v.src = url;
+        }
+        return v;
+      }
+      const im = document.createElement('img');
+      im.loading = 'lazy';
+      im.src = url;
+      im.addEventListener('error', function onErr() {
+        im.removeEventListener('error', onErr);
+        const v = document.createElement('video');
+        v.preload = 'metadata';
+        v.muted = true;
+        v.src = url;
+        v.addEventListener('error', () => im.classList.add('xft-broken'));
+        v.addEventListener('loadedmetadata', () => { if (im.parentNode) im.replaceWith(v); });
+        v.load();
+      });
+      return im;
+    }
+
     function updateProgressText() {
       const t = hub.progress.total ? (hub.progress.done + '/' + hub.progress.total) : '–';
       if (progressEl) progressEl.textContent = t;
-      if (sorterPending) setSortBtn('⚡ ' + t + '…', true);
+      // NOT disabled while pending: the second click cancels + sorts partial
+      if (sorterPending) setSortBtn('⚡ ' + t + '…', false);
     }
 
     function schedulePanelRender() {
@@ -899,9 +943,7 @@
       closeViewer();
       const v = document.createElement('div');
       v.id = 'xft-viewer';
-      const media = it.kind === 'video' ? document.createElement('video') : document.createElement('img');
-      if (it.kind === 'video') { media.controls = true; media.autoplay = true; }
-      media.src = it.url;
+      const media = buildMediaEl(it.kind, it.url, false);
       const bar = document.createElement('div');
       bar.className = 'xft-viewer-bar';
       const info = document.createElement('span');
@@ -923,18 +965,7 @@
           const t = viewerItems[k];
           const th = document.createElement('div');
           th.className = 'xft-vthumb' + (k === viewerIndex ? ' xft-vthumb-active' : '');
-          let el;
-          if (t.kind === 'video') {
-            el = document.createElement('video');
-            el.preload = 'metadata';
-            el.muted = true;
-            el.src = t.url + (t.url.indexOf('#') === -1 ? '#t=0.1' : '');
-          } else {
-            el = document.createElement('img');
-            el.loading = 'lazy';
-            el.src = t.url;
-          }
-          th.appendChild(el);
+          th.appendChild(buildMediaEl(t.kind, t.url, true));
           const idx = k;
           th.addEventListener('click', () => openViewerAt(idx));
           strip.appendChild(th);
@@ -1047,17 +1078,7 @@
               cell.className = 'xft-cell';
               cell.title = '[#' + it.pos + '] ' + (it.r.author || '?') + ' — open';
               const isVideo = it.kind === 'video';
-              let thumb;
-              if (isVideo) {
-                thumb = document.createElement('video');
-                thumb.preload = 'metadata';
-                thumb.muted = true;
-                thumb.src = it.url + (it.url.indexOf('#') === -1 ? '#t=0.1' : '');
-              } else {
-                thumb = document.createElement('img');
-                thumb.loading = 'lazy';
-                thumb.src = it.url;
-              }
+              const thumb = buildMediaEl(it.kind, it.url, true);
               const label = document.createElement('span');
               label.className = 'xft-cell-label';
               label.textContent = '#' + it.pos + ' ' + (it.r.author || '?');
@@ -1448,6 +1469,7 @@
         '.xft-vthumb img,.xft-vthumb video{width:100%;height:100%;object-fit:cover;display:block}',
         '.xft-vthumb-active{border-color:#fff}',
         '.xft-btn:disabled{opacity:.45;cursor:default}',
+        '.xft-broken{opacity:.2;filter:grayscale(1)}',
         '.xft-subtabs{display:flex;align-items:center;gap:6px;padding:6px 8px;border-bottom:1px solid #e2e7ee}',
         '.xft-subtabs[hidden]{display:none}',
         '.xft-subtab{font-size:11px;padding:2px 6px}',

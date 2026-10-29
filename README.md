@@ -80,7 +80,6 @@ Validated against stock XF2 markup. If your style/add-ons rename a class, overri
 | `reactionsLink` | `a.reactionsBar-link` | Element whose text holds the count ("A, B and 12 others" / "A, B và 12 người khác") |
 | `image` | `img.bbImage` | Embedded image |
 | `attachment` | `a[href*="attachments"]` | XF attachment link — scanned across the whole post (XF renders attachment blocks outside `.bbWrapper`); video extensions route to Videos |
-| `unfurlImage` | `img.bbCodeBlockUnfurl-image` | Link-preview (unfurl) card image — the attachment-looking thumbnails some sites render for hotlinked media |
 | `pageNav` | `.pageNav` | Pagination block (page count = highest page number found) |
 | `pageNavPage` | `.pageNav-page` | A single page-number element |
 | `toolbar` | `.p-title-pageAction, .p-title .buttonGroup, .p-title` | Primary toolbar button anchor (first match wins) |
