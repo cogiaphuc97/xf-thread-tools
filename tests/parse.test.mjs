@@ -8,7 +8,7 @@ import path from 'node:path';
 
 const require = createRequire(import.meta.url);
 const userJsPath = path.join(path.dirname(fileURLToPath(import.meta.url)), '..', 'xf-thread-tools.user.js');
-const { parseReactionCount, filterLinks, sortPosts, estimateSize, partitionLinks, extractDomain, groupLinkItems, applyLinkFilters } = require(userJsPath);
+const { parseReactionCount, filterLinks, sortPosts, estimateSize, partitionLinks, extractDomain, groupLinkItems, applyLinkFilters, boilerplateUrls } = require(userJsPath);
 
 test('UMD export exposes the four pure functions', () => {
   assert.equal(typeof parseReactionCount, 'function');
@@ -207,4 +207,34 @@ test('applyLinkFilters: user and domain Sets exclude non-members; combinable', (
   );
   // null Set = no filter on that axis
   assert.equal(applyLinkFilters(items, { users: null, domains: null }).length, 3);
+});
+
+// ---- boilerplateUrls (signature / "sent via app" footer fingerprint) ----
+test('boilerplateUrls: URL across >=3 distinct authors is flagged, fewer is not', () => {
+  const recs = [
+    { author: 'a', links: ['https://app.example/id1'], images: [] },
+    { author: 'b', links: ['https://app.example/id1'], images: [] },
+    { author: 'c', links: ['https://app.example/id1'], images: [] },
+    { author: 'a', links: ['https://app.example/id1'], images: [] }, // same author again: still 3 distinct
+    { author: 'a', links: ['https://shared.example/2au'], images: [] },
+    { author: 'b', links: ['https://shared.example/2au'], images: [] } // only 2 distinct -> keep
+  ];
+  const out = boilerplateUrls(recs, 3);
+  assert.equal(out.has('https://app.example/id1'), true);
+  assert.equal(out.has('https://shared.example/2au'), false);
+});
+
+test('boilerplateUrls: images count too; data:/blob: URLs are ignored', () => {
+  const recs = [
+    { author: 'a', links: [], images: ['https://img.example/banner.png'] },
+    { author: 'b', links: [], images: ['https://img.example/banner.png'] },
+    { author: 'c', links: [], images: ['https://img.example/banner.png', 'data:image/gif;base64,R0lGOD'] },
+    { author: 'd', links: [], images: ['data:image/gif;base64,R0lGOD'] },
+    { author: 'e', links: [], images: ['data:image/gif;base64,R0lGOD'] },
+    { author: 'f', links: [], images: ['data:image/gif;base64,R0lGOD'] }
+  ];
+  const out = boilerplateUrls(recs, 3);
+  assert.equal(out.has('https://img.example/banner.png'), true);
+  assert.equal(out.has('data:image/gif;base64,R0lGOD'), false);
+  assert.equal(out.size, 1);
 });

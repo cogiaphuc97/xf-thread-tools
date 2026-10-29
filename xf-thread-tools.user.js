@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         xf-thread-tools
 // @namespace    xf-thread-tools
-// @version      0.7.10
+// @version      0.7.11
 // @description  XenForo 2: sort thread posts by reaction count across all pages (cached) + floating media panel (images / external links).
 // @author       xf-thread-tools
 // @match        *://*/threads/*
@@ -49,6 +49,7 @@
     image: 'img.bbImage',
     attachment: 'a[href*="attachments"]',
     quote: 'blockquote.bbCodeBlock--quote',
+    signature: '.message-signature',
     pageNav: '.pageNav',
     pageNavPage: '.pageNav-page',
     toolbar: '.p-title-pageAction, .p-title .buttonGroup, .p-title',
@@ -120,6 +121,29 @@
    * Partition post-body hrefs into media links (image/video file URLs, which
    * belong on the Files/Videos tabs, not Links) and page links (pure).
    */
+  // Boilerplate fingerprint: a URL that appears in the posts of N or more
+  // DISTINCT authors is signature/"sent via app" footer content, not something
+  // any one author posted. Catches both real signatures (flickr gear lists,
+  // proxy-wrapped banner images) and forum-injected footers that live inside
+  // the post body markup with no structural marker at all.
+  function boilerplateUrls(records, minAuthors) {
+    const min = minAuthors || 3;
+    const authors = new Map();
+    const add = (u, r) => {
+      const u2 = String(u || '');
+      if (!u2 || /^(data|blob):/i.test(u2)) return;
+      if (!authors.has(u2)) authors.set(u2, new Set());
+      authors.get(u2).add(String(r.author || ''));
+    };
+    for (const r of Array.isArray(records) ? records : []) {
+      for (const u of (r.links || [])) add(u, r);
+      for (const u of (r.images || [])) add(u, r);
+    }
+    const out = new Set();
+    for (const [u, set] of authors) if (set.size >= min) out.add(u);
+    return out;
+  }
+
   function partitionLinks(hrefList) {
     const imageLinks = [];
     const videoLinks = [];
@@ -343,7 +367,13 @@
       const postId = dc.indexOf('post-') === 0 ? dc.slice(5) : dc;
       const authorEl = art.querySelector(SEL.author);
       const dateEl = art.querySelector(SEL.date);
-      const body = art.querySelector(SEL.postBody);
+      // Signatures carry their OWN .bbWrapper (XF2: aside.message-signature >
+      // div.bbWrapper). A post with no/empty body would otherwise extract the
+      // signature as the post body — take the first body OUTSIDE the signature.
+      let body = null;
+      for (const b of art.querySelectorAll(SEL.postBody)) {
+        if (!b.closest(SEL.signature)) { body = b; break; }
+      }
 
       let reactionCount = 0;
       const bar = art.querySelector(SEL.reactionsBar);
@@ -357,14 +387,19 @@
       const videos = [];
       // Quoted content is a COPY of another post's media/links — collect only
       // what THIS post authored (probe 2026-10-29: 9 of 19 bbImage were inside
-      // blockquote.bbCodeBlock--quote on a live page)
-      const inQuote = (el) => !!(el.closest && el.closest(SEL.quote));
+      // blockquote.bbCodeBlock--quote on a live page). Signature content is
+      // boilerplate the author did not write in this post — skip it too.
+      const skip = (el) => !!((el.closest && (el.closest(SEL.quote) || el.closest(SEL.signature))));
       if (body) {
         body.querySelectorAll('a[href]').forEach((a) => {
-          if (!inQuote(a)) rawLinks.push(a.getAttribute('href') || '');
+          if (!skip(a)) rawLinks.push(a.getAttribute('href') || '');
         });
         body.querySelectorAll(SEL.image).forEach((im) => {
-          if (inQuote(im)) return;
+          if (skip(im)) return;
+          // smilies are not content media: XF marks them with class "smilie"
+          // ("smilie--sprite67", "smilie smilie--emoji", …); legacy editors
+          // also embed them as plain bbImage <img> whose URL hits /smilies/
+          if ([].some.call(im.classList, (t) => t === 'smilie' || t.indexOf('smilie--') === 0)) return;
           // Lazy-loaded images carry a 1×1 svg data-URI placeholder in src;
           // the real URL lives in data-src/data-url (voz-style lazy loading).
           // Placeholder-first means src must be discarded when it is data:/blob:.
@@ -372,11 +407,11 @@
           if (/^(data|blob):/i.test(s)) {
             s = im.getAttribute('data-src') || im.getAttribute('data-url') || im.getAttribute('data-lazy-src') || '';
           }
-          if (s) images.push(absolutize(s));
+          if (s && !/\/smilies\//i.test(s)) images.push(absolutize(s));
         });
         // HTML5 videos: <video class="videotag"><source src> (site media threads)
         body.querySelectorAll('video').forEach((v) => {
-          if (inQuote(v)) return;
+          if (skip(v)) return;
           const srcEl = v.querySelector('source');
           const s = (srcEl && srcEl.getAttribute('src')) || v.getAttribute('src') || '';
           if (s) videos.push(absolutize(s));
@@ -385,7 +420,7 @@
       // XF2 attachment blocks (.message-attachments) sit OUTSIDE .bbWrapper —
       // scan the whole article; video-file attachments go to Videos by extension
       art.querySelectorAll(SEL.attachment).forEach((a) => {
-        if (inQuote(a)) return;
+        if (skip(a)) return;
         const h = a.getAttribute('href') || '';
         if (!h) return;
         const abs = absolutize(h);
@@ -1073,6 +1108,9 @@
       if (!panelIsOpen() || !panelBodyEl) return;
       const ordered = orderedRecords();
       const posMap = new Map(ordered.map((r, i) => [r.postId, i + 1]));
+      // signature/"sent via app" boilerplate: URLs recurring across >=3
+      // distinct authors — filtered at render so stale caches heal without Refresh
+      const boiler = boilerplateUrls(ordered, 3);
       let items = [];
       let filtered = [];
       let mediaCounts = null;
@@ -1080,8 +1118,9 @@
         const all = [];
         // stale caches (pre-0.7.9) hold 1×1 data-URI placeholders alongside
         // their real URLs (attachment-scan twins) — drop the placeholders so
-        // already-cached threads heal without a Refresh
-        const real = (list) => (list || []).filter((u) => !/^(data|blob):/i.test(u || ''));
+        // already-cached threads heal without a Refresh; smilies and
+        // signature/footer boilerplate are filtered the same way
+        const real = (list) => (list || []).filter((u) => !/^(data|blob):/i.test(u || '') && !/\/smilies\//i.test(u || '') && !boiler.has(String(u || '')));
         for (const r of ordered) {
           for (const url of real(r.images)) all.push({ r: r, url: url, pos: posMap.get(r.postId) || 0, kind: 'image' });
           for (const url of real(r.videos)) all.push({ r: r, url: url, pos: posMap.get(r.postId) || 0, kind: 'video' });
@@ -1093,7 +1132,7 @@
         viewerItems = items.map((it) => ({ kind: it.kind, url: it.url, postId: it.r.postId, pos: it.pos, author: it.r.author }));
       } else {
         for (const r of ordered) {
-          for (const url of r.links) items.push({ r: r, url: url, pos: posMap.get(r.postId) || 0, kind: 'link' });
+          for (const url of r.links) if (!boiler.has(url)) items.push({ r: r, url: url, pos: posMap.get(r.postId) || 0, kind: 'link' });
         }
         filtered = applyLinkFilters(items, {
           query: linkSearchEl ? linkSearchEl.value : '',
@@ -1736,5 +1775,5 @@
   }
 
   // UMD export of the pure functions for node:test (no DOM / GM usage in them).
-  if (typeof module !== 'undefined' && module.exports) module.exports = { parseReactionCount, filterLinks, sortPosts, estimateSize, partitionLinks, extractDomain, groupLinkItems, applyLinkFilters };
+  if (typeof module !== 'undefined' && module.exports) module.exports = { parseReactionCount, filterLinks, sortPosts, estimateSize, partitionLinks, extractDomain, groupLinkItems, applyLinkFilters, boilerplateUrls };
 })();

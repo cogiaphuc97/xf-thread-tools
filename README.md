@@ -81,6 +81,7 @@ Validated against stock XF2 markup. If your style/add-ons rename a class, overri
 | `image` | `img.bbImage` | Embedded image |
 | `attachment` | `a[href*="attachments"]` | XF attachment link — scanned across the whole post (XF renders attachment blocks outside `.bbWrapper`); video extensions route to Videos |
 | `quote` | `blockquote.bbCodeBlock--quote` | Quoted content inside a post — media/links inside it are skipped (they belong to the quoted post, not this one) |
+| `signature` | `.message-signature` | Signature block — its links/media are skipped; a post with no body text would otherwise extract the signature as its body |
 | `pageNav` | `.pageNav` | Pagination block (page count = highest page number found) |
 | `pageNavPage` | `.pageNav-page` | A single page-number element |
 | `toolbar` | `.p-title-pageAction, .p-title .buttonGroup, .p-title` | Primary toolbar button anchor (first match wins) |

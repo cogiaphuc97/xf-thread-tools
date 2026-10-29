@@ -133,11 +133,15 @@ try {
     open: document.getElementById('xft-panel').classList.contains('xft-open'),
     subtabs: Array.from(document.querySelectorAll('#xft-panel .xft-subtab')).map((b) => b.textContent.trim()),
     unfurlSrcs: Array.from(document.images).filter((i) => i.classList.contains('bbCodeBlockUnfurl-image')).map((i) => i.src),
-    // images a post AUTHORED itself: outside every blockquote.bbCodeBlock--quote
+    // images a post AUTHORED itself: outside every blockquote.bbCodeBlock--quote,
+    // outside .message-signature, and not smilies (grid excludes all three)
     // (videos are fetch-less tiles in the grid now — checked via tile counts)
     ownSrcs: Array.from(document.querySelectorAll('article img.bbImage'))
-      .filter((el) => !el.closest('blockquote.bbCodeBlock--quote'))
-      .map((el) => el.src)
+      .filter((el) => !el.closest('blockquote.bbCodeBlock--quote')
+        && !el.closest('.message-signature')
+        && ![].some.call(el.classList, (t) => t === 'smilie' || t.indexOf('smilie--') === 0)
+        && !/\\/smilies\\//i.test(el.src || ''))
+      .map((el) => (el.getAttribute('data-src') && /^(data|blob):/i.test(el.src || '') ? el.getAttribute('data-src') : el.src))
       .filter(Boolean),
     quotedSrcs: Array.from(document.querySelectorAll('article blockquote.bbCodeBlock--quote img.bbImage')).map((i) => i.src),
     cellSrcs: Array.from(document.querySelectorAll('#xft-panel .xft-cell img, #xft-panel .xft-cell video')).map((el) => el.src)
