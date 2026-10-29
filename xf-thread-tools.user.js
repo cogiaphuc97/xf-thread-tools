@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         xf-thread-tools
 // @namespace    xf-thread-tools
-// @version      0.7.5
+// @version      0.7.6
 // @description  XenForo 2: sort thread posts by reaction count across all pages (cached) + floating media panel (images / external links).
 // @author       xf-thread-tools
 // @match        *://*/threads/*
@@ -906,7 +906,9 @@
         return v;
       }
       const im = document.createElement('img');
-      im.loading = 'lazy';
+      // thumbs are only created in-range by the virtualizer — eager loading
+      // avoids loading=lazy deferral bugs on re-inserted cached rows
+      if (!thumb) im.loading = 'lazy';
       im.src = url;
       im.addEventListener('error', function onErr() {
         im.removeEventListener('error', onErr);
@@ -1153,7 +1155,13 @@
               }
               vrowCache.set(r, rowEl);
             }
-            vrows.appendChild(rowEl); // moves the cached node — loads survive
+            // reconcile in place: re-inserting a row (appendChild is remove+
+            // insert) makes Chrome re-evaluate loading=lazy visibility and
+            // can strand an image deferred forever — only touch misplaced rows
+            const slot = r - first;
+            if (vrows.children[slot] !== rowEl) {
+              vrows.insertBefore(rowEl, vrows.children[slot] || null);
+            }
           }
           // cap the cache so a very long scroll does not pin the whole list
           if (vrowCache.size > 300) {
