@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         xf-thread-tools
 // @namespace    xf-thread-tools
-// @version      0.5.1
+// @version      0.5.3
 // @description  XenForo 2: sort thread posts by reaction count across all pages (cached) + floating media panel (images / external links).
 // @author       xf-thread-tools
 // @match        *://*/threads/*
@@ -883,7 +883,7 @@
         const gap = 6;
         const totalRows = Math.ceil(items.length / cols);
         const cellW = (panelBodyEl.clientWidth - 20 - (cols - 1) * gap) / cols;
-        const rowH = cellW + 2 + gap; // square cell + border + row gap
+        let rowH = cellW + 2 + gap; // estimate; corrected by measurement below
         const renderRange = () => {
           const st = panelBodyEl.scrollTop;
           const vh = panelBodyEl.clientHeight || 600;
@@ -926,6 +926,13 @@
               rowEl.appendChild(cell);
             }
             vrows.appendChild(rowEl);
+          }
+          // measure the REAL row pitch and correct the estimate: a few px of
+          // drift per row turns into thousands of px of scroll-anchor jumps
+          // on huge virtualized lists
+          if (vrows.firstElementChild) {
+            const real = vrows.firstElementChild.getBoundingClientRect().height + gap;
+            if (real > 0 && Math.abs(real - rowH) > 0.5) rowH = real;
           }
           topPad.style.height = (first * rowH) + 'px';
           bottomPad.style.height = (Math.max(0, totalRows - last) * rowH) + 'px';
@@ -1036,12 +1043,22 @@
     // the virtualized content is (a flick must not fly hundreds of rows);
     // small deltas (trackpad pixel scrolling) stay native
     function installWheelNormalizer() {
+      let pend = 0;
+      let raf = 0;
       panelBodyEl.addEventListener('wheel', (e) => {
-        if (Math.abs(e.deltaY) < 40) return;
         e.preventDefault();
-        const dir = e.deltaY > 0 ? 1 : -1;
-        const notches = e.deltaMode === 1 ? Math.max(1, Math.round(Math.abs(e.deltaY))) : 1;
-        panelBodyEl.scrollBy({ top: dir * notches * gridRowH(), behavior: 'smooth' });
+        // every wheel event contributes at most one row of travel, no native
+        // path at all — free-spin/high-res wheels sending small rapid deltas
+        // cannot fling through the virtualized list
+        const rowH = gridRowH();
+        const d = e.deltaMode === 1 ? e.deltaY * (rowH / 3) : e.deltaY;
+        pend += Math.max(-rowH, Math.min(rowH, d));
+        if (raf) return;
+        raf = requestAnimationFrame(() => {
+          raf = 0;
+          panelBodyEl.scrollBy({ top: pend, behavior: 'auto' });
+          pend = 0;
+        });
       }, { passive: false });
     }
 
@@ -1144,7 +1161,7 @@
         '.xft-tabs{display:flex;align-items:center;gap:6px;padding:6px 8px;border-bottom:1px solid #e2e7ee}',
         '.xft-tab-active{background:#0b6bcb;border-color:#0b6bcb;color:#fff;font-weight:700;box-shadow:0 1px 5px rgba(11,107,203,.45)}',
         '.xft-count{margin-left:auto;opacity:.7}',
-        '.xft-body{overflow-y:auto;flex:1;padding:8px 10px;scrollbar-width:thin;overscroll-behavior:contain}',
+        '.xft-body{overflow-y:auto;flex:1;padding:8px 10px;scrollbar-width:thin;overscroll-behavior:contain;overflow-anchor:none}',
         '.xft-grid{display:grid;grid-template-columns:repeat(4,1fr);gap:6px}',
         '.xft-vrows{display:flex;flex-direction:column;gap:6px}',
         '.xft-vrow{display:grid;grid-template-columns:repeat(4,1fr);gap:6px}',
