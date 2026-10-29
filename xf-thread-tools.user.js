@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         xf-thread-tools
 // @namespace    xf-thread-tools
-// @version      0.7.4
+// @version      0.7.5
 // @description  XenForo 2: sort thread posts by reaction count across all pages (cached) + floating media panel (images / external links).
 // @author       xf-thread-tools
 // @match        *://*/threads/*
@@ -618,6 +618,7 @@
           hub.pagesDone.clear();
           recordsVersion += 1;
           seededPage = -1;
+          vrowCache.clear(); // rebuilt records -> cached rows are stale
         }
         seedLivePage(); // current page comes free from the live DOM
         if (seededPage > 0) hub.pagesDone.add(seededPage);
@@ -849,6 +850,13 @@
     // reaching it extends rowLimit, so there is no "Show more" button
     let linksSentinel = null;
     let linksObserver = null;
+    // Media grid: rows are cached by index and MOVED, never destroyed —
+    // scroll re-ranges and fetch-tick rebuilds would otherwise kill lazy
+    // image loads mid-flight and leave blank cells. Cleared whenever the
+    // item list itself changes identity (tab/sub-tab/search/filter/refresh).
+    const vrowCache = new Map();
+    let vRowHMeasured = 0;
+    let vGrid = null; // live media-grid state {topPad,vrows,bottomPad,items,identity,renderRange}
     let settingsView = null;
     let panelTab = 'files';
     let panelSubTab = 'all';        // media sub-tab: all | image | video
@@ -938,6 +946,7 @@
     function setTab(t) {
       panelTab = t;
       rowLimit = settings.rowCap;
+      vrowCache.clear(); // row indices no longer map to the same items
       if (tabFilesBtn) tabFilesBtn.classList.toggle('xft-tab-active', t === 'media');
       if (tabLinksBtn) tabLinksBtn.classList.toggle('xft-tab-active', t === 'links');
       if (subtabsEl) subtabsEl.hidden = t !== 'media';
@@ -947,6 +956,7 @@
 
     function setSubTab(t) {
       panelSubTab = t;
+      vrowCache.clear(); // different kind filter -> different item list
       for (const k of ['all', 'image', 'video']) {
         if (subTabBtns[k]) subTabBtns[k].classList.toggle('xft-tab-active', k === t);
       }
@@ -1077,6 +1087,15 @@
       ]);
       if (sig === lastPanelSignature) { updateCountOnly(items.length); return; }
       lastPanelSignature = sig;
+      // Media tab, same kind filter, grid still mounted: the only change is
+      // item GROWTH from fetch ticks. Keep the DOM exactly as-is — point the
+      // grid at the longer list and re-range. A teardown here is what caused
+      // blank cells (lazy loads killed mid-flight) and scroll-position loss.
+      if (panelTab === 'media' && vGrid && vGrid.topPad.isConnected && vGrid.identity === panelSubTab) {
+        vGrid.items = items;
+        vGrid.renderRange();
+        return;
+      }
       const keepScroll = panelBodyEl.scrollTop;
       panelCountEl.textContent = panelTab === 'links' && filtered.length !== items.length
         ? filtered.length + '/' + items.length + ' items'
@@ -1092,59 +1111,76 @@
         frag.append(topPad, vrows, bottomPad);
         const cols = 4;
         const gap = 6;
-        const totalRows = Math.ceil(items.length / cols);
         const cellW = (panelBodyEl.clientWidth - 20 - (cols - 1) * gap) / cols;
         let rowH = cellW + 2 + gap; // estimate; corrected by measurement below
         const renderRange = () => {
+          const gItems = vGrid ? vGrid.items : items;
+          const gRows = Math.ceil(gItems.length / cols);
           const st = panelBodyEl.scrollTop;
           const vh = panelBodyEl.clientHeight || 600;
-          const first = Math.max(0, Math.floor(st / rowH) - 1);
-          const last = Math.min(totalRows, Math.ceil((st + vh) / rowH) + 1);
-          vrows.textContent = '';
-          for (let r = first; r < last; r++) {
-            const rowEl = document.createElement('div');
-            rowEl.className = 'xft-vrow';
-            for (let c = 0; c < cols; c++) {
-              const i = r * cols + c;
-              if (i >= items.length) break;
-              const it = items[i];
-              const cell = document.createElement('div');
-              cell.className = 'xft-cell';
-              cell.title = '[#' + it.pos + '] ' + (it.r.author || '?') + ' — open';
-              const isVideo = it.kind === 'video';
-              const thumb = buildMediaEl(it.kind, it.url, true);
-              const label = document.createElement('span');
-              label.className = 'xft-cell-label';
-              label.textContent = '#' + it.pos + ' ' + (it.r.author || '?');
-              cell.append(thumb, label);
-              if (isVideo) {
-                const badge = document.createElement('span');
-                badge.className = 'xft-cell-badge';
-                badge.textContent = '▶';
-                cell.appendChild(badge);
-              }
-              cell.addEventListener('click', () => openViewerAt(i));
-              rowEl.appendChild(cell);
-            }
-            vrows.appendChild(rowEl);
+          const pitch = vRowHMeasured || rowH;
+          const first = Math.max(0, Math.floor(st / pitch) - 1);
+          const last = Math.min(gRows, Math.ceil((st + vh) / pitch) + 1);
+          for (const idx of Array.from(vrowCache.keys())) {
+            if (idx < first || idx >= last) vrowCache.get(idx).remove();
           }
-          // measure the REAL row pitch and correct the estimate: a few px of
-          // drift per row turns into thousands of px of scroll-anchor jumps
-          // on huge virtualized lists
+          for (let r = first; r < last; r++) {
+            let rowEl = vrowCache.get(r);
+            if (!rowEl) {
+              rowEl = document.createElement('div');
+              rowEl.className = 'xft-vrow';
+              for (let c = 0; c < cols; c++) {
+                const i = r * cols + c;
+                if (i >= gItems.length) break;
+                const it = gItems[i];
+                const cell = document.createElement('div');
+                cell.className = 'xft-cell';
+                cell.title = '[#' + it.pos + '] ' + (it.r.author || '?') + ' — open';
+                const isVideo = it.kind === 'video';
+                const thumb = buildMediaEl(it.kind, it.url, true);
+                const label = document.createElement('span');
+                label.className = 'xft-cell-label';
+                label.textContent = '#' + it.pos + ' ' + (it.r.author || '?');
+                cell.append(thumb, label);
+                if (isVideo) {
+                  const badge = document.createElement('span');
+                  badge.className = 'xft-cell-badge';
+                  badge.textContent = '▶';
+                  cell.appendChild(badge);
+                }
+                cell.addEventListener('click', () => openViewerAt(i));
+                rowEl.appendChild(cell);
+              }
+              vrowCache.set(r, rowEl);
+            }
+            vrows.appendChild(rowEl); // moves the cached node — loads survive
+          }
+          // cap the cache so a very long scroll does not pin the whole list
+          if (vrowCache.size > 300) {
+            const mid = (first + last) / 2;
+            for (const idx of Array.from(vrowCache.keys()).sort((a, b) => Math.abs(a - mid) - Math.abs(b - mid)).slice(200)) {
+              vrowCache.get(idx).remove();
+              vrowCache.delete(idx);
+            }
+          }
+          // measure the REAL row pitch once and keep it across rebuilds: a
+          // few px of estimate drift per row turns into thousands of px of
+          // scroll jumps on huge virtualized lists
           if (vrows.firstElementChild) {
             const real = vrows.firstElementChild.getBoundingClientRect().height + gap;
-            if (real > 0 && Math.abs(real - rowH) > 0.5) rowH = real;
+            if (real > 0) vRowHMeasured = real;
           }
-          topPad.style.height = (first * rowH) + 'px';
-          bottomPad.style.height = (Math.max(0, totalRows - last) * rowH) + 'px';
+          topPad.style.height = (first * pitch) + 'px';
+          bottomPad.style.height = (Math.max(0, gRows - last) * pitch) + 'px';
         };
+        vGrid = { topPad: topPad, vrows: vrows, bottomPad: bottomPad, items: items, identity: panelSubTab, renderRange: renderRange };
         renderRange();
         panelBodyEl.onscroll = () => {
           if (vScrollRaf) return;
-          vScrollRaf = requestAnimationFrame(() => { vScrollRaf = 0; renderRange(); });
+          vScrollRaf = requestAnimationFrame(() => { vScrollRaf = 0; if (vGrid) vGrid.renderRange(); });
         };
         if (vResizeObserver) vResizeObserver.disconnect();
-        vResizeObserver = new ResizeObserver(() => renderRange());
+        vResizeObserver = new ResizeObserver(() => { if (vGrid) vGrid.renderRange(); });
         vResizeObserver.observe(panelBodyEl);
       } else {
         panelBodyEl.onscroll = null;
@@ -1378,7 +1414,7 @@
       let debounce = 0;
       linkSearchEl.addEventListener('input', () => {
         clearTimeout(debounce);
-        debounce = setTimeout(() => { rowLimit = settings.rowCap; renderPanelBody(); }, 150);
+        debounce = setTimeout(() => { rowLimit = settings.rowCap; vrowCache.clear(); renderPanelBody(); }, 150);
       });
       bar.appendChild(linkSearchEl);
       // user column: one checkbox per author that has at least one link
