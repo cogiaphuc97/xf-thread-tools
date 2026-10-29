@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         xf-thread-tools
 // @namespace    xf-thread-tools
-// @version      0.7.9
+// @version      0.7.10
 // @description  XenForo 2: sort thread posts by reaction count across all pages (cached) + floating media panel (images / external links).
 // @author       xf-thread-tools
 // @match        *://*/threads/*
@@ -887,6 +887,13 @@
       return b;
     }
 
+    // dead media URL: mark the containing cell/thumb (CSS shows the ⚠
+    // placeholder), not just the <img> that may be replaced by the video retry
+    function markMediaBroken(el) {
+      const host = el.closest('.xft-cell, .xft-vthumb');
+      (host || el).classList.add('xft-broken');
+    }
+
     // Build the <img>/<video> element for a grid cell, viewer, or filmstrip
     // thumb. An <img> that fails to load is retried once as <video> —
     // extension-based classification cannot know a URL's real bytes (video
@@ -908,15 +915,10 @@
         v.controls = true;
         v.autoplay = true;
         v.src = url;
-        // dead video URL: same explicit placeholder as dead images
-        const markVBroken = () => {
-          const host = v.closest('.xft-cell, .xft-vthumb');
-          (host || v).classList.add('xft-broken');
-        };
-        v.addEventListener('error', markVBroken);
+        v.addEventListener('error', () => markMediaBroken(v));
         // cached failures never fire events — probe after a moment
         setTimeout(() => {
-          if (v.readyState === 0 && v.networkState === 3) markVBroken(); // NETWORK_NO_SOURCE
+          if (v.readyState === 0 && v.networkState === 3) markMediaBroken(v); // NETWORK_NO_SOURCE
         }, 800);
         return v;
       }
@@ -924,19 +926,13 @@
       // thumbs are only created in-range by the virtualizer — eager loading
       // avoids loading=lazy deferral bugs on re-inserted cached rows
       if (!thumb) im.loading = 'lazy';
-      // dead link (expired proxy URL, 404): mark the containing cell/thumb,
-      // not just the <img> that may get replaced by the video retry
-      const markBroken = () => {
-        const host = im.closest('.xft-cell, .xft-vthumb');
-        (host || im).classList.add('xft-broken');
-      };
       im.addEventListener('error', function onErr() {
         im.removeEventListener('error', onErr);
         const v = document.createElement('video');
         v.preload = 'metadata';
         v.muted = true;
         v.src = url;
-        v.addEventListener('error', markBroken);
+        v.addEventListener('error', () => markMediaBroken(v));
         v.addEventListener('loadedmetadata', () => { if (im.parentNode) im.replaceWith(v); });
         v.load();
       });
@@ -945,13 +941,10 @@
       // 1×1 placeholders (svg data-URIs, hotlink-block pixels) "load" as a
       // single stretched pixel = a blank cell. nw<=1 + complete = dead either
       // way — probe for both, or the cell renders blank forever
-      if (im.complete && im.naturalWidth <= 1) markBroken();
+      if (im.complete && im.naturalWidth <= 1) markMediaBroken(im);
       else {
-        im.addEventListener('load', () => { if (im.naturalWidth <= 1) markBroken(); });
-        setTimeout(() => { if (im.complete && im.naturalWidth <= 1 && !im.classList.contains('xft-broken')) {
-          const host = im.closest('.xft-cell, .xft-vthumb');
-          if (host && !host.classList.contains('xft-broken')) markBroken();
-        } }, 800);
+        im.addEventListener('load', () => { if (im.naturalWidth <= 1) markMediaBroken(im); });
+        setTimeout(() => { if (im.complete && im.naturalWidth <= 1) markMediaBroken(im); }, 800);
       }
       return im;
     }
@@ -1127,6 +1120,7 @@
       if (panelTab === 'media' && vGrid && vGrid.topPad.isConnected && vGrid.identity === panelSubTab) {
         vGrid.items = items;
         vGrid.renderRange();
+        updateCountOnly(items.length); // growth ticks must refresh the count too
         return;
       }
       const keepScroll = panelBodyEl.scrollTop;
@@ -1144,8 +1138,7 @@
         frag.append(topPad, vrows, bottomPad);
         const cols = 4;
         const gap = 6;
-        const cellW = (panelBodyEl.clientWidth - 20 - (cols - 1) * gap) / cols;
-        let rowH = cellW + 2 + gap; // estimate; corrected by measurement below
+        let rowH = gridRowH(); // estimate; corrected by measurement below
         const renderRange = () => {
           const gItems = vGrid ? vGrid.items : items;
           const gRows = Math.ceil(gItems.length / cols);
@@ -1635,7 +1628,7 @@
         '.xft-cell img,.xft-cell video{width:100%;height:100%;object-fit:cover;display:block}',
         // video thumbs: no fetch — a muted gradient tile with the ▶ badge
         '.xft-cell .xft-vtile{width:100%;height:100%;background:linear-gradient(160deg,hsl(var(--xft-muted)),hsl(var(--xft-muted-fg)/.14));display:flex;align-items:center;justify-content:center;position:relative}',
-        '.xft-cell .xft-vtile::before{content:"▶";font-size:22px;color:hsl(var(--xft-muted-fg)/.75)}',
+        // the video ▶ marker is the .xft-cell-badge chip — do not add a second one here
         '.xft-cell-label{position:absolute;left:0;right:0;bottom:0;background:linear-gradient(transparent,hsl(240 10% 3.9%/.82));color:hsl(0 0% 98%);font-size:10px;padding:12px 5px 4px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;pointer-events:none}',
         // shadcn Badge (secondary) for the ▶ marker
         '.xft-cell-badge{position:absolute;top:4px;right:4px;background:hsl(240 10% 3.9%/.72);color:hsl(0 0% 98%);border-radius:9999px;font-size:10px;font-weight:500;padding:1px 7px;pointer-events:none}',
