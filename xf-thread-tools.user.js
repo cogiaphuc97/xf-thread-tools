@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         xf-thread-tools
 // @namespace    xf-thread-tools
-// @version      0.7.8
+// @version      0.7.9
 // @description  XenForo 2: sort thread posts by reaction count across all pages (cached) + floating media panel (images / external links).
 // @author       xf-thread-tools
 // @match        *://*/threads/*
@@ -365,7 +365,13 @@
         });
         body.querySelectorAll(SEL.image).forEach((im) => {
           if (inQuote(im)) return;
-          const s = im.getAttribute('src') || im.getAttribute('data-src') || '';
+          // Lazy-loaded images carry a 1×1 svg data-URI placeholder in src;
+          // the real URL lives in data-src/data-url (voz-style lazy loading).
+          // Placeholder-first means src must be discarded when it is data:/blob:.
+          let s = im.getAttribute('src') || '';
+          if (/^(data|blob):/i.test(s)) {
+            s = im.getAttribute('data-src') || im.getAttribute('data-url') || im.getAttribute('data-lazy-src') || '';
+          }
           if (s) images.push(absolutize(s));
         });
         // HTML5 videos: <video class="videotag"><source src> (site media threads)
@@ -935,12 +941,14 @@
         v.load();
       });
       im.src = url;
-      // A failure cached by Chrome replays instantly with NO error event —
-      // probe for it, or the cell renders blank forever
-      if (im.complete && im.naturalWidth === 0) markBroken();
+      // A failure cached by Chrome replays instantly with NO error event, and
+      // 1×1 placeholders (svg data-URIs, hotlink-block pixels) "load" as a
+      // single stretched pixel = a blank cell. nw<=1 + complete = dead either
+      // way — probe for both, or the cell renders blank forever
+      if (im.complete && im.naturalWidth <= 1) markBroken();
       else {
-        im.addEventListener('load', () => { if (im.naturalWidth === 0) markBroken(); });
-        setTimeout(() => { if (im.complete && im.naturalWidth === 0 && !im.classList.contains('xft-broken')) {
+        im.addEventListener('load', () => { if (im.naturalWidth <= 1) markBroken(); });
+        setTimeout(() => { if (im.complete && im.naturalWidth <= 1 && !im.classList.contains('xft-broken')) {
           const host = im.closest('.xft-cell, .xft-vthumb');
           if (host && !host.classList.contains('xft-broken')) markBroken();
         } }, 800);
@@ -1077,9 +1085,13 @@
       let mediaCounts = null;
       if (panelTab === 'media') {
         const all = [];
+        // stale caches (pre-0.7.9) hold 1×1 data-URI placeholders alongside
+        // their real URLs (attachment-scan twins) — drop the placeholders so
+        // already-cached threads heal without a Refresh
+        const real = (list) => (list || []).filter((u) => !/^(data|blob):/i.test(u || ''));
         for (const r of ordered) {
-          for (const url of (r.images || [])) all.push({ r: r, url: url, pos: posMap.get(r.postId) || 0, kind: 'image' });
-          for (const url of (r.videos || [])) all.push({ r: r, url: url, pos: posMap.get(r.postId) || 0, kind: 'video' });
+          for (const url of real(r.images)) all.push({ r: r, url: url, pos: posMap.get(r.postId) || 0, kind: 'image' });
+          for (const url of real(r.videos)) all.push({ r: r, url: url, pos: posMap.get(r.postId) || 0, kind: 'video' });
         }
         mediaCounts = { all: all.length, image: 0, video: 0 };
         for (const it of all) mediaCounts[it.kind] += 1;
