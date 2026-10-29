@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         xf-thread-tools
 // @namespace    xf-thread-tools
-// @version      0.6.0
+// @version      0.6.1
 // @description  XenForo 2: sort thread posts by reaction count across all pages (cached) + floating media panel (images / external links).
 // @author       xf-thread-tools
 // @match        *://*/threads/*
@@ -47,6 +47,7 @@
     reactionsLink: 'a.reactionsBar-link',
     image: 'img.bbImage',
     attachment: 'a[href*="attachments"]',
+    unfurlImage: 'img.bbCodeBlockUnfurl-image',
     pageNav: '.pageNav',
     pageNavPage: '.pageNav-page',
     toolbar: '.p-title-pageAction, .p-title .buttonGroup, .p-title',
@@ -354,9 +355,11 @@
           const s = im.getAttribute('src') || im.getAttribute('data-src') || '';
           if (s) images.push(absolutize(s));
         });
-        body.querySelectorAll(SEL.attachment).forEach((a) => {
-          const h = a.getAttribute('href') || '';
-          if (h) images.push(absolutize(h));
+        // link-preview (unfurl) images — rendered as attachment-like cards;
+        // favicons (bbCodeBlockUnfurl-icon) and smilies stay excluded
+        body.querySelectorAll(SEL.unfurlImage).forEach((im) => {
+          const s = im.getAttribute('src') || im.getAttribute('data-src') || '';
+          if (s) images.push(absolutize(s));
         });
         // HTML5 videos: <video class="videotag"><source src> (site media threads)
         body.querySelectorAll('video').forEach((v) => {
@@ -365,6 +368,15 @@
           if (s) videos.push(absolutize(s));
         });
       }
+      // XF2 attachment blocks (.message-attachments) sit OUTSIDE .bbWrapper —
+      // scan the whole article; video-file attachments go to Videos by extension
+      art.querySelectorAll(SEL.attachment).forEach((a) => {
+        const h = a.getAttribute('href') || '';
+        if (!h) return;
+        const abs = absolutize(h);
+        if (VID_EXT_RE.test(abs)) videos.push(abs);
+        else images.push(abs);
+      });
 
       // media-file anchors (lightbox wraps img.bbImage in <a>) belong on the
       // Files/Videos tabs, not Links — partition before filtering
@@ -1500,10 +1512,10 @@
         hub.meta = Object.assign({ threadKey: threadKey, pageCount: getPageCount(), postIds: [], pagesDone: [], fetchedAt: 0, complete: false }, savedMeta);
         hub.meta.pageCount = Math.max(hub.meta.pageCount, getPageCount());
         hub.pagesDone = new Set(savedMeta.pagesDone || []);
-        if (!hub.meta.complete) {
-          seedLivePage(); // refresh live-page data even on partial cache
-          if (seededPage > 0) hub.pagesDone.add(seededPage);
-        }
+        // always re-seed the live page: current-page records refresh with the
+        // latest extractor (new media forms appear without a full ↻ Refresh)
+        seedLivePage();
+        if (seededPage > 0) hub.pagesDone.add(seededPage);
         hub.progress = { done: hub.meta.complete ? hub.meta.pageCount : hub.pagesDone.size, total: hub.meta.pageCount };
         if (hub.meta.pageCount === 1 && hub.pagesDone.has(1)) {
           hub.meta.complete = true;
