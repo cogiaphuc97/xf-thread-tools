@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         xf-thread-tools
 // @namespace    xf-thread-tools
-// @version      0.7.2
+// @version      0.7.3
 // @description  XenForo 2: sort thread posts by reaction count across all pages (cached) + floating media panel (images / external links).
 // @author       xf-thread-tools
 // @match        *://*/threads/*
@@ -901,7 +901,13 @@
         v.preload = 'metadata';
         v.muted = true;
         v.src = url;
-        v.addEventListener('error', () => im.classList.add('xft-broken'));
+        // dead link (e.g. expired image-proxy URLs): mark the containing
+        // cell/thumb, not just the <img> that may get replaced
+        const markBroken = () => {
+          const host = im.closest('.xft-cell, .xft-vthumb');
+          (host || im).classList.add('xft-broken');
+        };
+        v.addEventListener('error', markBroken);
         v.addEventListener('loadedmetadata', () => { if (im.parentNode) im.replaceWith(v); });
         v.load();
       });
@@ -1550,7 +1556,11 @@
         '.xft-cell-label{position:absolute;left:0;right:0;bottom:0;background:linear-gradient(transparent,hsl(240 10% 3.9%/.82));color:hsl(0 0% 98%);font-size:10px;padding:12px 5px 4px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;pointer-events:none}',
         // shadcn Badge (secondary) for the ▶ marker
         '.xft-cell-badge{position:absolute;top:4px;right:4px;background:hsl(240 10% 3.9%/.72);color:hsl(0 0% 98%);border-radius:9999px;font-size:10px;font-weight:500;padding:1px 7px;pointer-events:none}',
-        '.xft-broken{opacity:.2;filter:grayscale(1)}',
+        '.xft-broken{opacity:.15;filter:grayscale(1)}',
+        // a dead link renders as an explicit placeholder, never a black void
+        '.xft-cell.xft-broken,.xft-vthumb.xft-broken{background:hsl(var(--xft-muted))}',
+        '.xft-cell.xft-broken::after{content:"⚠ broken link";position:absolute;inset:0;display:flex;align-items:center;justify-content:center;font-size:11px;font-weight:500;color:hsl(var(--xft-muted-fg));pointer-events:none}',
+        '.xft-vthumb.xft-broken::after{content:"⚠";position:absolute;inset:0;display:flex;align-items:center;justify-content:center;font-size:16px;color:hsl(0 0% 98%/.7)}',
         // ---- links table ----
         '.xft-lrow{display:grid;grid-template-columns:170px 1fr;gap:8px;align-items:baseline;padding:3px 0;border-bottom:1px solid hsl(var(--xft-border)/.5)}',
         '.xft-lrow-first{padding-top:6px}',
