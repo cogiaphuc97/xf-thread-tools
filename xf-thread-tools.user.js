@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         xf-thread-tools
 // @namespace    xf-thread-tools
-// @version      0.7.7
+// @version      0.7.8
 // @description  XenForo 2: sort thread posts by reaction count across all pages (cached) + floating media panel (images / external links).
 // @author       xf-thread-tools
 // @match        *://*/threads/*
@@ -888,16 +888,20 @@
     // element is marked .xft-broken.
     function buildMediaEl(kind, url, thumb) {
       if (kind === 'video') {
-        const v = document.createElement('video');
         if (thumb) {
-          v.preload = 'metadata';
-          v.muted = true;
-          v.src = url + (url.indexOf('#') === -1 ? '#t=0.1' : '');
-        } else {
-          v.controls = true;
-          v.autoplay = true;
-          v.src = url;
+          // Video thumbs do NOT fetch: media hosts rate-limit (a video-heavy
+          // thread = hundreds of queued metadata requests stuck LOADING,
+          // rendering black cells that never error). A styled tile + the
+          // cell's ▶ badge is instant and reliable; the viewer streams the
+          // real video on click.
+          const tile = document.createElement('div');
+          tile.className = 'xft-vtile';
+          return tile;
         }
+        const v = document.createElement('video');
+        v.controls = true;
+        v.autoplay = true;
+        v.src = url;
         // dead video URL: same explicit placeholder as dead images
         const markVBroken = () => {
           const host = v.closest('.xft-cell, .xft-vthumb');
@@ -1617,6 +1621,9 @@
         '.xft-cell{position:relative;aspect-ratio:1;overflow:hidden;border:1px solid hsl(var(--xft-border));border-radius:calc(var(--xft-radius) - 2px);cursor:zoom-in;background:hsl(var(--xft-muted));padding:0;transition:box-shadow .15s}',
         '.xft-cell:hover{box-shadow:0 0 0 2px hsl(var(--xft-ring)/.35)}',
         '.xft-cell img,.xft-cell video{width:100%;height:100%;object-fit:cover;display:block}',
+        // video thumbs: no fetch — a muted gradient tile with the ▶ badge
+        '.xft-cell .xft-vtile{width:100%;height:100%;background:linear-gradient(160deg,hsl(var(--xft-muted)),hsl(var(--xft-muted-fg)/.14));display:flex;align-items:center;justify-content:center;position:relative}',
+        '.xft-cell .xft-vtile::before{content:"▶";font-size:22px;color:hsl(var(--xft-muted-fg)/.75)}',
         '.xft-cell-label{position:absolute;left:0;right:0;bottom:0;background:linear-gradient(transparent,hsl(240 10% 3.9%/.82));color:hsl(0 0% 98%);font-size:10px;padding:12px 5px 4px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;pointer-events:none}',
         // shadcn Badge (secondary) for the ▶ marker
         '.xft-cell-badge{position:absolute;top:4px;right:4px;background:hsl(240 10% 3.9%/.72);color:hsl(0 0% 98%);border-radius:9999px;font-size:10px;font-weight:500;padding:1px 7px;pointer-events:none}',
