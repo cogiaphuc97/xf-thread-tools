@@ -8,7 +8,7 @@ import path from 'node:path';
 
 const require = createRequire(import.meta.url);
 const userJsPath = path.join(path.dirname(fileURLToPath(import.meta.url)), '..', 'xf-thread-tools.user.js');
-const { parseReactionCount, filterLinks, sortPosts, estimateSize, partitionLinks } = require(userJsPath);
+const { parseReactionCount, filterLinks, sortPosts, estimateSize, partitionLinks, extractDomain, groupLinkItems, applyLinkFilters } = require(userJsPath);
 
 test('UMD export exposes the four pure functions', () => {
   assert.equal(typeof parseReactionCount, 'function');
@@ -150,4 +150,61 @@ test('partitionLinks: query/hash after extension still media; plain page stays',
   assert.deepStrictEqual(r.imageLinks, ['https://x/a.png#img']);
   assert.deepStrictEqual(r.videoLinks, ['https://x/file.webm']);
   assert.deepStrictEqual(r.links, ['https://x/watch?v=1']);
+});
+
+// ---- extractDomain (Links-tab domain filter values) ----
+test('extractDomain: www-stripped lowercase host; port kept; garbage -> ""', () => {
+  assert.equal(extractDomain('https://www.Example.COM/a?b=1'), 'example.com');
+  assert.equal(extractDomain('http://mirror.example.org:8080/x'), 'mirror.example.org:8080');
+  assert.equal(extractDomain('not a url'), '');
+  assert.equal(extractDomain(''), '');
+});
+
+// ---- groupLinkItems (Links-tab grouped first column) ----
+test('groupLinkItems: consecutive same-post items collapse into one group', () => {
+  const r1 = { postId: '1', author: 'a' };
+  const r2 = { postId: '2', author: 'b' };
+  const groups = groupLinkItems([
+    { r: r1, url: 'u1', pos: 1 },
+    { r: r1, url: 'u2', pos: 1 },
+    { r: r2, url: 'u3', pos: 2 }
+  ]);
+  assert.equal(groups.length, 2);
+  assert.equal(groups[0].r, r1);
+  assert.deepEqual(groups[0].urls, ['u1', 'u2']);
+  assert.equal(groups[1].r.postId, '2');
+  assert.deepEqual(groups[1].urls, ['u3']);
+});
+
+test('groupLinkItems: non-array -> []', () => {
+  assert.deepEqual(groupLinkItems(null), []);
+});
+
+// ---- applyLinkFilters (Links-tab search + checkbox filters) ----
+test('applyLinkFilters: query matches url OR author, case-insensitive', () => {
+  const items = [
+    { r: { postId: '1', author: 'Alice' }, url: 'https://x.com/a', pos: 1 },
+    { r: { postId: '2', author: 'Bob' }, url: 'https://mega.nz/folder', pos: 2 }
+  ];
+  assert.equal(applyLinkFilters(items, { query: 'MEGA' }).length, 1);
+  assert.equal(applyLinkFilters(items, { query: 'alice' })[0].r.postId, '1');
+  assert.equal(applyLinkFilters(items, { query: 'zzz' }).length, 0);
+  assert.equal(applyLinkFilters(items, {}).length, 2);
+  assert.equal(applyLinkFilters(items, { query: '  ' }).length, 2);
+});
+
+test('applyLinkFilters: user and domain Sets exclude non-members; combinable', () => {
+  const items = [
+    { r: { postId: '1', author: 'Alice' }, url: 'https://a.com/1', pos: 1 },
+    { r: { postId: '2', author: 'Bob' }, url: 'https://b.com/2', pos: 2 },
+    { r: { postId: '3', author: 'Bob' }, url: 'https://a.com/3', pos: 3 }
+  ];
+  assert.deepEqual(applyLinkFilters(items, { users: new Set(['Bob']) }).map((i) => i.r.postId), ['2', '3']);
+  assert.deepEqual(applyLinkFilters(items, { domains: new Set(['a.com']) }).map((i) => i.r.postId), ['1', '3']);
+  assert.deepEqual(
+    applyLinkFilters(items, { users: new Set(['Bob']), domains: new Set(['a.com']) }).map((i) => i.r.postId),
+    ['3']
+  );
+  // null Set = no filter on that axis
+  assert.equal(applyLinkFilters(items, { users: null, domains: null }).length, 3);
 });

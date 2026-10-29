@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         xf-thread-tools
 // @namespace    xf-thread-tools
-// @version      0.5.3
+// @version      0.6.0
 // @description  XenForo 2: sort thread posts by reaction count across all pages (cached) + floating media panel (images / external links).
 // @author       xf-thread-tools
 // @match        *://*/threads/*
@@ -129,6 +129,48 @@
       else links.push(raw);
     }
     return { imageLinks, videoLinks, links };
+  }
+
+  /** Hostname (www-stripped, lowercase, port kept) of a URL; '' when unparseable (pure). */
+  function extractDomain(url) {
+    if (typeof url !== 'string' || url === '') return '';
+    try { return hostKey(new URL(url).host); } catch (e) { return ''; }
+  }
+
+  /**
+   * Collapse consecutive same-post link items into one group per post (pure).
+   * Items arrive in table order (record order, then link order), so a linear
+   * scan is enough. Output: [{ r, pos, urls: [...] }, ...] — one per post.
+   */
+  function groupLinkItems(items) {
+    const groups = [];
+    for (const it of Array.isArray(items) ? items : []) {
+      const lastG = groups[groups.length - 1];
+      if (lastG && lastG.r.postId === it.r.postId) lastG.urls.push(it.url);
+      else groups.push({ r: it.r, pos: it.pos, urls: [it.url] });
+    }
+    return groups;
+  }
+
+  /**
+   * Links-tab search + column filters (pure).
+   * query: case-insensitive substring of the URL OR the author name.
+   * users/domains: Set of allowed values; null/undefined = no filtering.
+   */
+  function applyLinkFilters(items, opts) {
+    const o = opts || {};
+    const q = typeof o.query === 'string' ? o.query.trim().toLowerCase() : '';
+    const users = o.users instanceof Set ? o.users : null;
+    const domains = o.domains instanceof Set ? o.domains : null;
+    const out = [];
+    for (const it of Array.isArray(items) ? items : []) {
+      if (q && String(it.url).toLowerCase().indexOf(q) === -1
+        && String(it.r.author || '').toLowerCase().indexOf(q) === -1) continue;
+      if (users && !users.has(it.r.author || '')) continue;
+      if (domains && !domains.has(extractDomain(it.url))) continue;
+      out.push(it);
+    }
+    return out;
   }
 
   /**
@@ -766,6 +808,16 @@
     let showMoreBtn = null;
     let settingsView = null;
     let panelTab = 'files';
+    let panelSubTab = 'all';        // media sub-tab: all | image | video
+    let subtabsEl = null;
+    let subTabBtns = {};
+    let linksBarEl = null;
+    let linkSearchEl = null;
+    let linkUserSel = null;         // Set of allowed authors; null = no filter
+    let linkDomainSel = null;       // Set of allowed domains; null = no filter
+    let viewerItems = [];           // media items the fullscreen viewer navigates
+    let viewerIndex = -1;
+    let viewerKeyHandler = null;
     let rowLimit = settings.rowCap;
     let renderQueued = false;
 
@@ -776,11 +828,6 @@
       b.textContent = label;
       b.addEventListener('click', fn);
       return b;
-    }
-
-    function shortenUrl(u) {
-      let s = String(u).replace(/^https?:\/\//i, '');
-      return s.length > 70 ? s.slice(0, 67) + '…' : s;
     }
 
     function updateProgressText() {
@@ -803,32 +850,97 @@
       rowLimit = settings.rowCap;
       if (tabFilesBtn) tabFilesBtn.classList.toggle('xft-tab-active', t === 'media');
       if (tabLinksBtn) tabLinksBtn.classList.toggle('xft-tab-active', t === 'links');
+      if (subtabsEl) subtabsEl.hidden = t !== 'media';
+      if (linksBarEl) linksBarEl.hidden = t !== 'links';
       renderPanelBody();
     }
 
-    // fullscreen media viewer with jump-to-comment
+    function setSubTab(t) {
+      panelSubTab = t;
+      for (const k of ['all', 'image', 'video']) {
+        if (subTabBtns[k]) subTabBtns[k].classList.toggle('xft-tab-active', k === t);
+      }
+      renderPanelBody();
+    }
+
+    function updateSubTabCounts(c) {
+      if (subTabBtns.all) subTabBtns.all.textContent = 'All ' + c.all;
+      if (subTabBtns.image) subTabBtns.image.textContent = 'Image ' + c.image;
+      if (subTabBtns.video) subTabBtns.video.textContent = 'Video ' + c.video;
+    }
+
+    // fullscreen media viewer: prev/next, thumbnail filmstrip below the
+    // preview (the media around the current item), keyboard arrows, Esc
     function closeViewer() {
       const v = document.getElementById('xft-viewer');
       if (v) v.remove();
+      if (viewerKeyHandler) {
+        document.removeEventListener('keydown', viewerKeyHandler);
+        viewerKeyHandler = null;
+      }
     }
 
-    function openViewer(kind, url, postId, pos, author) {
+    function openViewerAt(i) {
+      if (i < 0 || i >= viewerItems.length) return;
+      viewerIndex = i;
+      const it = viewerItems[i];
       closeViewer();
       const v = document.createElement('div');
       v.id = 'xft-viewer';
-      const media = kind === 'video' ? document.createElement('video') : document.createElement('img');
-      if (kind === 'video') { media.controls = true; media.autoplay = true; }
-      media.src = url;
+      const media = it.kind === 'video' ? document.createElement('video') : document.createElement('img');
+      if (it.kind === 'video') { media.controls = true; media.autoplay = true; }
+      media.src = it.url;
       const bar = document.createElement('div');
       bar.className = 'xft-viewer-bar';
       const info = document.createElement('span');
-      info.textContent = '[#' + pos + '] ' + (author || '?');
-      const go = mkBtn('Go to comment', () => { closeViewer(); jumpTo(postId); });
+      info.textContent = (viewerIndex + 1) + '/' + viewerItems.length + ' · [#' + it.pos + '] ' + (it.author || '?');
+      const prev = mkBtn('‹ Prev', () => openViewerAt(viewerIndex - 1));
+      const next = mkBtn('Next ›', () => openViewerAt(viewerIndex + 1));
+      prev.disabled = viewerIndex === 0;
+      next.disabled = viewerIndex === viewerItems.length - 1;
+      const go = mkBtn('Go to comment', () => { closeViewer(); jumpTo(it.postId); });
       const close = mkBtn('✕ Close', closeViewer);
-      bar.append(info, go, close);
+      bar.append(info, prev, next, go, close);
       v.append(bar, media);
+      if (viewerItems.length > 1) {
+        const strip = document.createElement('div');
+        strip.className = 'xft-viewer-strip';
+        const from = Math.max(0, viewerIndex - 15);
+        const to = Math.min(viewerItems.length, viewerIndex + 16);
+        for (let k = from; k < to; k++) {
+          const t = viewerItems[k];
+          const th = document.createElement('div');
+          th.className = 'xft-vthumb' + (k === viewerIndex ? ' xft-vthumb-active' : '');
+          let el;
+          if (t.kind === 'video') {
+            el = document.createElement('video');
+            el.preload = 'metadata';
+            el.muted = true;
+            el.src = t.url + (t.url.indexOf('#') === -1 ? '#t=0.1' : '');
+          } else {
+            el = document.createElement('img');
+            el.loading = 'lazy';
+            el.src = t.url;
+          }
+          th.appendChild(el);
+          const idx = k;
+          th.addEventListener('click', () => openViewerAt(idx));
+          strip.appendChild(th);
+        }
+        v.appendChild(strip);
+        requestAnimationFrame(() => {
+          const act = strip.querySelector('.xft-vthumb-active');
+          if (act) act.scrollIntoView({ inline: 'center', block: 'nearest' });
+        });
+      }
       v.addEventListener('click', (e) => { if (e.target === v) closeViewer(); });
       document.body.appendChild(v);
+      viewerKeyHandler = (e) => {
+        if (e.key === 'ArrowLeft') openViewerAt(viewerIndex - 1);
+        else if (e.key === 'ArrowRight') openViewerAt(viewerIndex + 1);
+        else if (e.key === 'Escape') closeViewer();
+      };
+      document.addEventListener('keydown', viewerKeyHandler);
     }
 
     function jumpTo(postId) {
@@ -852,24 +964,46 @@
       if (!panelIsOpen() || !panelBodyEl) return;
       const ordered = orderedRecords();
       const posMap = new Map(ordered.map((r, i) => [r.postId, i + 1]));
-      const items = [];
+      let items = [];
+      let filtered = [];
+      let mediaCounts = null;
       if (panelTab === 'media') {
+        const all = [];
         for (const r of ordered) {
-          for (const url of (r.images || [])) items.push({ r: r, url: url, pos: posMap.get(r.postId) || 0, kind: 'image' });
-          for (const url of (r.videos || [])) items.push({ r: r, url: url, pos: posMap.get(r.postId) || 0, kind: 'video' });
+          for (const url of (r.images || [])) all.push({ r: r, url: url, pos: posMap.get(r.postId) || 0, kind: 'image' });
+          for (const url of (r.videos || [])) all.push({ r: r, url: url, pos: posMap.get(r.postId) || 0, kind: 'video' });
         }
+        mediaCounts = { all: all.length, image: 0, video: 0 };
+        for (const it of all) mediaCounts[it.kind] += 1;
+        updateSubTabCounts(mediaCounts);
+        items = panelSubTab === 'all' ? all : all.filter((it) => it.kind === panelSubTab);
+        viewerItems = items.map((it) => ({ kind: it.kind, url: it.url, postId: it.r.postId, pos: it.pos, author: it.r.author }));
       } else {
         for (const r of ordered) {
           for (const url of r.links) items.push({ r: r, url: url, pos: posMap.get(r.postId) || 0, kind: 'link' });
         }
+        filtered = applyLinkFilters(items, {
+          query: linkSearchEl ? linkSearchEl.value : '',
+          users: linkUserSel,
+          domains: linkDomainSel
+        });
       }
       // skip rebuild when nothing changed — background fetch progress ticks
       // must not churn the grid or reset the user's scroll position
-      const sig = panelTab + ':' + items.length + ':' + (panelTab === 'media' ? 0 : items.length ? items[items.length - 1].r.postId : 0);
+      // (sub-tab + search + filter selections are part of the signature)
+      const sig = panelTab + ':' + panelSubTab + ':' + JSON.stringify([
+        linkSearchEl ? linkSearchEl.value : '',
+        linkUserSel ? Array.from(linkUserSel).sort() : null,
+        linkDomainSel ? Array.from(linkDomainSel).sort() : null,
+        items.length,
+        panelTab === 'media' ? 0 : items.length ? items[items.length - 1].r.postId : 0
+      ]);
       if (sig === lastPanelSignature) { updateCountOnly(items.length); return; }
       lastPanelSignature = sig;
       const keepScroll = panelBodyEl.scrollTop;
-      panelCountEl.textContent = items.length + ' items';
+      panelCountEl.textContent = panelTab === 'links' && filtered.length !== items.length
+        ? filtered.length + '/' + items.length + ' items'
+        : items.length + ' items';
       panelBodyEl.textContent = '';
       const frag = document.createDocumentFragment();
       if (panelTab === 'media') {
@@ -922,7 +1056,7 @@
                 badge.textContent = '▶';
                 cell.appendChild(badge);
               }
-              cell.addEventListener('click', () => openViewer(it.kind, it.url, it.r.postId, it.pos, it.r.author));
+              cell.addEventListener('click', () => openViewerAt(i));
               rowEl.appendChild(cell);
             }
             vrows.appendChild(rowEl);
@@ -948,34 +1082,54 @@
       } else {
         panelBodyEl.onscroll = null;
         if (vResizeObserver) { vResizeObserver.disconnect(); vResizeObserver = null; }
-        const max = Math.min(items.length, rowLimit);
-        for (let i = 0; i < max; i++) {
-          const it = items[i];
-          const row = document.createElement('div');
-          row.className = 'xft-row';
-          const label = document.createElement('span');
-          label.className = 'xft-row-label';
-          label.textContent = '[#' + it.pos + '] ' + (it.r.author || '?');
-          label.title = 'Jump to post ' + it.r.postId;
-          label.addEventListener('click', () => jumpTo(it.r.postId));
-          const a = document.createElement('a');
-          a.href = it.url;
-          a.target = '_blank';
-          a.rel = 'noopener noreferrer';
-          a.textContent = shortenUrl(it.url);
-          row.append(label, a);
-          frag.appendChild(row);
+        // grouped rows: the post label ([#pos] author) renders once per post
+        // in a fixed-width first column; the post's links stack beneath it
+        const groups = groupLinkItems(filtered);
+        const max = Math.min(filtered.length, rowLimit);
+        let n = 0;
+        for (const g of groups) {
+          if (n >= max) break;
+          for (let i = 0; i < g.urls.length && n < max; i++, n++) {
+            const row = document.createElement('div');
+            row.className = 'xft-lrow' + (i === 0 ? ' xft-lrow-first' : '');
+            const c1 = document.createElement('div');
+            if (i === 0) {
+              c1.className = 'xft-lcell-label';
+              c1.textContent = '[#' + g.pos + '] ' + (g.r.author || '?');
+              c1.title = c1.textContent + ' — ' + g.urls.length + ' link(s) — jump to post';
+              c1.addEventListener('click', () => jumpTo(g.r.postId));
+            }
+            const c2 = document.createElement('div');
+            c2.className = 'xft-lcell-link';
+            const a = document.createElement('a');
+            a.href = g.urls[i];
+            a.target = '_blank';
+            a.rel = 'noopener noreferrer';
+            a.textContent = g.urls[i];
+            a.title = g.urls[i];
+            c2.appendChild(a);
+            row.append(c1, c2);
+            frag.appendChild(row);
+          }
+        }
+        if (!filtered.length && items.length) {
+          const none = document.createElement('div');
+          none.className = 'xft-empty';
+          none.textContent = 'No links match your search/filters.';
+          frag.appendChild(none);
         }
       }
       if (!items.length) {
         const empty = document.createElement('div');
         empty.className = 'xft-empty';
-        empty.textContent = hub.fetchRunning ? 'Fetching…' : 'Nothing found yet.';
+        empty.textContent = hub.fetchRunning
+          ? 'Fetching…'
+          : (mediaCounts && mediaCounts.all > 0 ? 'No ' + panelSubTab + 's in this thread.' : 'Nothing found yet.');
         frag.appendChild(empty);
       }
       panelBodyEl.appendChild(frag);
       if (keepScroll) panelBodyEl.scrollTop = keepScroll;
-      showMoreBtn.hidden = items.length <= rowLimit;
+      showMoreBtn.hidden = (panelTab === 'links' ? filtered.length : items.length) <= rowLimit;
       const notes = [];
       if (hub.capNotice || cache.stopPersist) notes.push('Cache cap reached — new data kept in memory only (not persisted).');
       if (hub.partialNotice) notes.push('Fetch stopped early — list is partial.');
@@ -1046,6 +1200,7 @@
       let pend = 0;
       let raf = 0;
       panelBodyEl.addEventListener('wheel', (e) => {
+        if (panelTab !== 'media') return; // Links tab keeps native scrolling
         e.preventDefault();
         // every wheel event contributes at most one row of travel, no native
         // path at all — free-spin/high-res wheels sending small rapid deltas
@@ -1072,6 +1227,98 @@
         renderPanelBody();
         ensure(false);
       }
+    }
+
+    // column filter: button + popup checkbox list built from current table
+    // values (distinct users / distinct link domains); click outside closes
+    function buildFilterControl(label, getValues, getSel, setSel) {
+      const wrap = document.createElement('div');
+      wrap.className = 'xft-filter';
+      let pop = null;
+      const close = () => { if (pop) { pop.remove(); pop = null; } };
+      const btn = mkBtn(label, () => {
+        if (pop) { close(); return; }
+        const vals = getValues();
+        const sel = getSel(); // Set of allowed values, or null = everything
+        pop = document.createElement('div');
+        pop.className = 'xft-fpop';
+        const applyState = () => {
+          const boxes = Array.from(pop.querySelectorAll('input[type=checkbox]'));
+          const checked = new Set(boxes.filter((b) => b.checked).map((b) => b.value));
+          setSel(checked.size === vals.length ? null : checked);
+          btn.classList.toggle('xft-filter-on', checked.size !== vals.length);
+        };
+        const head = document.createElement('div');
+        head.className = 'xft-fpop-head';
+        head.append(
+          mkBtn('All', () => { pop.querySelectorAll('input[type=checkbox]').forEach((b) => { b.checked = true; }); applyState(); }),
+          mkBtn('None', () => { pop.querySelectorAll('input[type=checkbox]').forEach((b) => { b.checked = false; }); applyState(); })
+        );
+        pop.appendChild(head);
+        if (!vals.length) {
+          const none = document.createElement('div');
+          none.className = 'xft-empty';
+          none.textContent = 'No values yet.';
+          pop.appendChild(none);
+        }
+        for (const v of vals) {
+          const lab = document.createElement('label');
+          const cb = document.createElement('input');
+          cb.type = 'checkbox';
+          cb.value = v;
+          cb.checked = !sel || sel.has(v);
+          cb.addEventListener('change', applyState);
+          const sp = document.createElement('span');
+          sp.textContent = v === '' ? '(no name)' : v;
+          sp.title = v;
+          lab.append(cb, sp);
+          pop.appendChild(lab);
+        }
+        wrap.appendChild(pop);
+      });
+      document.addEventListener('click', (e) => { if (pop && !wrap.contains(e.target)) close(); });
+      wrap.appendChild(btn);
+      return wrap;
+    }
+
+    // Links-tab toolbar: search box (matches link URL or author) + the two
+    // column filters. Sits below the tab row, always visible on Links.
+    function buildLinksBar() {
+      const bar = document.createElement('div');
+      bar.className = 'xft-linksbar';
+      linkSearchEl = document.createElement('input');
+      linkSearchEl.type = 'search';
+      linkSearchEl.placeholder = 'Search link or user…';
+      let debounce = 0;
+      linkSearchEl.addEventListener('input', () => {
+        clearTimeout(debounce);
+        debounce = setTimeout(() => { rowLimit = settings.rowCap; renderPanelBody(); }, 150);
+      });
+      bar.appendChild(linkSearchEl);
+      // user column: one checkbox per author that has at least one link
+      bar.appendChild(buildFilterControl('User ▾', () => {
+        const seen = new Set();
+        const vals = [];
+        for (const r of orderedRecords()) {
+          const a = r.author || '';
+          if ((r.links || []).length && !seen.has(a)) { seen.add(a); vals.push(a); }
+        }
+        return vals;
+      }, () => linkUserSel, (s) => { linkUserSel = s; renderPanelBody(); }));
+      // link column: one checkbox per distinct link domain
+      bar.appendChild(buildFilterControl('Domain ▾', () => {
+        const seen = new Set();
+        const vals = [];
+        for (const r of orderedRecords()) {
+          for (const u of (r.links || [])) {
+            const d = extractDomain(u);
+            if (d && !seen.has(d)) { seen.add(d); vals.push(d); }
+          }
+        }
+        return vals;
+      }, () => linkDomainSel, (s) => { linkDomainSel = s; renderPanelBody(); }));
+      bar.hidden = true;
+      return bar;
     }
 
     function buildEdgeButton() {
@@ -1112,6 +1359,18 @@
       panelCountEl.textContent = '0 items';
       tabs.append(tabFilesBtn, tabLinksBtn, panelCountEl);
 
+      // media sub-tabs (All / Image / Video), below the main tab row
+      subtabsEl = document.createElement('div');
+      subtabsEl.className = 'xft-subtabs';
+      subtabsEl.hidden = true;
+      subTabBtns.all = mkBtn('All', () => setSubTab('all'), 'xft-btn xft-subtab');
+      subTabBtns.image = mkBtn('Image', () => setSubTab('image'), 'xft-btn xft-subtab');
+      subTabBtns.video = mkBtn('Video', () => setSubTab('video'), 'xft-btn xft-subtab');
+      subTabBtns.all.classList.add('xft-tab-active');
+      subtabsEl.append(subTabBtns.all, subTabBtns.image, subTabBtns.video);
+
+      linksBarEl = buildLinksBar();
+
       settingsView = buildSettingsView();
       panelBodyEl = document.createElement('div');
       panelBodyEl.className = 'xft-body';
@@ -1121,7 +1380,7 @@
       noteEl.className = 'xft-note';
       noteEl.hidden = true;
 
-      panel.append(head, tabs, settingsView, panelBodyEl, showMoreBtn, noteEl);
+      panel.append(head, tabs, subtabsEl, linksBarEl, settingsView, panelBodyEl, showMoreBtn, noteEl);
       document.body.appendChild(panel);
       setTab('media');
       buildEdgeButton();
@@ -1172,9 +1431,28 @@
         '#xft-viewer{position:fixed;inset:0;background:rgba(0,0,0,.92);z-index:10000;display:flex;flex-direction:column;align-items:center;justify-content:center;gap:12px}',
         '#xft-viewer img,#xft-viewer video{max-width:92vw;max-height:80vh;object-fit:contain}',
         '.xft-viewer-bar{display:flex;gap:10px;align-items:center;color:#fff;font:12px sans-serif}',
-        '.xft-row{display:flex;gap:8px;align-items:baseline;padding:3px 0;border-bottom:1px solid #f0f2f5}',
-        '.xft-row-label{white-space:nowrap;cursor:pointer;color:#0b6bcb;text-decoration:underline dotted;max-width:40%;overflow:hidden;text-overflow:ellipsis}',
-        '.xft-row a{flex:1;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;color:inherit}',
+        '.xft-viewer-strip{display:flex;gap:6px;overflow-x:auto;max-width:94vw;padding:4px;scrollbar-width:thin}',
+        '.xft-vthumb{flex:0 0 72px;width:72px;height:72px;border:2px solid transparent;border-radius:6px;overflow:hidden;cursor:pointer;background:#000;position:relative}',
+        '.xft-vthumb img,.xft-vthumb video{width:100%;height:100%;object-fit:cover;display:block}',
+        '.xft-vthumb-active{border-color:#fff}',
+        '.xft-btn:disabled{opacity:.45;cursor:default}',
+        '.xft-subtabs{display:flex;align-items:center;gap:6px;padding:6px 8px;border-bottom:1px solid #e2e7ee}',
+        '.xft-subtabs[hidden]{display:none}',
+        '.xft-subtab{font-size:11px;padding:2px 6px}',
+        '.xft-linksbar{display:flex;align-items:center;gap:6px;padding:6px 8px;border-bottom:1px solid #e2e7ee}',
+        '.xft-linksbar[hidden]{display:none}',
+        '.xft-linksbar input[type=search]{flex:1;min-width:0;border:1px solid #cfd6de;border-radius:4px;padding:3px 8px;font:11px sans-serif;background:#fff;color:#14171a}',
+        '.xft-filter{position:relative}',
+        '.xft-filter-on{background:#0b6bcb;border-color:#0b6bcb;color:#fff;font-weight:700}',
+        '.xft-fpop{position:absolute;top:calc(100% + 4px);right:0;min-width:200px;max-width:280px;max-height:280px;overflow:auto;background:#fff;border:1px solid #cfd6de;border-radius:6px;box-shadow:0 8px 24px rgba(0,0,0,.18);padding:6px;z-index:20}',
+        '.xft-fpop-head{display:flex;gap:6px;padding:2px 2px 6px;border-bottom:1px solid #e2e7ee;margin-bottom:4px}',
+        '.xft-fpop label{display:flex;align-items:center;gap:6px;padding:2px 4px;font:11px sans-serif;cursor:pointer;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}',
+        '.xft-fpop label span{overflow:hidden;text-overflow:ellipsis}',
+        '.xft-lrow{display:grid;grid-template-columns:170px 1fr;gap:8px;align-items:baseline;padding:2px 0;border-bottom:1px solid #f0f2f5}',
+        '.xft-lrow-first{padding-top:6px}',
+        '.xft-lcell-label{white-space:nowrap;overflow:hidden;text-overflow:ellipsis;cursor:pointer;color:#0b6bcb;text-decoration:underline dotted}',
+        '.xft-lcell-link{overflow:hidden;text-overflow:ellipsis;white-space:nowrap;min-width:0}',
+        '.xft-lcell-link a{color:inherit}',
         '.xft-empty{padding:10px 0;opacity:.6}',
         '.xft-note{padding:6px 8px;border-top:1px solid #e2e7ee;color:#8a5300;background:#fff7e0}',
         '.xft-note[hidden]{display:none}',
@@ -1192,8 +1470,13 @@
         '#xft-sort-btn{margin-left:4px;cursor:pointer}',
         '@media (prefers-color-scheme:dark){',
         '#xft-panel{background:#1c2027;color:#e6e9ee;border-color:#3a4250}',
-        '.xft-head,.xft-tabs{border-color:#3a4250}',
+        '.xft-head,.xft-tabs,.xft-subtabs,.xft-linksbar{border-color:#3a4250}',
         '.xft-btn{background:#262c36;border-color:#3a4250;color:#e6e9ee}',
+        '.xft-linksbar input[type=search]{background:#262c36;border-color:#3a4250;color:#e6e9ee}',
+        '.xft-filter-on{background:#3b82f6;border-color:#3b82f6}',
+        '.xft-fpop{background:#1c2027;border-color:#3a4250}',
+        '.xft-fpop-head{border-color:#3a4250}',
+        '.xft-lrow{border-color:#2a303a}',
         '#xft-edge-btn{background:#1c2027;border-color:#3a4250;color:#e6e9ee}',
         '.xft-tab-active{background:#3b82f6;border-color:#3b82f6;color:#fff}',
         '.xft-cell{border-color:#3a4250;background:#262c36}',
@@ -1252,5 +1535,5 @@
   }
 
   // UMD export of the pure functions for node:test (no DOM / GM usage in them).
-  if (typeof module !== 'undefined' && module.exports) module.exports = { parseReactionCount, filterLinks, sortPosts, estimateSize, partitionLinks };
+  if (typeof module !== 'undefined' && module.exports) module.exports = { parseReactionCount, filterLinks, sortPosts, estimateSize, partitionLinks, extractDomain, groupLinkItems, applyLinkFilters };
 })();

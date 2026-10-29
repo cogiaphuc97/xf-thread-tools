@@ -10,7 +10,7 @@
 A single Tampermonkey userscript for **XenForo 2** forums that adds two tools to thread pages:
 
 1. **Reaction sort** — fetches every page of the thread (sequentially, politely, cached in IndexedDB), then reorders the posts you see by reaction count, descending. Zero-reaction posts go last; equal counts keep thread order. Click again to restore the exact original order.
-2. **Media panel** — a floating, draggable panel with two tabs: **Files** (embedded `img.bbImage` + native XF attachments where present) and **Links** (external http(s) links from post bodies, same-host/profile/permalink links filtered out). Items are labeled `[post#] author` and fill in progressively while pages download.
+2. **Media panel** — a right-docked drawer panel with two tabs: **Media** (grid of embedded images + videos, with **All / Image / Video** sub-tabs) and **Links** (external http(s) links from post bodies, same-host/profile/permalink links filtered out, grouped per post, with search + user/domain column filters). Items are labeled `[post#] author` and fill in progressively while pages download.
 
 Built and validated against XenForo 2 markup (probe date 2026-10-29). No admin access, no API keys, no server — everything runs client-side in your browser.
 
@@ -30,8 +30,10 @@ The script requests only two grants — `GM_setValue` / `GM_getValue` (used to s
 - Click the button again (now labeled **↕ Chronological**) to remove all clones and restore the exact original post order.
 
 ### Media panel
-- Click **📁 Media**. The panel opens top-right; drag its title bar to move it.
-- **Files** tab lists images; **Links** tab lists external URLs. Rows show `[post#] author — url`.
+- Click the **📁 Media** tab on the right edge of the page. The panel slides in as a drawer (click **✕** to slide it back out).
+- **Media** tab: 4-column grid of images and videos (video cells carry a ▶ badge). Sub-tabs **All / Image / Video** below the tab row switch kinds; each shows its count.
+- Click any cell for the fullscreen viewer: **‹ Prev / Next ›** buttons, arrow keys, `Esc` to close, a position counter (`n/total · [post#] author`), **Go to comment**, and a thumbnail filmstrip below the preview showing the media around the current item (click a thumb to jump there).
+- **Links** tab: rows are grouped per post — the `[post#] author` label appears once in a fixed-width column (long names ellipsize), with that post's links stacked beneath it. Below the tab row sits a toolbar, always visible: a **search box** (matches the URL or the author name, case-insensitive) and two column filters (**User ▾**, **Domain ▾**) that open checkbox lists built from the values currently in the table, with All/None shortcuts.
 - Click the `[post#] author` label to jump: if that post is currently in the DOM it scrolls to it and pulses a highlight; otherwise it opens `/threads/{id}/post-{postId}` in a new tab. The URL itself always opens in a new tab.
 - Header controls: `n/total` progress, **■ Stop** (cancels the fetch, keeps the partial list interactive), **↻ Refresh** (deletes the cached records for this thread and re-fetches), **⚙** (settings), **✕** (close).
 - Rows are capped at 500 per tab with a **Show more rows** button (cap configurable, see Settings).
@@ -106,6 +108,6 @@ Sorting a thread means downloading **every page of it**. A 1886-page thread is 1
 npm test
 ```
 
-runs the `node:test` suite (`tests/parse.test.mjs`) against the pure functions (`parseReactionCount`, `filterLinks`, `sortPosts`, `estimateSize`) exported from the userscript via its UMD tail. The script's runtime guard (`<html id="XF" data-template="thread_view">`) keeps all DOM/GM code inert under Node, so the same file is both the deliverable and the test target.
+runs the `node:test` suite (`tests/parse.test.mjs`) against the pure functions (`parseReactionCount`, `filterLinks`, `sortPosts`, `estimateSize`, `partitionLinks`, `extractDomain`, `groupLinkItems`, `applyLinkFilters`) exported from the userscript via its UMD tail. The script's runtime guard (`<html id="XF" data-template="thread_view">`) keeps all DOM/GM code inert under Node, so the same file is both the deliverable and the test target.
 
 The userscript is inert by design on non-XF pages and on non-thread XF pages (forum list, profile, …): no buttons, no console output, no network.
