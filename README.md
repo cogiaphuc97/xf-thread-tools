@@ -30,7 +30,7 @@ The script requests only two grants — `GM_setValue` / `GM_getValue` (used to s
 - Click the button again (now labeled **↕ Chronological**) to remove all clones and restore the exact original post order.
 
 ### Media panel
-- Click the **📁 Media** tab on the right edge of the page. The panel slides in as a drawer (click **✕** to slide it back out).
+- Click the **📁 Media** tab on the right edge of the page. The panel slides in as a drawer (click **✕** to slide it back out). Panel UI is styled by an embedded token system (shadcn/ui's zinc palette and radius scale, as plain CSS custom properties — no dependencies) and follows your OS light/dark mode.
 - **Media** tab: 4-column grid of images and videos (video cells carry a ▶ badge). Sub-tabs **All / Image / Video** below the tab row switch kinds; each shows its count.
 - Click any cell for the fullscreen viewer: **‹ Prev / Next ›** buttons, arrow keys, `Esc` to close, a position counter (`n/total · [post#] author`), **Go to comment**, and a thumbnail filmstrip below the preview showing the media around the current item (click a thumb to jump there).
 - **Links** tab: rows are grouped per post — the `[post#] author` label appears once in a fixed-width column (long names ellipsize), with that post's links stacked beneath it. Below the tab row sits a toolbar, always visible: a **search box** (matches the URL or the author name, case-insensitive) and two column filters (**User ▾**, **Domain ▾**) that open checkbox lists built from the values currently in the table, with All/None shortcuts.
