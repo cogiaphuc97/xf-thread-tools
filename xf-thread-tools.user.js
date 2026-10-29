@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         xf-thread-tools
 // @namespace    xf-thread-tools
-// @version      0.5.0
+// @version      0.5.1
 // @description  XenForo 2: sort thread posts by reaction count across all pages (cached) + floating media panel (images / external links).
 // @author       xf-thread-tools
 // @match        *://*/threads/*
@@ -1024,6 +1024,27 @@
       if (panelCountEl) panelCountEl.textContent = n + ' items';
     }
 
+    // virtualized-grid row pitch: square 4-col cells (kept in sync with .xft-vrow CSS)
+    function gridRowH() {
+      const gap = 6;
+      const cols = 4;
+      const cellW = (panelBodyEl.clientWidth - 20 - (cols - 1) * gap) / cols;
+      return cellW + 2 + gap;
+    }
+
+    // normalize wheel scrolling: one notch = one grid row, no matter how tall
+    // the virtualized content is (a flick must not fly hundreds of rows);
+    // small deltas (trackpad pixel scrolling) stay native
+    function installWheelNormalizer() {
+      panelBodyEl.addEventListener('wheel', (e) => {
+        if (Math.abs(e.deltaY) < 40) return;
+        e.preventDefault();
+        const dir = e.deltaY > 0 ? 1 : -1;
+        const notches = e.deltaMode === 1 ? Math.max(1, Math.round(Math.abs(e.deltaY))) : 1;
+        panelBodyEl.scrollBy({ top: dir * notches * gridRowH(), behavior: 'smooth' });
+      }, { passive: false });
+    }
+
     function setPanelOpen(open) {
       if (!panel) return;
       panel.classList.toggle('xft-open', open);
@@ -1087,6 +1108,7 @@
       document.body.appendChild(panel);
       setTab('media');
       buildEdgeButton();
+      installWheelNormalizer();
     }
 
     // ---------- step 9: toolbar injection ----------
@@ -1122,7 +1144,7 @@
         '.xft-tabs{display:flex;align-items:center;gap:6px;padding:6px 8px;border-bottom:1px solid #e2e7ee}',
         '.xft-tab-active{background:#0b6bcb;border-color:#0b6bcb;color:#fff;font-weight:700;box-shadow:0 1px 5px rgba(11,107,203,.45)}',
         '.xft-count{margin-left:auto;opacity:.7}',
-        '.xft-body{overflow-y:auto;flex:1;padding:8px 10px;scrollbar-width:thin}',
+        '.xft-body{overflow-y:auto;flex:1;padding:8px 10px;scrollbar-width:thin;overscroll-behavior:contain}',
         '.xft-grid{display:grid;grid-template-columns:repeat(4,1fr);gap:6px}',
         '.xft-vrows{display:flex;flex-direction:column;gap:6px}',
         '.xft-vrow{display:grid;grid-template-columns:repeat(4,1fr);gap:6px}',
