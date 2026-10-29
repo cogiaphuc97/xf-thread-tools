@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         xf-thread-tools
 // @namespace    xf-thread-tools
-// @version      0.7.3
+// @version      0.7.4
 // @description  XenForo 2: sort thread posts by reaction count across all pages (cached) + floating media panel (images / external links).
 // @author       xf-thread-tools
 // @match        *://*/threads/*
@@ -890,6 +890,11 @@
           v.autoplay = true;
           v.src = url;
         }
+        // dead video URL: same explicit placeholder as dead images
+        v.addEventListener('error', () => {
+          const host = v.closest('.xft-cell, .xft-vthumb');
+          (host || v).classList.add('xft-broken');
+        });
         return v;
       }
       const im = document.createElement('img');
