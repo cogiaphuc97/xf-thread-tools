@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         xf-thread-tools
 // @namespace    xf-thread-tools
-// @version      0.7.1
+// @version      0.7.2
 // @description  XenForo 2: sort thread posts by reaction count across all pages (cached) + floating media panel (images / external links).
 // @author       xf-thread-tools
 // @match        *://*/threads/*
@@ -845,7 +845,10 @@
     let noteEl = null;
     let tabFilesBtn = null;
     let tabLinksBtn = null;
-    let showMoreBtn = null;
+    // Links-tab auto-load: sentinel div observed at the end of the list —
+    // reaching it extends rowLimit, so there is no "Show more" button
+    let linksSentinel = null;
+    let linksObserver = null;
     let settingsView = null;
     let panelTab = 'files';
     let panelSubTab = 'all';        // media sub-tab: all | image | video
@@ -1184,7 +1187,24 @@
       if (keepScroll) panelBodyEl.scrollTop = keepScroll;
       // media grid is window-virtualized and renders what the viewport shows —
       // row capping (and this button) only applies to the Links tab
-      showMoreBtn.hidden = panelTab !== 'links' || filtered.length <= rowLimit;
+      // auto-load replaces the old Show-more button: a sentinel at the list
+      // end extends rowLimit when scrolled into view (media grid is
+      // window-virtualized and needs no capping)
+      if (linksObserver) linksObserver.disconnect();
+      if (panelTab === 'links' && filtered.length > rowLimit) {
+        if (!linksObserver) {
+          linksObserver = new IntersectionObserver(() => {
+            rowLimit += settings.rowCap;
+            renderPanelBody();
+          }, { root: panelBodyEl, rootMargin: '600px' });
+        }
+        if (!linksSentinel || !linksSentinel.isConnected) {
+          linksSentinel = document.createElement('div');
+          linksSentinel.className = 'xft-sentinel';
+        }
+        panelBodyEl.appendChild(linksSentinel);
+        linksObserver.observe(linksSentinel);
+      }
       const notes = [];
       if (hub.capNotice || cache.stopPersist) notes.push('Cache cap reached — new data kept in memory only (not persisted).');
       if (hub.partialNotice) notes.push('Fetch stopped early — list is partial.');
@@ -1429,13 +1449,11 @@
       settingsView = buildSettingsView();
       panelBodyEl = document.createElement('div');
       panelBodyEl.className = 'xft-body';
-      showMoreBtn = mkBtn('Show more rows', () => { rowLimit += settings.rowCap; renderPanelBody(); });
-      showMoreBtn.hidden = true;
       noteEl = document.createElement('div');
       noteEl.className = 'xft-note';
       noteEl.hidden = true;
 
-      panel.append(head, tabs, subtabsEl, linksBarEl, settingsView, panelBodyEl, showMoreBtn, noteEl);
+      panel.append(head, tabs, subtabsEl, linksBarEl, settingsView, panelBodyEl, noteEl);
       document.body.appendChild(panel);
       setTab('media');
       buildEdgeButton();

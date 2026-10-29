@@ -107,7 +107,7 @@ try {
   check('thread page rendered', isThread === true);
 
   // 2. Disable background auto-fetch so the run stays deterministic, then inject
-  await ev(cdp, `localStorage.setItem('xft_xfThreadTools:settings', JSON.stringify({ autoFetch: 0, delayMs: 250, rowCap: 2 })); true`);
+  await ev(cdp, `localStorage.setItem('xft_xfThreadTools:settings', JSON.stringify({ autoFetch: 0, delayMs: 250, rowCap: 1 })); true`);
   const inj = await cdp.send('Runtime.evaluate', { expression: readFileSync(INJECT, 'utf8') });
   if (inj.exceptionDetails) console.log('INJECT EXCEPTION:', JSON.stringify((inj.exceptionDetails.exception || {}).description || inj.exceptionDetails.text).slice(0, 800));
   await sleep(4500); // cache.open() bails to memory mode at 3s when IndexedDB stalls
@@ -158,11 +158,9 @@ try {
     missing.length === 0 && extra.length === 0,
     'grid=' + cells.size + ' own=' + own.size + ' missing=' + missing.length + ' extra=' + extra.length + ' (quoted copies on page: ' + panel.quotedSrcs.length + ')');
 
-  // 3b. "Show more rows" must stay hidden on the media tab (grid is
-  // virtualized; the button only paginates Links rows)
-  const moreBtnExpr = `(Array.from(document.querySelectorAll('#xft-panel .xft-btn')).find((b) => b.textContent === 'Show more rows') || null)`;
-  const mediaBtnShown = await ev(cdp, `!!${moreBtnExpr} && !${moreBtnExpr}.hidden`);
-  check('Show more rows hidden on media tab', mediaBtnShown === false);
+  // 3b. the "Show more rows" button is gone entirely (Links auto-loads)
+  check('Show more rows button removed',
+    await ev(cdp, `!Array.from(document.querySelectorAll('#xft-panel')).length || !Array.from(document.querySelectorAll('#xft-panel *')).some((el) => el.textContent === 'Show more rows')`));
 
   // 4. Sort on partial cache. Two paths, both valid ends:
   //    (a) fetch keeps running → second click aborts → partial sort;
@@ -223,21 +221,18 @@ try {
       && restored.firstArticle === firstArticleBefore,
     JSON.stringify(restored.label) + ' first=' + restored.firstArticle);
 
-  // 5b. "Show more rows" on Links: after the sort's partial fetch there are
-  // more link items than rowCap (2) — a click must render more rows
-  // (regression: signature guard skipped the rebuild after rowLimit bumped)
+  // 5b. Links auto-load (no button): the sentinel fills the viewport and then
+  // paginates on scroll, so a short list ends fully rendered on its own —
+  // rows must equal the item count without any click
   await ev(cdp, `(Array.from(document.querySelectorAll('#xft-panel .xft-tab')).find((b) => b.textContent.trim() === 'Links') || { click(){} }).click(); true`);
-  await sleep(600);
-  const linksBtn = await ev(cdp, `!!${moreBtnExpr} && !${moreBtnExpr}.hidden`);
-  if (linksBtn) {
-    const before = await ev(cdp, `document.querySelectorAll('#xft-panel .xft-lrow').length`);
-    await ev(cdp, `${moreBtnExpr}.click(); true`);
-    await sleep(300);
-    const after = await ev(cdp, `document.querySelectorAll('#xft-panel .xft-lrow').length`);
-    check('Show more rows renders more rows', after > before, 'rows ' + before + ' -> ' + after);
-  } else {
-    check('Show more rows renders more rows', true, 'skipped: fewer link items than rowCap');
-  }
+  await sleep(900); // sentinel cascade needs a paint + observer pass or two
+  const links = await ev(cdp, `({
+    count: (document.querySelector('#xft-panel .xft-count') || { textContent: '' }).textContent.trim(),
+    rows: document.querySelectorAll('#xft-panel .xft-lrow').length
+  })`);
+  const itemCount = parseInt((links.count.match(/(\d+)/) || [0, 0])[1], 10);
+  check('Links rows auto-load without a button', links.rows === itemCount,
+    'count=' + links.count + ' rows=' + links.rows + (itemCount === 0 ? ' (no links on this page)' : ''));
 
   cdp.close();
 } catch (e) {

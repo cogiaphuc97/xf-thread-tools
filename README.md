@@ -36,7 +36,7 @@ The script requests only two grants — `GM_setValue` / `GM_getValue` (used to s
 - **Links** tab: rows are grouped per post — the `[post#] author` label appears once in a fixed-width column (long names ellipsize), with that post's links stacked beneath it. Below the tab row sits a toolbar, always visible: a **search box** (matches the URL or the author name, case-insensitive) and two column filters (**User ▾**, **Domain ▾**) that open checkbox lists built from the values currently in the table, with All/None shortcuts.
 - Click the `[post#] author` label to jump: if that post is currently in the DOM it scrolls to it and pulses a highlight; otherwise it opens `/threads/{id}/post-{postId}` in a new tab. The URL itself always opens in a new tab.
 - Header controls: `n/total` progress, **■ Stop** (cancels the fetch, keeps the partial list interactive), **↻ Refresh** (deletes the cached records for this thread and re-fetches), **⚙** (settings), **✕** (close).
-- Rows are capped at 500 per tab with a **Show more rows** button (cap configurable, see Settings).
+- Long lists never dump the DOM at once: rows render progressively and extend automatically as you scroll (no button; batch size = `rowCap`, see Settings).
 
 ### Caching
 - Extracted posts are cached per thread in IndexedDB (db `xf-thread-tools`, stores `posts` and `threads`). Reopening a cached thread is instant — the script issues **zero** page requests until you press **↻ Refresh**.
