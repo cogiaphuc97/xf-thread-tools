@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         xf-thread-tools
 // @namespace    xf-thread-tools
-// @version      0.4.1
+// @version      0.5.0
 // @description  XenForo 2: sort thread posts by reaction count across all pages (cached) + floating media panel (images / external links).
 // @author       xf-thread-tools
 // @match        *://*/threads/*
@@ -32,8 +32,9 @@
   const DEFAULT_SETTINGS = {
     delayMs: 350,                // politeness delay between page fetches
     chunkSize: 50,               // sorted-view render chunk
-    rowCap: 500,                 // panel rows rendered before "show more"
+    rowCap: 500,                 // panel rows rendered before "show more" (Links tab)
     capBytes: DEFAULT_CAP_BYTES, // IndexedDB persistence cap
+    autoFetch: 1,                // 1 = fetch the whole thread in background on page load
     basePath: '',                // '' = forum at site root; '/forum' for subpath installs
     selectors: {}                // per-site selector overrides, merged over BASE_SEL
   };
@@ -600,7 +601,7 @@
       // mid-run failure. Explicit refresh (force=true) is the only refetch path.
       if (!force && (hub.meta.complete || hub.records.size > 0)) {
         if (!hub.progress || (!hub.progress.total && hub.meta.pageCount)) {
-          hub.progress = { done: hub.pagesDone.size, total: hub.meta.pageCount };
+          hub.progress = { done: hub.meta.complete ? hub.meta.pageCount : hub.pagesDone.size, total: hub.meta.pageCount };
         }
         notify();
         return Promise.resolve();
@@ -757,6 +758,8 @@
     let progressEl = null;
     let panelBodyEl = null;
     let panelCountEl = null;
+    let vScrollRaf = 0;
+    let vResizeObserver = null;
     let noteEl = null;
     let tabFilesBtn = null;
     let tabLinksBtn = null;
@@ -787,7 +790,7 @@
     }
 
     function schedulePanelRender() {
-      if (!panel || panel.hidden || renderQueued) return;
+      if (!panelIsOpen() || renderQueued) return;
       renderQueued = true;
       requestAnimationFrame(() => {
         renderQueued = false;
@@ -843,8 +846,10 @@
       }
     }
 
+    let lastPanelSignature = '';
+
     function renderPanelBody() {
-      if (!panel || panel.hidden || !panelBodyEl) return;
+      if (!panelIsOpen() || !panelBodyEl) return;
       const ordered = orderedRecords();
       const posMap = new Map(ordered.map((r, i) => [r.postId, i + 1]));
       const items = [];
@@ -858,45 +863,85 @@
           for (const url of r.links) items.push({ r: r, url: url, pos: posMap.get(r.postId) || 0, kind: 'link' });
         }
       }
+      // skip rebuild when nothing changed — background fetch progress ticks
+      // must not churn the grid or reset the user's scroll position
+      const sig = panelTab + ':' + items.length + ':' + (panelTab === 'media' ? 0 : items.length ? items[items.length - 1].r.postId : 0);
+      if (sig === lastPanelSignature) { updateCountOnly(items.length); return; }
+      lastPanelSignature = sig;
+      const keepScroll = panelBodyEl.scrollTop;
       panelCountEl.textContent = items.length + ' items';
       panelBodyEl.textContent = '';
       const frag = document.createDocumentFragment();
-      const max = Math.min(items.length, rowLimit);
       if (panelTab === 'media') {
-        const grid = document.createElement('div');
-        grid.className = 'xft-grid';
-        for (let i = 0; i < max; i++) {
-          const it = items[i];
-          const cell = document.createElement('div');
-          cell.className = 'xft-cell';
-          cell.title = '[#' + it.pos + '] ' + (it.r.author || '?') + ' — open';
-          const isVideo = it.kind === 'video';
-          let thumb;
-          if (isVideo) {
-            thumb = document.createElement('video');
-            thumb.preload = 'metadata';
-            thumb.muted = true;
-            thumb.src = it.url + (it.url.indexOf('#') === -1 ? '#t=0.1' : '');
-          } else {
-            thumb = document.createElement('img');
-            thumb.loading = 'lazy';
-            thumb.src = it.url;
+        // virtualized grid: only visible rows (+buffer) exist in the DOM
+        const topPad = document.createElement('div');
+        const vrows = document.createElement('div');
+        vrows.className = 'xft-vrows';
+        const bottomPad = document.createElement('div');
+        frag.append(topPad, vrows, bottomPad);
+        const cols = 4;
+        const gap = 6;
+        const totalRows = Math.ceil(items.length / cols);
+        const cellW = (panelBodyEl.clientWidth - 20 - (cols - 1) * gap) / cols;
+        const rowH = cellW + 2 + gap; // square cell + border + row gap
+        const renderRange = () => {
+          const st = panelBodyEl.scrollTop;
+          const vh = panelBodyEl.clientHeight || 600;
+          const first = Math.max(0, Math.floor(st / rowH) - 1);
+          const last = Math.min(totalRows, Math.ceil((st + vh) / rowH) + 1);
+          vrows.textContent = '';
+          for (let r = first; r < last; r++) {
+            const rowEl = document.createElement('div');
+            rowEl.className = 'xft-vrow';
+            for (let c = 0; c < cols; c++) {
+              const i = r * cols + c;
+              if (i >= items.length) break;
+              const it = items[i];
+              const cell = document.createElement('div');
+              cell.className = 'xft-cell';
+              cell.title = '[#' + it.pos + '] ' + (it.r.author || '?') + ' — open';
+              const isVideo = it.kind === 'video';
+              let thumb;
+              if (isVideo) {
+                thumb = document.createElement('video');
+                thumb.preload = 'metadata';
+                thumb.muted = true;
+                thumb.src = it.url + (it.url.indexOf('#') === -1 ? '#t=0.1' : '');
+              } else {
+                thumb = document.createElement('img');
+                thumb.loading = 'lazy';
+                thumb.src = it.url;
+              }
+              const label = document.createElement('span');
+              label.className = 'xft-cell-label';
+              label.textContent = '#' + it.pos + ' ' + (it.r.author || '?');
+              cell.append(thumb, label);
+              if (isVideo) {
+                const badge = document.createElement('span');
+                badge.className = 'xft-cell-badge';
+                badge.textContent = '▶';
+                cell.appendChild(badge);
+              }
+              cell.addEventListener('click', () => openViewer(it.kind, it.url, it.r.postId, it.pos, it.r.author));
+              rowEl.appendChild(cell);
+            }
+            vrows.appendChild(rowEl);
           }
-          const label = document.createElement('span');
-          label.className = 'xft-cell-label';
-          label.textContent = '#' + it.pos + ' ' + (it.r.author || '?');
-          cell.append(thumb, label);
-          if (isVideo) {
-            const badge = document.createElement('span');
-            badge.className = 'xft-cell-badge';
-            badge.textContent = '▶';
-            cell.appendChild(badge);
-          }
-          cell.addEventListener('click', () => openViewer(it.kind, it.url, it.r.postId, it.pos, it.r.author));
-          grid.appendChild(cell);
-        }
-        frag.appendChild(grid);
+          topPad.style.height = (first * rowH) + 'px';
+          bottomPad.style.height = (Math.max(0, totalRows - last) * rowH) + 'px';
+        };
+        renderRange();
+        panelBodyEl.onscroll = () => {
+          if (vScrollRaf) return;
+          vScrollRaf = requestAnimationFrame(() => { vScrollRaf = 0; renderRange(); });
+        };
+        if (vResizeObserver) vResizeObserver.disconnect();
+        vResizeObserver = new ResizeObserver(() => renderRange());
+        vResizeObserver.observe(panelBodyEl);
       } else {
+        panelBodyEl.onscroll = null;
+        if (vResizeObserver) { vResizeObserver.disconnect(); vResizeObserver = null; }
+        const max = Math.min(items.length, rowLimit);
         for (let i = 0; i < max; i++) {
           const it = items[i];
           const row = document.createElement('div');
@@ -922,6 +967,7 @@
         frag.appendChild(empty);
       }
       panelBodyEl.appendChild(frag);
+      if (keepScroll) panelBodyEl.scrollTop = keepScroll;
       showMoreBtn.hidden = items.length <= rowLimit;
       const notes = [];
       if (hub.capNotice || cache.stopPersist) notes.push('Cache cap reached — new data kept in memory only (not persisted).');
@@ -948,7 +994,8 @@
       };
       const inDelay = mkField('fetch delay (ms)', settings.delayMs);
       const inChunk = mkField('render chunk', settings.chunkSize);
-      const inRows = mkField('panel row cap', settings.rowCap);
+      const inRows = mkField('panel row cap (Links)', settings.rowCap);
+      const inAuto = mkField('auto fetch on load (1/0)', settings.autoFetch ? 1 : 0);
       const inBase = mkField('base path (subpath installs)', settings.basePath);
       const save = mkBtn('Save', () => {
         const num = (v, def) => {
@@ -958,6 +1005,7 @@
         settings.delayMs = num(inDelay.value, DEFAULT_SETTINGS.delayMs);
         settings.chunkSize = num(inChunk.value, DEFAULT_SETTINGS.chunkSize);
         settings.rowCap = num(inRows.value, DEFAULT_SETTINGS.rowCap);
+        settings.autoFetch = parseInt(inAuto.value, 10) === 1 ? 1 : 0;
         settings.basePath = inBase.value.trim().replace(/\/+$/, '');
         writeStore(SETTINGS_KEY, settings);
         wrap.hidden = true;
@@ -968,11 +1016,40 @@
       return wrap;
     }
 
+    function panelIsOpen() {
+      return !!(panel && panel.classList.contains('xft-open'));
+    }
+
+    function updateCountOnly(n) {
+      if (panelCountEl) panelCountEl.textContent = n + ' items';
+    }
+
+    function setPanelOpen(open) {
+      if (!panel) return;
+      panel.classList.toggle('xft-open', open);
+      const edge = document.getElementById('xft-edge-btn');
+      if (edge) edge.classList.toggle('xft-edge-hidden', open);
+      if (open) {
+        rowLimit = settings.rowCap;
+        renderPanelBody();
+        ensure(false);
+      }
+    }
+
+    function buildEdgeButton() {
+      const b = document.createElement('button');
+      b.type = 'button';
+      b.id = 'xft-edge-btn';
+      b.textContent = '📁 Media';
+      b.title = 'Open media panel';
+      b.addEventListener('click', () => setPanelOpen(true));
+      document.body.appendChild(b);
+    }
+
     function buildPanel() {
       panel = document.createElement('div');
       panel.id = 'xft-panel';
       panel.className = 'xft-panel';
-      panel.hidden = true;
 
       const head = document.createElement('div');
       head.className = 'xft-head';
@@ -985,7 +1062,7 @@
       const cancelBtn = mkBtn('■ Stop', () => { if (hub.abortRef) hub.abortRef.aborted = true; });
       const refreshBtn = mkBtn('↻ Refresh', () => { ensure(true); });
       const gearBtn = mkBtn('⚙', () => { settingsView.hidden = !settingsView.hidden; });
-      const closeBtn = mkBtn('✕', () => { panel.hidden = true; });
+      const closeBtn = mkBtn('✕', () => setPanelOpen(false));
       head.append(title, progressEl, cancelBtn, refreshBtn, gearBtn, closeBtn);
 
       const tabs = document.createElement('div');
@@ -1009,6 +1086,7 @@
       panel.append(head, tabs, settingsView, panelBodyEl, showMoreBtn, noteEl);
       document.body.appendChild(panel);
       setTab('media');
+      buildEdgeButton();
     }
 
     // ---------- step 9: toolbar injection ----------
@@ -1025,36 +1103,29 @@
       sortBtn.className = 'button button--link';
       sortBtn.textContent = '⚡ Sort by reactions';
       sortBtn.addEventListener('click', () => sorter.toggle());
-      const mediaBtn = document.createElement('button');
-      mediaBtn.type = 'button';
-      mediaBtn.id = 'xft-media-btn';
-      mediaBtn.className = 'button button--link';
-      mediaBtn.textContent = '📁 Media';
-      mediaBtn.addEventListener('click', () => {
-        panel.hidden = !panel.hidden;
-        if (!panel.hidden) {
-          renderPanelBody();
-          ensure(false);
-        }
-      });
-      host.append(sortBtn, mediaBtn);
+      host.append(sortBtn);
     }
 
     function injectStyles() {
       const st = document.createElement('style');
       st.textContent = [
-        '#xft-panel{position:fixed;top:0;right:0;bottom:0;width:470px;max-width:100vw;display:flex;flex-direction:column;background:#fff;color:#14171a;border-left:1px solid #cfd6de;box-shadow:-6px 0 24px rgba(0,0,0,.2);z-index:9999;font:12px/1.45 sans-serif}',
-        '#xft-panel[hidden]{display:none}',
+        '#xft-panel{position:fixed;top:0;right:0;bottom:0;width:560px;max-width:100vw;display:flex;flex-direction:column;background:#fff;color:#14171a;border-left:1px solid #cfd6de;box-shadow:-6px 0 24px rgba(0,0,0,.2);z-index:9999;font:12px/1.45 sans-serif;transform:translateX(100%);transition:transform .28s ease}',
+        '#xft-panel.xft-open{transform:translateX(0)}',
+        '#xft-edge-btn{position:fixed;right:0;top:50%;transform:translateY(-50%);z-index:9998;border:1px solid #cfd6de;border-right:none;border-radius:8px 0 0 8px;background:#fff;color:#14171a;padding:14px 8px;cursor:pointer;font:12px sans-serif;writing-mode:vertical-rl;box-shadow:-4px 0 14px rgba(0,0,0,.18);transition:opacity .2s}',
+        '#xft-edge-btn:hover{background:#f0f3f7}',
+        '#xft-edge-btn.xft-edge-hidden{opacity:0;pointer-events:none}',
         '.xft-head{display:flex;align-items:center;gap:6px;padding:8px 10px;border-bottom:1px solid #e2e7ee;user-select:none}',
         '.xft-title{font-weight:700;margin-right:auto;white-space:nowrap}',
         '.xft-progress{font-variant-numeric:tabular-nums;opacity:.75;margin-right:4px}',
         '.xft-btn{border:1px solid #cfd6de;background:#f4f6f9;color:#14171a;border-radius:4px;padding:2px 8px;cursor:pointer;font:11px sans-serif}',
         '.xft-btn:hover{background:#e8ecf2}',
         '.xft-tabs{display:flex;align-items:center;gap:6px;padding:6px 8px;border-bottom:1px solid #e2e7ee}',
-        '.xft-tab-active{background:#14171a;color:#fff;border-color:#14171a;font-weight:700}',
+        '.xft-tab-active{background:#0b6bcb;border-color:#0b6bcb;color:#fff;font-weight:700;box-shadow:0 1px 5px rgba(11,107,203,.45)}',
         '.xft-count{margin-left:auto;opacity:.7}',
         '.xft-body{overflow-y:auto;flex:1;padding:8px 10px;scrollbar-width:thin}',
         '.xft-grid{display:grid;grid-template-columns:repeat(4,1fr);gap:6px}',
+        '.xft-vrows{display:flex;flex-direction:column;gap:6px}',
+        '.xft-vrow{display:grid;grid-template-columns:repeat(4,1fr);gap:6px}',
         '.xft-cell{position:relative;aspect-ratio:1;overflow:hidden;border:1px solid #e2e7ee;border-radius:6px;cursor:zoom-in;background:#f4f6f9;padding:0}',
         '.xft-cell img,.xft-cell video{width:100%;height:100%;object-fit:cover;display:block}',
         '.xft-cell-label{position:absolute;left:0;right:0;bottom:0;background:linear-gradient(transparent,rgba(0,0,0,.72));color:#fff;font:10px sans-serif;padding:12px 4px 3px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;pointer-events:none}',
@@ -1079,11 +1150,13 @@
         '.xft-sort-marker{display:none}',
         '.xft-pulse{outline:3px solid transparent;animation:xftpulse 1.6s ease-out 2}',
         '@keyframes xftpulse{0%{outline-color:#ffb700}100%{outline-color:transparent}}',
-        '#xft-sort-btn,#xft-media-btn{margin-left:4px;cursor:pointer}',
+        '#xft-sort-btn{margin-left:4px;cursor:pointer}',
         '@media (prefers-color-scheme:dark){',
         '#xft-panel{background:#1c2027;color:#e6e9ee;border-color:#3a4250}',
         '.xft-head,.xft-tabs{border-color:#3a4250}',
         '.xft-btn{background:#262c36;border-color:#3a4250;color:#e6e9ee}',
+        '#xft-edge-btn{background:#1c2027;border-color:#3a4250;color:#e6e9ee}',
+        '.xft-tab-active{background:#3b82f6;border-color:#3b82f6;color:#fff}',
         '.xft-cell{border-color:#3a4250;background:#262c36}',
         '.xft-row{border-color:#2a303a}',
         '.xft-note{background:#3a2f14;color:#ffd479;border-color:#3a4250}',
@@ -1109,7 +1182,7 @@
           seedLivePage(); // refresh live-page data even on partial cache
           if (seededPage > 0) hub.pagesDone.add(seededPage);
         }
-        hub.progress = { done: hub.pagesDone.size, total: hub.meta.pageCount };
+        hub.progress = { done: hub.meta.complete ? hub.meta.pageCount : hub.pagesDone.size, total: hub.meta.pageCount };
         if (hub.meta.pageCount === 1 && hub.pagesDone.has(1)) {
           hub.meta.complete = true;
           hub.meta.fetchedAt = Date.now();
@@ -1131,6 +1204,11 @@
       injectToolbar();
       buildPanel();
       updateProgressText();
+      // background full-thread fetch: starts on page load, resumes partials,
+      // never waits for the user to open the panel (setting: autoFetch)
+      if (settings.autoFetch && !hub.meta.complete && !currentRun) {
+        currentRun = runFetch(false).catch(() => {}).then(() => { currentRun = null; });
+      }
     })();
   }
 
