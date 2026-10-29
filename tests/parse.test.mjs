@@ -8,7 +8,7 @@ import path from 'node:path';
 
 const require = createRequire(import.meta.url);
 const userJsPath = path.join(path.dirname(fileURLToPath(import.meta.url)), '..', 'xf-thread-tools.user.js');
-const { parseReactionCount, filterLinks, sortPosts, estimateSize, partitionLinks, extractDomain, groupLinkItems, applyLinkFilters, boilerplateUrls } = require(userJsPath);
+const { parseReactionCount, filterLinks, sortPosts, estimateSize, partitionLinks, extractDomain, groupLinkItems, applyLinkFilters, boilerplateUrls, isSmilieUrl } = require(userJsPath);
 
 test('UMD export exposes the four pure functions', () => {
   assert.equal(typeof parseReactionCount, 'function');
@@ -237,4 +237,18 @@ test('boilerplateUrls: images count too; data:/blob: URLs are ignored', () => {
   assert.equal(out.has('https://img.example/banner.png'), true);
   assert.equal(out.has('data:image/gif;base64,R0lGOD'), false);
   assert.equal(out.size, 1);
+});
+
+// ---- isSmilieUrl (raw + percent-encoded proxy forms) ----
+test('isSmilieUrl: matches raw, proxy-encoded, and legacy paths; spares real media', () => {
+  assert.equal(isSmilieUrl('https://forums.example/images/smilies/Off/lmao.gif'), true);
+  assert.equal(isSmilieUrl('https://cdn.example/styles/xenforo/smilies/popo/frown.png'), true);
+  // image-proxy wrapped: /smilies/ only exists percent-encoded
+  assert.equal(isSmilieUrl('https://forum.example/proxy.php?image=https%3A%2F%2Fcdn.example%2Fstyles%2Fsmilies%2Fpopo%2Ffrown.png&hash=ab'), true);
+  assert.equal(isSmilieUrl('https://live.staticflickr.com/65535/49550633708_h.jpg'), false);
+  assert.equal(isSmilieUrl('https://forum.example/attachments/photo-jpeg.12345/'), false);
+  assert.equal(isSmilieUrl(''), false);
+  assert.equal(isSmilieUrl(null), false);
+  // malformed percent escape: must not throw; falls back to raw-only test
+  assert.equal(isSmilieUrl('https://x.example/a%zz%2Fsmilies%2F'), false);
 });

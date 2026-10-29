@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         xf-thread-tools
 // @namespace    xf-thread-tools
-// @version      0.7.11
+// @version      0.7.12
 // @description  XenForo 2: sort thread posts by reaction count across all pages (cached) + floating media panel (images / external links).
 // @author       xf-thread-tools
 // @match        *://*/threads/*
@@ -142,6 +142,19 @@
     const out = new Set();
     for (const [u, set] of authors) if (set.size >= min) out.add(u);
     return out;
+  }
+
+  // Smilie detector: raw OR decodeURIComponent'd URL — lazy-image themes wrap
+  // smilies in image proxies where the /smilies/ path only exists percent-
+  // encoded (proxy.php?image=https%3A%2F%2F…%2Fsmilies%2Fx.png), so testing the
+  // raw string alone lets them through both the extraction and render gates.
+  function isSmilieUrl(u) {
+    const s = String(u || '');
+    if (!s) return false;
+    let d = s;
+    try { d = decodeURIComponent(s); } catch (e) { /* malformed escape — raw test still applies */ }
+    return s.indexOf('/smilies/') !== -1 || s.indexOf('/smilie.') !== -1
+      || d.indexOf('/smilies/') !== -1 || d.indexOf('/smilie.') !== -1;
   }
 
   function partitionLinks(hrefList) {
@@ -407,7 +420,7 @@
           if (/^(data|blob):/i.test(s)) {
             s = im.getAttribute('data-src') || im.getAttribute('data-url') || im.getAttribute('data-lazy-src') || '';
           }
-          if (s && !/\/smilies\//i.test(s)) images.push(absolutize(s));
+          if (s && !isSmilieUrl(s)) images.push(absolutize(s));
         });
         // HTML5 videos: <video class="videotag"><source src> (site media threads)
         body.querySelectorAll('video').forEach((v) => {
@@ -1120,7 +1133,7 @@
         // their real URLs (attachment-scan twins) — drop the placeholders so
         // already-cached threads heal without a Refresh; smilies and
         // signature/footer boilerplate are filtered the same way
-        const real = (list) => (list || []).filter((u) => !/^(data|blob):/i.test(u || '') && !/\/smilies\//i.test(u || '') && !boiler.has(String(u || '')));
+        const real = (list) => (list || []).filter((u) => !/^(data|blob):/i.test(u || '') && !isSmilieUrl(u) && !boiler.has(String(u || '')));
         for (const r of ordered) {
           for (const url of real(r.images)) all.push({ r: r, url: url, pos: posMap.get(r.postId) || 0, kind: 'image' });
           for (const url of real(r.videos)) all.push({ r: r, url: url, pos: posMap.get(r.postId) || 0, kind: 'video' });
@@ -1775,5 +1788,5 @@
   }
 
   // UMD export of the pure functions for node:test (no DOM / GM usage in them).
-  if (typeof module !== 'undefined' && module.exports) module.exports = { parseReactionCount, filterLinks, sortPosts, estimateSize, partitionLinks, extractDomain, groupLinkItems, applyLinkFilters, boilerplateUrls };
+  if (typeof module !== 'undefined' && module.exports) module.exports = { parseReactionCount, filterLinks, sortPosts, estimateSize, partitionLinks, extractDomain, groupLinkItems, applyLinkFilters, boilerplateUrls, isSmilieUrl };
 })();

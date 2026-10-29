@@ -140,7 +140,7 @@ try {
       .filter((el) => !el.closest('blockquote.bbCodeBlock--quote')
         && !el.closest('.message-signature')
         && ![].some.call(el.classList, (t) => t === 'smilie' || t.indexOf('smilie--') === 0)
-        && !/\\/smilies\\//i.test(el.src || ''))
+        && !(String(el.src || '').indexOf('/smilies/') !== -1 || (() => { try { return decodeURIComponent(el.src || '').indexOf('/smilies/') !== -1; } catch (e) { return false; } })()))
       .map((el) => (el.getAttribute('data-src') && /^(data|blob):/i.test(el.src || '') ? el.getAttribute('data-src') : el.src))
       .filter(Boolean),
     quotedSrcs: Array.from(document.querySelectorAll('article blockquote.bbCodeBlock--quote img.bbImage')).map((i) => i.src),
