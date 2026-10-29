@@ -151,7 +151,10 @@ try {
     missing.length === 0 && extra.length === 0,
     'grid=' + cells.size + ' own=' + own.size + ' missing=' + missing.length + ' extra=' + extra.length + ' (quoted copies on page: ' + panel.quotedSrcs.length + ')');
 
-  // 4. Sort on partial cache: click 1 starts the fetch, click 2 aborts + sorts
+  // 4. Sort on partial cache. Two paths, both valid ends:
+  //    (a) fetch keeps running → second click aborts → partial sort;
+  //    (b) fetch fails/finishes fast (e.g. WAF 403s page fetches) → sorter
+  //        fires on its own → partial sort without a second click.
   const firstArticleBefore = await ev(cdp, `(document.querySelector('article[data-content^="post-"]') || {}).dataset ? document.querySelector('article[data-content^="post-"]').dataset.content : ''`);
   await ev(cdp, `document.getElementById('xft-sort-btn').click(); true`);
   await sleep(1200);
@@ -159,23 +162,38 @@ try {
     label: document.getElementById('xft-sort-btn').textContent,
     progress: (document.querySelector('#xft-panel .xft-note, #xft-panel .xft-count') || { textContent: '' }).textContent.trim()
   })`);
-  check('sort click resumes fetch', fetching.label.indexOf('…') !== -1, JSON.stringify(fetching.label) + ' / ' + JSON.stringify(fetching.progress));
+  check('sort click starts fetch', /…/.test(fetching.label) || /partial|Chronological/.test(fetching.label), JSON.stringify(fetching.label) + ' / ' + JSON.stringify(fetching.progress));
 
-  await ev(cdp, `document.getElementById('xft-sort-btn').click(); true`); // abort → sort partial
   let sortedState = null;
-  for (let i = 0; i < 40; i++) {
+  // A sort is "settled" when the label stopped fetching AND the DOM shows it:
+  // moved originals (.xft-placed) and/or clones. The .xft-sort-marker only
+  // exists while unrendered chunks remain — a partial sort that fits in one
+  // chunk (<= chunkSize records) removes it, so never require the marker.
+  const readSorted = () => ev(cdp, `({
+    label: document.getElementById('xft-sort-btn').textContent,
+    marker: !!document.querySelector('.xft-sort-marker'),
+    clones: document.querySelectorAll('article.xf-fetched').length,
+    placed: document.querySelectorAll('article[data-content^="post-"].xft-placed').length,
+    originals: document.querySelectorAll('article[data-content^="post-"]').length
+  })`);
+  const settled = (s) => s.label.indexOf('…') === -1 && (s.marker || s.placed > 0 || s.clones > 0);
+  for (let i = 0; i < 20; i++) { // wait for the sorter to settle on its own
     await sleep(500);
-    sortedState = await ev(cdp, `({
-      label: document.getElementById('xft-sort-btn').textContent,
-      marker: !!document.querySelector('.xft-sort-marker'),
-      clones: document.querySelectorAll('article.xf-fetched').length,
-      originals: document.querySelectorAll('article[data-content^="post-"]').length
-    })`);
-    if (sortedState.marker && sortedState.label.indexOf('…') === -1) break;
+    sortedState = await readSorted();
+    if (/Chronological/.test(sortedState.label) && settled(sortedState)) break;
+  }
+  if (!/Chronological/.test(sortedState.label) || !settled(sortedState)) {
+    // still fetching → abort manually, then wait again
+    await ev(cdp, `document.getElementById('xft-sort-btn').click(); true`);
+    for (let i = 0; i < 40; i++) {
+      await sleep(500);
+      sortedState = await readSorted();
+      if (/Chronological/.test(sortedState.label) && settled(sortedState)) break;
+    }
   }
   check('partial sort applied with (partial) label',
-    sortedState.marker === true && /partial/.test(sortedState.label),
-    JSON.stringify(sortedState.label) + ' clones=' + sortedState.clones + ' originals=' + sortedState.originals);
+    /partial/.test(sortedState.label) && (sortedState.placed + sortedState.clones) > 0,
+    JSON.stringify(sortedState.label) + ' placed=' + sortedState.placed + ' clones=' + sortedState.clones + ' originals=' + sortedState.originals);
 
   // 5. Restore exact original order
   await ev(cdp, `document.getElementById('xft-sort-btn').click(); true`);
@@ -184,10 +202,11 @@ try {
     label: document.getElementById('xft-sort-btn').textContent,
     marker: !!document.querySelector('.xft-sort-marker'),
     clones: document.querySelectorAll('article.xf-fetched').length,
+    placed: document.querySelectorAll('article[data-content^="post-"].xft-placed').length,
     firstArticle: (document.querySelector('article[data-content^="post-"]') || {}).dataset ? document.querySelector('article[data-content^="post-"]').dataset.content : ''
   })`);
   check('restore returns to chronological',
-    restored.marker === false && restored.clones === 0 && restored.label.indexOf('Sort by reactions') !== -1
+    restored.marker === false && restored.clones === 0 && restored.placed === 0 && restored.label.indexOf('Sort by reactions') !== -1
       && restored.firstArticle === firstArticleBefore,
     JSON.stringify(restored.label) + ' first=' + restored.firstArticle);
 

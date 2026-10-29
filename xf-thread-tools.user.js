@@ -1,10 +1,11 @@
 // ==UserScript==
 // @name         xf-thread-tools
 // @namespace    xf-thread-tools
-// @version      0.6.3
+// @version      0.6.4
 // @description  XenForo 2: sort thread posts by reaction count across all pages (cached) + floating media panel (images / external links).
 // @author       xf-thread-tools
 // @match        *://*/threads/*
+// @match        *://*/t/*
 // @run-at       document-idle
 // @grant        GM_setValue
 // @grant        GM_getValue
@@ -252,15 +253,20 @@
     const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
     // ---------- step 3: thread meta ----------
-    const threadId = (function () {
-      const m = location.pathname.match(/\/threads\/([^/?#]+)/);
+    // XF ships two thread routes: /threads/{slug}.{id} and the short /t/{slug}.{id}.
+    // Remember BOTH the prefix and the full slug segment: rebuilt URLs must
+    // reuse the exact route the user is on (some sites' WAF/SEO rules 404 or
+    // redirect slugless /threads/{id} shapes).
+    const route = (function () {
+      const m = location.pathname.match(/\/(threads|t)\/([^/?#]+)/);
       if (!m) return null;
-      const seg = decodeURIComponent(m[1]);
+      const seg = decodeURIComponent(m[2]);
       const dot = seg.lastIndexOf('.');
       const tail = dot >= 0 ? seg.slice(dot + 1) : seg;
-      return /^\d+$/.test(tail) ? tail : seg;
+      return { prefix: m[1], seg: seg, id: /^\d+$/.test(tail) ? tail : seg };
     })();
-    if (!threadId) return; // non-standard thread route: stay silent
+    if (!route) return; // non-standard thread route: stay silent
+    const threadId = route.id;
 
     const threadKey = threadId;
 
@@ -586,7 +592,7 @@
 
     // ---------- step 4: sequential, abortable, stop-with-partial fetcher ----------
     function threadUrl(suffix) {
-      return location.origin + settings.basePath + '/threads/' + threadId + suffix;
+      return location.origin + settings.basePath + '/' + route.prefix + '/' + route.seg + suffix;
     }
 
     async function runFetch(force) {

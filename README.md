@@ -18,7 +18,7 @@ Built and validated against XenForo 2 markup (probe date 2026-10-29). No admin a
 
 1. Install [Tampermonkey](https://www.tampermonkey.net/) (Chrome/Edge/Firefox).
 2. Open the Tampermonkey dashboard → **Utilities** tab → *Import from file*, or simply create a new userscript and paste the full contents of `xf-thread-tools.user.js`, then save.
-3. Visit any thread page, e.g. `https://your-forum.example/threads/12345/`. Two buttons appear in the page-action toolbar next to the thread title: **⚡ Sort by reactions** and **📁 Media**.
+3. Visit any thread page, e.g. `https://your-forum.example/threads/12345/`. Both XF thread routes work: `/threads/{slug}.{id}` and the short `/t/{slug}.{id}`. Two buttons appear in the page-action toolbar next to the thread title: **⚡ Sort by reactions** and **📁 Media**.
 
 The script requests only two grants — `GM_setValue` / `GM_getValue` (used to store your settings). All page fetching is same-origin `fetch` with your session cookies; there is no `@connect` and no third-party network access.
 
