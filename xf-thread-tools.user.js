@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         xf-thread-tools
 // @namespace    xf-thread-tools
-// @version      0.7.0
+// @version      0.7.1
 // @description  XenForo 2: sort thread posts by reaction count across all pages (cached) + floating media panel (images / external links).
 // @author       xf-thread-tools
 // @match        *://*/threads/*
@@ -446,6 +446,9 @@
         return new Promise((resolve, reject) => {
           let req;
           try { req = indexedDB.open('xf-thread-tools', 1); } catch (e) { reject(e); return; }
+          // A pending open that never settles would hang boot forever with no
+          // error anywhere — bail to the in-memory cache instead
+          const bail = setTimeout(() => { try { req.transaction ? null : null; } catch (e) {} reject(new Error('open timeout')); }, 3000);
           req.onupgradeneeded = () => {
             const db = req.result;
             if (!db.objectStoreNames.contains('posts')) {
@@ -455,8 +458,9 @@
               db.createObjectStore('threads', { keyPath: 'threadKey' });
             }
           };
-          req.onsuccess = () => resolve(req.result);
-          req.onerror = () => reject(req.error);
+          req.onblocked = () => { clearTimeout(bail); reject(new Error('blocked by another connection')); };
+          req.onsuccess = () => { clearTimeout(bail); resolve(req.result); };
+          req.onerror = () => { clearTimeout(bail); reject(req.error); };
         });
       },
 
@@ -1050,7 +1054,7 @@
       // skip rebuild when nothing changed — background fetch progress ticks
       // must not churn the grid or reset the user's scroll position
       // (sub-tab + search + filter selections are part of the signature)
-      const sig = panelTab + ':' + panelSubTab + ':' + JSON.stringify([
+      const sig = panelTab + ':' + panelSubTab + ':' + rowLimit + ':' + JSON.stringify([
         linkSearchEl ? linkSearchEl.value : '',
         linkUserSel ? Array.from(linkUserSel).sort() : null,
         linkDomainSel ? Array.from(linkDomainSel).sort() : null,
@@ -1178,7 +1182,9 @@
       }
       panelBodyEl.appendChild(frag);
       if (keepScroll) panelBodyEl.scrollTop = keepScroll;
-      showMoreBtn.hidden = (panelTab === 'links' ? filtered.length : items.length) <= rowLimit;
+      // media grid is window-virtualized and renders what the viewport shows —
+      // row capping (and this button) only applies to the Links tab
+      showMoreBtn.hidden = panelTab !== 'links' || filtered.length <= rowLimit;
       const notes = [];
       if (hub.capNotice || cache.stopPersist) notes.push('Cache cap reached — new data kept in memory only (not persisted).');
       if (hub.partialNotice) notes.push('Fetch stopped early — list is partial.');

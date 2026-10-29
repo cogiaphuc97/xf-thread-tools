@@ -101,15 +101,16 @@ try {
   const navP = cdp.waitEvent('Page.loadEventFired', 45000);
   await cdp.send('Page.navigate', { url: URL });
   await navP;
-  await sleep(3000); // let the forum's own JS settle
+  await sleep(6000); // let the forum's own JS settle (slow hours need more)
 
   const isThread = await ev(cdp, `document.documentElement.id === 'XF' && document.documentElement.dataset.template === 'thread_view'`);
   check('thread page rendered', isThread === true);
 
   // 2. Disable background auto-fetch so the run stays deterministic, then inject
-  await ev(cdp, `localStorage.setItem('xft_xfThreadTools:settings', JSON.stringify({ autoFetch: 0, delayMs: 250 })); true`);
-  await cdp.send('Runtime.evaluate', { expression: readFileSync(INJECT, 'utf8') });
-  await sleep(1500);
+  await ev(cdp, `localStorage.setItem('xft_xfThreadTools:settings', JSON.stringify({ autoFetch: 0, delayMs: 250, rowCap: 2 })); true`);
+  const inj = await cdp.send('Runtime.evaluate', { expression: readFileSync(INJECT, 'utf8') });
+  if (inj.exceptionDetails) console.log('INJECT EXCEPTION:', JSON.stringify((inj.exceptionDetails.exception || {}).description || inj.exceptionDetails.text).slice(0, 800));
+  await sleep(4500); // cache.open() bails to memory mode at 3s when IndexedDB stalls
 
   const boot = await ev(cdp, `({
     sortBtn: !!document.getElementById('xft-sort-btn'),
@@ -118,6 +119,12 @@ try {
     edge: !!document.getElementById('xft-edge-btn')
   })`);
   check('toolbar + panel + edge button injected', boot.sortBtn && boot.panel && boot.edge, 'label=' + JSON.stringify(boot.sortLabel));
+  if (!(boot.sortBtn && boot.panel && boot.edge)) {
+    console.log('BOOT DEBUG url=' + await ev(cdp, 'location.href'));
+    console.log('BOOT DEBUG xf=' + await ev(cdp, `document.documentElement.id + '/' + (document.documentElement.dataset || {}).template + '/readyState=' + document.readyState`));
+    console.log('BOOT DEBUG anchors=' + await ev(cdp, `[...['.p-title-pageAction', '.p-title .buttonGroup', '.p-title', '.pageContent', '.p-body']].map((s) => s + ':' + document.querySelectorAll(s).length).join(' ')`));
+    console.log('BOOT DEBUG storage=' + await ev(cdp, `(function () { try { localStorage.setItem('xft_probe', '1'); return localStorage.getItem('xft_probe'); } catch (e) { return 'ERR ' + e.message; } })()`));
+  }
 
   // 3. Open panel; sub-tabs must exist with counts; unfurl logos must be absent
   await ev(cdp, `document.getElementById('xft-edge-btn').click(); true`);
@@ -150,6 +157,12 @@ try {
   check('media grid = own-post media only (quotes excluded)',
     missing.length === 0 && extra.length === 0,
     'grid=' + cells.size + ' own=' + own.size + ' missing=' + missing.length + ' extra=' + extra.length + ' (quoted copies on page: ' + panel.quotedSrcs.length + ')');
+
+  // 3b. "Show more rows" must stay hidden on the media tab (grid is
+  // virtualized; the button only paginates Links rows)
+  const moreBtnExpr = `(Array.from(document.querySelectorAll('#xft-panel .xft-btn')).find((b) => b.textContent === 'Show more rows') || null)`;
+  const mediaBtnShown = await ev(cdp, `!!${moreBtnExpr} && !${moreBtnExpr}.hidden`);
+  check('Show more rows hidden on media tab', mediaBtnShown === false);
 
   // 4. Sort on partial cache. Two paths, both valid ends:
   //    (a) fetch keeps running → second click aborts → partial sort;
@@ -209,6 +222,22 @@ try {
     restored.marker === false && restored.clones === 0 && restored.placed === 0 && restored.label.indexOf('Sort by reactions') !== -1
       && restored.firstArticle === firstArticleBefore,
     JSON.stringify(restored.label) + ' first=' + restored.firstArticle);
+
+  // 5b. "Show more rows" on Links: after the sort's partial fetch there are
+  // more link items than rowCap (2) — a click must render more rows
+  // (regression: signature guard skipped the rebuild after rowLimit bumped)
+  await ev(cdp, `(Array.from(document.querySelectorAll('#xft-panel .xft-tab')).find((b) => b.textContent.trim() === 'Links') || { click(){} }).click(); true`);
+  await sleep(600);
+  const linksBtn = await ev(cdp, `!!${moreBtnExpr} && !${moreBtnExpr}.hidden`);
+  if (linksBtn) {
+    const before = await ev(cdp, `document.querySelectorAll('#xft-panel .xft-lrow').length`);
+    await ev(cdp, `${moreBtnExpr}.click(); true`);
+    await sleep(300);
+    const after = await ev(cdp, `document.querySelectorAll('#xft-panel .xft-lrow').length`);
+    check('Show more rows renders more rows', after > before, 'rows ' + before + ' -> ' + after);
+  } else {
+    check('Show more rows renders more rows', true, 'skipped: fewer link items than rowCap');
+  }
 
   cdp.close();
 } catch (e) {
