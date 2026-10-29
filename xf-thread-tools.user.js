@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         xf-thread-tools
 // @namespace    xf-thread-tools
-// @version      0.7.6
+// @version      0.7.7
 // @description  XenForo 2: sort thread posts by reaction count across all pages (cached) + floating media panel (images / external links).
 // @author       xf-thread-tools
 // @match        *://*/threads/*
@@ -899,33 +899,48 @@
           v.src = url;
         }
         // dead video URL: same explicit placeholder as dead images
-        v.addEventListener('error', () => {
+        const markVBroken = () => {
           const host = v.closest('.xft-cell, .xft-vthumb');
           (host || v).classList.add('xft-broken');
-        });
+        };
+        v.addEventListener('error', markVBroken);
+        // cached failures never fire events — probe after a moment
+        setTimeout(() => {
+          if (v.readyState === 0 && v.networkState === 3) markVBroken(); // NETWORK_NO_SOURCE
+        }, 800);
         return v;
       }
       const im = document.createElement('img');
       // thumbs are only created in-range by the virtualizer — eager loading
       // avoids loading=lazy deferral bugs on re-inserted cached rows
       if (!thumb) im.loading = 'lazy';
-      im.src = url;
+      // dead link (expired proxy URL, 404): mark the containing cell/thumb,
+      // not just the <img> that may get replaced by the video retry
+      const markBroken = () => {
+        const host = im.closest('.xft-cell, .xft-vthumb');
+        (host || im).classList.add('xft-broken');
+      };
       im.addEventListener('error', function onErr() {
         im.removeEventListener('error', onErr);
         const v = document.createElement('video');
         v.preload = 'metadata';
         v.muted = true;
         v.src = url;
-        // dead link (e.g. expired image-proxy URLs): mark the containing
-        // cell/thumb, not just the <img> that may get replaced
-        const markBroken = () => {
-          const host = im.closest('.xft-cell, .xft-vthumb');
-          (host || im).classList.add('xft-broken');
-        };
         v.addEventListener('error', markBroken);
         v.addEventListener('loadedmetadata', () => { if (im.parentNode) im.replaceWith(v); });
         v.load();
       });
+      im.src = url;
+      // A failure cached by Chrome replays instantly with NO error event —
+      // probe for it, or the cell renders blank forever
+      if (im.complete && im.naturalWidth === 0) markBroken();
+      else {
+        im.addEventListener('load', () => { if (im.naturalWidth === 0) markBroken(); });
+        setTimeout(() => { if (im.complete && im.naturalWidth === 0 && !im.classList.contains('xft-broken')) {
+          const host = im.closest('.xft-cell, .xft-vthumb');
+          if (host && !host.classList.contains('xft-broken')) markBroken();
+        } }, 800);
+      }
       return im;
     }
 
