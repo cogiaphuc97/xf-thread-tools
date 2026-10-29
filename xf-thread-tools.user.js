@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         xf-thread-tools
 // @namespace    xf-thread-tools
-// @version      0.7.13
+// @version      0.7.14
 // @description  XenForo 2: sort thread posts by reaction count across all pages (cached) + floating media panel (images / external links).
 // @author       xf-thread-tools
 // @match        *://*/threads/*
@@ -913,10 +913,11 @@
     let vGrid = null; // live media-grid state {topPad,vrows,bottomPad,items,identity,renderRange}
     // Smilies/stickers rehosted on image hosts carry NO url/class marker —
     // only their size gives them away (measured: forum smilies 24px, imgur
-    // stickers 50–56px, real photos 320px+). Detected at render; the next
-    // panel pass drops them, so stale caches heal without a Refresh.
+    // stickers 50–129px incl. animated gifs, real photos 320px+). Detected at
+    // render; the next panel pass drops them, so stale caches heal without a
+    // Refresh. If a real photo ever gets eaten, lower this constant.
     const tinyMediaUrls = new Set();
-    const TINY_MEDIA_MAX = 120;
+    const TINY_MEDIA_MAX = 200;
     let settingsView = null;
     let panelTab = 'files';
     let panelSubTab = 'all';        // media sub-tab: all | image | video
