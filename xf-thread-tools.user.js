@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         xf-thread-tools
 // @namespace    xf-thread-tools
-// @version      0.7.15
+// @version      0.7.16
 // @description  XenForo 2: sort thread posts by reaction count across all pages (cached) + floating media panel (images / external links).
 // @author       xf-thread-tools
 // @match        *://*/threads/*
@@ -9,6 +9,7 @@
 // @run-at       document-idle
 // @grant        GM_setValue
 // @grant        GM_getValue
+// @grant        GM_xmlhttpRequest
 // @noframes
 // @updateURL   https://raw.githubusercontent.com/cogiaphuc97/xf-thread-tools/main/xf-thread-tools.user.js
 // @downloadURL https://raw.githubusercontent.com/cogiaphuc97/xf-thread-tools/main/xf-thread-tools.user.js
@@ -155,6 +156,31 @@
     try { d = decodeURIComponent(s); } catch (e) { /* malformed escape — raw test still applies */ }
     return s.indexOf('/smilies/') !== -1 || s.indexOf('/smilie.') !== -1
       || d.indexOf('/smilies/') !== -1 || d.indexOf('/smilie.') !== -1;
+  }
+
+  // Embed-page poster extractor: given the HTML of a video-host /embed/ page,
+  // pull a thumbnail URL. Hosts expose og:image / og:image:secure_url, plyr
+  // players carry data-poster, plain players a poster= attribute. Decodes the
+  // common HTML entities attribute values arrive with. '' when nothing found.
+  function parseEmbedPoster(html) {
+    const h = String(html || '');
+    if (!h) return '';
+    const dec = (s) => s
+      .replace(/&amp;/g, '&').replace(/&quot;/g, '"')
+      .replace(/&#0?39;/g, '\'').replace(/&lt;/g, '<').replace(/&gt;/g, '>');
+    const pats = [
+      /<meta[^>]+property=["']og:image:secure_url["'][^>]+content=["']([^"']+)["']/i,
+      /<meta[^>]+content=["']([^"']+)["'][^>]+property=["']og:image:secure_url["']/i,
+      /<meta[^>]+property=["']og:image["'][^>]+content=["']([^"']+)["']/i,
+      /<meta[^>]+content=["']([^"']+)["'][^>]+property=["']og:image["']/i,
+      /data-poster=["']([^"']+)["']/i,
+      /<video[^>]+poster=["']([^"']+)["']/i
+    ];
+    for (const re of pats) {
+      const m = h.match(re);
+      if (m && /^https?:\/\//i.test(m[1])) return dec(m[1]);
+    }
+    return '';
   }
 
   function partitionLinks(hrefList) {
@@ -931,6 +957,52 @@
     // Refresh. If a real photo ever gets eaten, lower this constant.
     const tinyMediaUrls = new Set();
     const TINY_MEDIA_MAX = 200;
+    // Embed posters: thumbnail URL per embed URL, parsed from the embed page's
+    // og:image/data-poster. GM_xmlhttpRequest is required for hosts that send
+    // no CORS headers (page fetch() is blocked); a failed look-up caches ''
+    // so a tile is never re-fetched. Persisted, pruned to keep storage flat.
+    const EMBED_POSTERS_KEY = 'xfThreadTools:embedPosters';
+    const embedPosters = readStore(EMBED_POSTERS_KEY, {}) || {};
+    const embedPosterInflight = new Map();
+    function saveEmbedPosters() {
+      const keys = Object.keys(embedPosters);
+      if (keys.length > 300) {
+        for (const k of keys.slice(0, keys.length - 300)) delete embedPosters[k];
+      }
+      writeStore(EMBED_POSTERS_KEY, embedPosters);
+    }
+    function fetchEmbedPoster(url, cb) {
+      if (embedPosterInflight.has(url)) { embedPosterInflight.get(url).push(cb); return; }
+      const queue = [cb];
+      embedPosterInflight.set(url, queue);
+      const done = (poster) => {
+        embedPosters[url] = poster || '';
+        saveEmbedPosters();
+        for (const fn of queue) fn(embedPosters[url]);
+        embedPosterInflight.delete(url);
+      };
+      if (typeof GM_xmlhttpRequest === 'function') {
+        try {
+          GM_xmlhttpRequest({
+            method: 'GET',
+            url: url,
+            timeout: 10000,
+            onload: (r) => done(parseEmbedPoster(r.responseText)),
+            onerror: () => done(''),
+            ontimeout: () => done('')
+          });
+          return;
+        } catch (e) { /* fall through to fetch */ }
+      }
+      fetch(url, { credentials: 'omit' })
+        .then((r) => r.text())
+        .then((t) => done(parseEmbedPoster(t)))
+        .catch(() => done(''));
+    }
+    function ensureEmbedPoster(url, cb) {
+      if (Object.prototype.hasOwnProperty.call(embedPosters, url)) { cb(embedPosters[url]); return; }
+      fetchEmbedPoster(url, cb);
+    }
     let settingsView = null;
     let panelTab = 'files';
     let panelSubTab = 'all';        // media sub-tab: all | image | video
@@ -969,11 +1041,24 @@
     // element is marked .xft-broken.
     function buildMediaEl(kind, url, thumb) {
       if (kind === 'embed') {
-        // Embed thumbs reuse the no-fetch video tile (hosts rate-limit and
-        // some embeds autostart); the viewer mounts the live iframe on click.
+        // Embed thumbs: base no-fetch tile (hosts rate-limit, some embeds
+        // autostart); the poster — parsed from the embed page's og:image —
+        // fills it in async when it arrives. The viewer mounts the live
+        // iframe on click.
         if (thumb) {
           const tile = document.createElement('div');
           tile.className = 'xft-vtile';
+          const fill = (poster) => {
+            if (!poster || !tile.isConnected || tile.querySelector('img')) return;
+            const im = document.createElement('img');
+            im.alt = '';
+            im.addEventListener('error', () => im.remove(), { once: true });
+            im.src = poster;
+            tile.appendChild(im);
+          };
+          // deferred a tick: the cached path resolves synchronously, before
+          // renderRange has inserted the row (tile.isConnected would be false)
+          ensureEmbedPoster(url, (p) => setTimeout(() => fill(p), 0));
           return tile;
         }
         const f = document.createElement('iframe');
@@ -1779,6 +1864,7 @@
         '.xft-vthumb:hover img,.xft-vthumb:hover video{opacity:1}',
         '.xft-vthumb-active{border-color:hsl(0 0% 98%)}',
         '.xft-vthumb-active img,.xft-vthumb-active video{opacity:1}',
+        '.xft-vtile img{width:100%;height:100%;object-fit:cover;display:block}',
         // ---- sorted clones / misc (host-page surface) ----
         'article.xf-fetched{border:1px solid hsl(var(--xft-border)/.6);border-radius:var(--xft-radius);margin:8px 0;padding:8px 12px;background:transparent}',
         '.xft-clone-head{font-size:11px;color:hsl(var(--xft-muted-fg));margin-bottom:6px}',
@@ -1840,5 +1926,5 @@
   }
 
   // UMD export of the pure functions for node:test (no DOM / GM usage in them).
-  if (typeof module !== 'undefined' && module.exports) module.exports = { parseReactionCount, filterLinks, sortPosts, estimateSize, partitionLinks, extractDomain, groupLinkItems, applyLinkFilters, boilerplateUrls, isSmilieUrl };
+  if (typeof module !== 'undefined' && module.exports) module.exports = { parseReactionCount, filterLinks, sortPosts, estimateSize, partitionLinks, extractDomain, groupLinkItems, applyLinkFilters, boilerplateUrls, isSmilieUrl, parseEmbedPoster };
 })();

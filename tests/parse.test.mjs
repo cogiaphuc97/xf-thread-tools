@@ -8,7 +8,7 @@ import path from 'node:path';
 
 const require = createRequire(import.meta.url);
 const userJsPath = path.join(path.dirname(fileURLToPath(import.meta.url)), '..', 'xf-thread-tools.user.js');
-const { parseReactionCount, filterLinks, sortPosts, estimateSize, partitionLinks, extractDomain, groupLinkItems, applyLinkFilters, boilerplateUrls, isSmilieUrl } = require(userJsPath);
+const { parseReactionCount, filterLinks, sortPosts, estimateSize, partitionLinks, extractDomain, groupLinkItems, applyLinkFilters, boilerplateUrls, isSmilieUrl, parseEmbedPoster } = require(userJsPath);
 
 test('UMD export exposes the four pure functions', () => {
   assert.equal(typeof parseReactionCount, 'function');
@@ -251,4 +251,29 @@ test('isSmilieUrl: matches raw, proxy-encoded, and legacy paths; spares real med
   assert.equal(isSmilieUrl(null), false);
   // malformed percent escape: must not throw; falls back to raw-only test
   assert.equal(isSmilieUrl('https://x.example/a%zz%2Fsmilies%2F'), false);
+});
+
+// ---- parseEmbedPoster (embed-page og:image / data-poster extraction) ----
+test('parseEmbedPoster: og:image, reversed attr order, data-poster, poster attr', () => {
+  const og = '<meta property="og:image" content="https://static.example/uuid/thumbs/abc.jpg">';
+  assert.equal(parseEmbedPoster(og), 'https://static.example/uuid/thumbs/abc.jpg');
+  // attribute order flipped by the host's renderer
+  const ogRev = '<meta content="https://static.example/uuid/thumbs/abc.jpg" property="og:image">';
+  assert.equal(parseEmbedPoster(ogRev), 'https://static.example/uuid/thumbs/abc.jpg');
+  // plyr-style data-poster on the video element
+  assert.equal(parseEmbedPoster('<video data-poster="https://cdn.example/p.jpg">'), 'https://cdn.example/p.jpg');
+  // plain poster attribute, entity-encoded ampersand in the URL
+  assert.equal(parseEmbedPoster('<video poster="https://cdn.example/p?a=1&amp;b=2">'), 'https://cdn.example/p?a=1&b=2');
+  // secure_url variant wins over plain og:image
+  assert.equal(parseEmbedPoster('<meta property="og:image" content="http://a.example/x.jpg">'
+    + '<meta property="og:image:secure_url" content="https://a.example/x.jpg">'), 'https://a.example/x.jpg');
+});
+
+test('parseEmbedPoster: no poster, non-http values, garbage input', () => {
+  assert.equal(parseEmbedPoster('<html><body>no meta here</body></html>'), '');
+  // data: URIs are not usable as cell thumbs
+  assert.equal(parseEmbedPoster('<meta property="og:image" content="data:image/png;base64,AAAA">'), '');
+  assert.equal(parseEmbedPoster(''), '');
+  assert.equal(parseEmbedPoster(null), '');
+  assert.equal(parseEmbedPoster(undefined), '');
 });
