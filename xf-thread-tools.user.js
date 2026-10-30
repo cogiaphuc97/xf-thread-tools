@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         xf-thread-tools
 // @namespace    xf-thread-tools
-// @version      0.7.14
+// @version      0.7.15
 // @description  XenForo 2: sort thread posts by reaction count across all pages (cached) + floating media panel (images / external links).
 // @author       xf-thread-tools
 // @match        *://*/threads/*
@@ -398,6 +398,7 @@
       const rawLinks = [];
       const images = [];
       const videos = [];
+      const embeds = [];
       // Quoted content is a COPY of another post's media/links — collect only
       // what THIS post authored (probe 2026-10-29: 9 of 19 bbImage were inside
       // blockquote.bbCodeBlock--quote on a live page). Signature content is
@@ -429,6 +430,16 @@
           const s = (srcEl && srcEl.getAttribute('src')) || v.getAttribute('src') || '';
           if (s) videos.push(absolutize(s));
         });
+        // Third-party embed iframes (video hosts): the real <video> lives in a
+        // cross-origin document we cannot read, and its src is a signed URL
+        // that expires — the iframe src itself is the only stable, playable
+        // identifier. Lazy variants carry the URL in data-src.
+        body.querySelectorAll('iframe').forEach((f) => {
+          if (skip(f)) return;
+          let s = f.getAttribute('src') || '';
+          if (!s || /^(data|blob):/i.test(s)) s = f.getAttribute('data-src') || '';
+          if (/^https?:/i.test(s)) embeds.push(absolutize(s));
+        });
       }
       // XF2 attachment blocks (.message-attachments) sit OUTSIDE .bbWrapper —
       // scan the whole article; video-file attachments go to Videos by extension
@@ -448,6 +459,7 @@
       for (const u of parts.videoLinks) videos.push(absolutize(u));
       const imgSet = new Set(images.filter(Boolean));
       const vidSet = new Set(videos.filter(Boolean));
+      const embSet = new Set(embeds.filter(Boolean));
       return {
         threadKey: threadKey,
         postId: postId,
@@ -457,9 +469,10 @@
         date: dateEl ? (dateEl.getAttribute('datetime') || '') : '',
         reactionCount: reactionCount,
         bodyHtml: body ? lazyBodyHtml(body) : '',
-        links: filterLinks(parts.links, location.host).filter((u) => !imgSet.has(u) && !vidSet.has(u)),
+        links: filterLinks(parts.links, location.host).filter((u) => !imgSet.has(u) && !vidSet.has(u) && !embSet.has(u)),
         images: Array.from(new Set(images.filter(Boolean))),
-        videos: Array.from(new Set(videos.filter(Boolean)))
+        videos: Array.from(new Set(videos.filter(Boolean))),
+        embeds: Array.from(new Set(embeds.filter(Boolean)))
       };
     }
 
@@ -955,6 +968,21 @@
     // links without .mp4 extensions exist); if the video also fails, the
     // element is marked .xft-broken.
     function buildMediaEl(kind, url, thumb) {
+      if (kind === 'embed') {
+        // Embed thumbs reuse the no-fetch video tile (hosts rate-limit and
+        // some embeds autostart); the viewer mounts the live iframe on click.
+        if (thumb) {
+          const tile = document.createElement('div');
+          tile.className = 'xft-vtile';
+          return tile;
+        }
+        const f = document.createElement('iframe');
+        f.src = url;
+        f.allow = 'fullscreen';
+        f.allowFullscreen = true;
+        f.addEventListener('error', () => markMediaBroken(f));
+        return f;
+      }
       if (kind === 'video') {
         if (thumb) {
           // Video thumbs do NOT fetch: media hosts rate-limit (a video-heavy
@@ -1158,11 +1186,13 @@
         for (const r of ordered) {
           for (const url of real(r.images)) all.push({ r: r, url: url, pos: posMap.get(r.postId) || 0, kind: 'image' });
           for (const url of real(r.videos)) all.push({ r: r, url: url, pos: posMap.get(r.postId) || 0, kind: 'video' });
+          for (const url of real(r.embeds)) all.push({ r: r, url: url, pos: posMap.get(r.postId) || 0, kind: 'embed' });
         }
+        // embeds are videos hosted elsewhere — they count under the Video tab
         mediaCounts = { all: all.length, image: 0, video: 0 };
-        for (const it of all) mediaCounts[it.kind] += 1;
+        for (const it of all) mediaCounts[it.kind === 'embed' ? 'video' : it.kind] += 1;
         updateSubTabCounts(mediaCounts);
-        items = panelSubTab === 'all' ? all : all.filter((it) => it.kind === panelSubTab);
+        items = panelSubTab === 'all' ? all : all.filter((it) => it.kind === panelSubTab || (panelSubTab === 'video' && it.kind === 'embed'));
         viewerItems = items.map((it) => ({ kind: it.kind, url: it.url, postId: it.r.postId, pos: it.pos, author: it.r.author }));
       } else {
         for (const r of ordered) {
@@ -1235,7 +1265,7 @@
                 const cell = document.createElement('div');
                 cell.className = 'xft-cell';
                 cell.title = '[#' + it.pos + '] ' + (it.r.author || '?') + ' — open';
-                const isVideo = it.kind === 'video';
+                const isVideo = it.kind === 'video' || it.kind === 'embed';
                 const thumb = buildMediaEl(it.kind, it.url, true);
                 const label = document.createElement('span');
                 label.className = 'xft-cell-label';
@@ -1738,6 +1768,7 @@
         // ---- viewer (always dark media surface, independent of theme) ----
         '#xft-viewer{position:fixed;inset:0;background:hsl(240 10% 3.9%/.94);z-index:10000;display:flex;flex-direction:column;align-items:center;justify-content:center;gap:12px}',
         '#xft-viewer img,#xft-viewer video{max-width:92vw;max-height:80vh;object-fit:contain;border-radius:calc(var(--xft-radius) - 2px)}',
+        '#xft-viewer iframe{width:min(92vw,1120px);aspect-ratio:16/9;max-height:80vh;border:0;border-radius:calc(var(--xft-radius) - 2px);background:#000}',
         '.xft-viewer-bar{display:flex;gap:8px;align-items:center;color:hsl(0 0% 98%);font-size:12px}',
         '#xft-viewer .xft-btn{background:hsl(240 5% 20%/.85);color:hsl(0 0% 98%);border-color:hsl(240 5% 32%)}',
         '#xft-viewer .xft-btn:hover{background:hsl(240 5% 28%);color:hsl(0 0% 98%)}',
