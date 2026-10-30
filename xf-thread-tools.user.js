@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         xf-thread-tools
 // @namespace    xf-thread-tools
-// @version      0.7.18
+// @version      0.7.19
 // @description  XenForo 2: sort thread posts by reaction count across all pages (cached) + floating media panel (images / external links).
 // @author       xf-thread-tools
 // @match        *://*/threads/*
@@ -181,6 +181,33 @@
       if (m && /^https?:\/\//i.test(m[1])) return dec(m[1]);
     }
     return '';
+  }
+
+  // Sign-endpoint builder for embed URLs: hosts running the turbo-style
+  // player expose <origin>/api/sign?v=<ID> next to their /embed/<ID> pages,
+  // returning {success, url} where url is a time-limited direct mp4. ''
+  // when the URL is not that shape — caller keeps the iframe player.
+  function embedSignUrl(u) {
+    try {
+      const url = new URL(String(u || ''), 'https://x.invalid');
+      if (!/^https?:$/.test(url.protocol)) return '';
+      const m = url.pathname.match(/\/embed\/([^/?#]+)/);
+      if (!m) return '';
+      return url.origin + '/api/sign?v=' + encodeURIComponent(m[1]);
+    } catch (e) { return ''; }
+  }
+
+  // Sign-response parser: {url, exp} on success (exp parsed from the signed
+  // URL's ?exp= seconds), null on anything else.
+  function parseSignResponse(text) {
+    try {
+      const j = JSON.parse(String(text || ''));
+      if (j && j.success && typeof j.url === 'string' && /^https?:\/\//.test(j.url)) {
+        const m = j.url.match(/[?&]exp=(\d+)/);
+        return { url: j.url, exp: m ? parseInt(m[1], 10) : 0 };
+      }
+    } catch (e) { /* not JSON / error page */ }
+    return null;
   }
 
   function partitionLinks(hrefList) {
@@ -1059,6 +1086,59 @@
       if (failedEmbedPosters.has(url)) { cb(''); return; } // one retry per page load
       fetchEmbedPoster(url, cb);
     }
+
+    // Direct-stream resolver: for embed URLs whose host exposes a sign
+    // endpoint, exchange the embed URL for a time-limited direct mp4 and
+    // cache it until ~60s before its exp. Video clicks are single-shot, so
+    // no queue — but a cached answer must never outlive its token.
+    const EMBED_STREAMS_KEY = 'xfThreadTools:embedStreams';
+    const embedStreams = readStore(EMBED_STREAMS_KEY, {}) || {};
+    const embedStreamInflight = new Map();
+    function saveEmbedStreams() {
+      const keys = Object.keys(embedStreams);
+      if (keys.length > 200) {
+        for (const k of keys.slice(0, keys.length - 200)) delete embedStreams[k];
+      }
+      writeStore(EMBED_STREAMS_KEY, embedStreams);
+    }
+    function resolveEmbedStream(url, cb) {
+      const now = Math.floor(Date.now() / 1000);
+      const c = embedStreams[url];
+      if (c && c.exp - now > 60) { cb(c.url); return; }
+      const sign = embedSignUrl(url);
+      if (!sign) { cb(''); return; }
+      if (embedStreamInflight.has(sign)) { embedStreamInflight.get(sign).push(cb); return; }
+      const queue = [cb];
+      embedStreamInflight.set(sign, queue);
+      const finish = (hit) => {
+        if (hit) {
+          embedStreams[url] = { url: hit.url, exp: hit.exp || (now + 600) };
+          saveEmbedStreams();
+          for (const fn of queue) fn(hit.url);
+        } else {
+          for (const fn of queue) fn('');
+        }
+        embedStreamInflight.delete(sign);
+      };
+      const ok = (text) => finish(parseSignResponse(text));
+      if (typeof GM_xmlhttpRequest === 'function') {
+        try {
+          GM_xmlhttpRequest({
+            method: 'GET',
+            url: sign,
+            timeout: 10000,
+            onload: (r) => ok(r && r.responseText || ''),
+            onerror: () => finish(null),
+            ontimeout: () => finish(null)
+          });
+          return;
+        } catch (e) { /* fall through to fetch */ }
+      }
+      fetch(sign, { credentials: 'omit' })
+        .then((r) => r.text())
+        .then(ok)
+        .catch(() => finish(null));
+    }
     let settingsView = null;
     let panelTab = 'files';
     let panelSubTab = 'all';        // media sub-tab: all | image | video
@@ -1120,12 +1200,38 @@
           ensureEmbedPoster(url, (p) => setTimeout(() => fill(p), 0));
           return tile;
         }
-        const f = document.createElement('iframe');
-        f.src = url;
-        f.allow = 'fullscreen';
-        f.allowFullscreen = true;
-        f.addEventListener('error', () => markMediaBroken(f));
-        return f;
+        // native <video> first: hosts exposing a sign endpoint serve the
+        // raw mp4 — no third-party player UI. Any failure (no endpoint,
+        // sign error, stream error) falls back to the embed iframe.
+        const host = document.createElement('div');
+        host.className = 'xft-embed-host';
+        let mode = 'none';
+        const mountIframe = () => {
+          if (mode === 'iframe') return;
+          mode = 'iframe';
+          const f = document.createElement('iframe');
+          f.src = url;
+          f.allow = 'fullscreen';
+          f.allowFullscreen = true;
+          f.addEventListener('error', () => markMediaBroken(f));
+          host.textContent = '';
+          host.appendChild(f);
+        };
+        const mountVideo = (src) => {
+          if (mode !== 'none' || !src) return;
+          mode = 'video';
+          const v = document.createElement('video');
+          v.controls = true;
+          v.autoplay = true;
+          // the CDN rejects foreign Referers — media requests must go out
+          // with none, or playback 403s
+          v.referrerPolicy = 'no-referrer';
+          v.src = src;
+          v.addEventListener('error', () => { mode = 'none'; mountIframe(); }, { once: true });
+          host.appendChild(v);
+        };
+        resolveEmbedStream(url, (src) => { if (src) mountVideo(src); else mountIframe(); });
+        return host;
       }
       if (kind === 'video') {
         if (thumb) {
@@ -1913,6 +2019,8 @@
         '#xft-viewer{position:fixed;inset:0;background:hsl(240 10% 3.9%/.94);z-index:10000;display:flex;flex-direction:column;align-items:center;justify-content:center;gap:12px}',
         '#xft-viewer img,#xft-viewer video{max-width:92vw;max-height:80vh;object-fit:contain;border-radius:calc(var(--xft-radius) - 2px)}',
         '#xft-viewer iframe{width:min(92vw,1120px);aspect-ratio:16/9;max-height:80vh;border:0;border-radius:calc(var(--xft-radius) - 2px);background:#000}',
+        '.xft-embed-host{display:flex;align-items:center;justify-content:center;max-width:100%}',
+        '#xft-viewer .xft-embed-host video{width:min(92vw,1120px);max-height:80vh;background:#000;border-radius:calc(var(--xft-radius) - 2px)}',
         '.xft-viewer-bar{display:flex;gap:8px;align-items:center;color:hsl(0 0% 98%);font-size:12px}',
         '#xft-viewer .xft-btn{background:hsl(240 5% 20%/.85);color:hsl(0 0% 98%);border-color:hsl(240 5% 32%)}',
         '#xft-viewer .xft-btn:hover{background:hsl(240 5% 28%);color:hsl(0 0% 98%)}',
@@ -1985,5 +2093,5 @@
   }
 
   // UMD export of the pure functions for node:test (no DOM / GM usage in them).
-  if (typeof module !== 'undefined' && module.exports) module.exports = { parseReactionCount, filterLinks, sortPosts, estimateSize, partitionLinks, extractDomain, groupLinkItems, applyLinkFilters, boilerplateUrls, isSmilieUrl, parseEmbedPoster };
+  if (typeof module !== 'undefined' && module.exports) module.exports = { parseReactionCount, filterLinks, sortPosts, estimateSize, partitionLinks, extractDomain, groupLinkItems, applyLinkFilters, boilerplateUrls, isSmilieUrl, parseEmbedPoster, embedSignUrl, parseSignResponse };
 })();

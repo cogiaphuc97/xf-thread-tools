@@ -8,7 +8,7 @@ import path from 'node:path';
 
 const require = createRequire(import.meta.url);
 const userJsPath = path.join(path.dirname(fileURLToPath(import.meta.url)), '..', 'xf-thread-tools.user.js');
-const { parseReactionCount, filterLinks, sortPosts, estimateSize, partitionLinks, extractDomain, groupLinkItems, applyLinkFilters, boilerplateUrls, isSmilieUrl, parseEmbedPoster } = require(userJsPath);
+const { parseReactionCount, filterLinks, sortPosts, estimateSize, partitionLinks, extractDomain, groupLinkItems, applyLinkFilters, boilerplateUrls, isSmilieUrl, parseEmbedPoster, embedSignUrl, parseSignResponse } = require(userJsPath);
 
 test('UMD export exposes the four pure functions', () => {
   assert.equal(typeof parseReactionCount, 'function');
@@ -276,4 +276,32 @@ test('parseEmbedPoster: no poster, non-http values, garbage input', () => {
   assert.equal(parseEmbedPoster(''), '');
   assert.equal(parseEmbedPoster(null), '');
   assert.equal(parseEmbedPoster(undefined), '');
+});
+
+// ---- embedSignUrl / parseSignResponse (direct-stream adapter) ----
+test('embedSignUrl: /embed/ID shape -> origin api/sign; everything else empty', () => {
+  assert.equal(embedSignUrl('https://embed.example.com/embed/abc123'),
+    'https://embed.example.com/api/sign?v=abc123');
+  assert.equal(embedSignUrl('https://embed.example.com/embed/abc123?x=1'),
+    'https://embed.example.com/api/sign?v=abc123');
+  // ID is encoded, not pasted raw
+  assert.equal(embedSignUrl('https://h.example/embed/a/b'), 'https://h.example/api/sign?v=a');
+  assert.equal(embedSignUrl('https://example.com/watch/abc'), '');
+  assert.equal(embedSignUrl(''), '');
+  assert.equal(embedSignUrl(null), '');
+});
+
+test('parseSignResponse: success shape, \\u0026 unescaping, exp capture, rejects', () => {
+  const hit = parseSignResponse('{"success":true,"url":"https://cdn.example/d/f.mp4?exp=1793347834\\u0026token=abc"}');
+  assert.equal(hit.url, 'https://cdn.example/d/f.mp4?exp=1793347834&token=abc');
+  assert.equal(hit.exp, 1793347834);
+  // no exp param -> 0, caller applies a short default
+  const noExp = parseSignResponse('{"success":true,"url":"https://cdn.example/d/f.mp4"}');
+  assert.equal(noExp.url, 'https://cdn.example/d/f.mp4');
+  assert.equal(noExp.exp, 0);
+  // failures
+  assert.equal(parseSignResponse('{"success":false}'), null);
+  assert.equal(parseSignResponse('<html>challenge</html>'), null);
+  assert.equal(parseSignResponse(''), null);
+  assert.equal(parseSignResponse(null), null);
 });
