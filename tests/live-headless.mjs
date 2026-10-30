@@ -128,7 +128,7 @@ try {
 
   // 3. Open panel; sub-tabs must exist with counts; unfurl logos must be absent
   await ev(cdp, `document.getElementById('xft-edge-btn').click(); true`);
-  await sleep(800);
+  await sleep(2200); // let dead-media errors land + the batched removal pass run
   const panel = await ev(cdp, `({
     open: document.getElementById('xft-panel').classList.contains('xft-open'),
     subtabs: Array.from(document.querySelectorAll('#xft-panel .xft-subtab')).map((b) => b.textContent.trim()),
@@ -143,6 +143,16 @@ try {
         && !(String(el.src || '').indexOf('/smilies/') !== -1 || (() => { try { return decodeURIComponent(el.src || '').indexOf('/smilies/') !== -1; } catch (e) { return false; } })()))
       .map((el) => (el.getAttribute('data-src') && /^(data|blob):/i.test(el.src || '') ? el.getAttribute('data-src') : el.src))
       .filter(Boolean),
+    // load state per ownSrc URL: dead (nw<=1) or still-pending page images may
+    // be absent from the grid (batched broken-removal) — only provably-loaded
+    // ones are required to appear there
+    ownLoadState: Array.from(document.querySelectorAll('article img.bbImage'))
+      .filter((el) => !el.closest('blockquote.bbCodeBlock--quote') && !el.closest('.message-signature'))
+      .map((el) => ({
+        url: el.getAttribute('data-src') && /^(data|blob):/i.test(el.src || '') ? el.getAttribute('data-src') : el.src,
+        good: el.complete && el.naturalWidth > 1
+      }))
+      .filter((o) => o.url),
     quotedSrcs: Array.from(document.querySelectorAll('article blockquote.bbCodeBlock--quote img.bbImage')).map((i) => i.src),
     cellSrcs: Array.from(document.querySelectorAll('#xft-panel .xft-cell img, #xft-panel .xft-cell video')).map((el) => el.src)
   })`);
@@ -157,13 +167,14 @@ try {
   const norm = (s) => String(s).split('#')[0];
   const cells = new Set(panel.cellSrcs.map(norm));
   const own = new Set(panel.ownSrcs.map(norm));
-  const missing = [...own].filter((s) => !cells.has(s));
+  const good = new Set(panel.ownLoadState.filter((o) => o.good).map((o) => norm(o.url)));
+  const missing = [...own].filter((s) => !cells.has(s) && good.has(s));
   const extra = [...cells].filter((s) => !own.has(s));
   const tiles = await ev(cdp, `document.querySelectorAll('#xft-panel .xft-cell .xft-vtile').length`);
   const videoN = parseInt((panel.subtabs.find((t) => t.indexOf('Video') === 0) || 'Video 0').replace(/\D+/g, ''), 10) || 0;
   check('media grid = own-post media only (quotes excluded)',
     missing.length === 0 && extra.length === 0 && tiles === videoN,
-    'grid=' + cells.size + ' own=' + own.size + ' missing=' + missing.length + ' extra=' + extra.length + ' tiles=' + tiles + '/video' + videoN + ' (quoted copies: ' + panel.quotedSrcs.length + ')');
+    'grid=' + cells.size + ' own=' + own.size + ' missing=' + missing.length + (missing.length ? ' miss0=' + missing[0].slice(0, 70) : '') + ' extra=' + extra.length + ' tiles=' + tiles + '/video' + videoN + ' (quoted copies: ' + panel.quotedSrcs.length + ')');
 
   // 3b. the "Show more rows" button is gone entirely (Links auto-loads)
   check('Show more rows button removed',

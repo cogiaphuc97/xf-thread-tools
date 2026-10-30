@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         xf-thread-tools
 // @namespace    xf-thread-tools
-// @version      0.7.21
+// @version      0.7.22
 // @description  XenForo 2: sort thread posts by reaction count across all pages (cached) + floating media panel (images / external links).
 // @author       xf-thread-tools
 // @match        *://*/threads/*
@@ -1033,6 +1033,20 @@
     // Refresh. If a real photo ever gets eaten, lower this constant.
     const tinyMediaUrls = new Set();
     const TINY_MEDIA_MAX = 200;
+    // Media that errored at load: dropped from the grid on the next render.
+    // Removals are debounced+batched so a wave of dead links collapses into
+    // ONE layout pass instead of cells popping out one by one.
+    const brokenMediaUrls = new Set();
+    let brokenRerenderTimer = null;
+    function scheduleBrokenRerender() {
+      if (brokenRerenderTimer) return;
+      brokenRerenderTimer = setTimeout(() => {
+        brokenRerenderTimer = null;
+        vrowCache.clear();
+        vGrid = null;
+        schedulePanelRender();
+      }, 300);
+    }
     // Embed posters: thumbnail URL per embed URL, parsed from the embed page's
     // og:image/data-poster. GM_xmlhttpRequest is required for hosts that send
     // no CORS headers (page fetch() is blocked); a failed look-up caches ''
@@ -1245,9 +1259,19 @@
 
     // dead media URL: mark the containing cell/thumb (CSS shows the ⚠
     // placeholder), not just the <img> that may be replaced by the video retry
-    function markMediaBroken(el) {
-      const host = el.closest('.xft-cell, .xft-vthumb');
+    function markMediaBroken(el, url) {
+      const host = el.closest('.xft-cell, .xft-vthumb, .xft-vslot');
       (host || el).classList.add('xft-broken');
+      if (url) {
+        brokenMediaUrls.add(url);
+        scheduleBrokenRerender();
+      }
+    }
+    // loaded media: fade the element in and stop the cell/slot shimmer
+    function markMediaLoaded(el) {
+      el.classList.add('xft-ok');
+      const host = el.closest('.xft-cell, .xft-vslot, .xft-embed-host');
+      if (host) host.classList.remove('xft-loading');
     }
 
     // Build the <img>/<video> element for a grid cell, viewer, or filmstrip
@@ -1268,10 +1292,13 @@
             // no isConnected gate: the row may be scrolled out of range (kept
             // in vrowCache, detached) when the poster arrives — filling a
             // detached tile is fine, the image loads and shows on re-insert
-            if (!poster || tile.querySelector('img')) return;
+            const cell = tile.closest('.xft-cell');
+            if (!poster) { if (cell) cell.classList.remove('xft-loading'); return; }
+            if (tile.querySelector('img')) return;
             const im = document.createElement('img');
             im.alt = '';
-            im.addEventListener('error', () => im.remove(), { once: true });
+            im.addEventListener('error', () => { im.remove(); if (cell) cell.classList.remove('xft-loading'); }, { once: true });
+            im.addEventListener('load', () => { im.classList.add('xft-ok'); if (cell) cell.classList.remove('xft-loading'); }, { once: true });
             im.src = poster;
             tile.appendChild(im);
           };
@@ -1284,7 +1311,7 @@
         // raw mp4 — no third-party player UI. Any failure (no endpoint,
         // sign error, stream error) falls back to the embed iframe.
         const host = document.createElement('div');
-        host.className = 'xft-embed-host';
+        host.className = 'xft-embed-host xft-loading';
         let mode = 'none';
         const mountIframe = () => {
           if (mode === 'iframe') return;
@@ -1296,6 +1323,7 @@
           f.addEventListener('error', () => markMediaBroken(f));
           host.textContent = '';
           host.appendChild(f);
+          host.classList.remove('xft-loading');
         };
         const mountVideo = (src) => {
           if (mode !== 'none' || !src) return;
@@ -1308,7 +1336,9 @@
           v.referrerPolicy = 'no-referrer';
           v.src = src;
           v.addEventListener('error', () => { mode = 'none'; mountIframe(); }, { once: true });
+          v.addEventListener('loadeddata', () => markMediaLoaded(v), { once: true });
           host.appendChild(v);
+          host.classList.remove('xft-loading');
         };
         resolveEmbedStream(url, (src) => { if (src) mountVideo(src); else mountIframe(); });
         return host;
@@ -1341,10 +1371,11 @@
         } else {
           v.src = url;
         }
-        v.addEventListener('error', () => markMediaBroken(v));
+        v.addEventListener('error', () => markMediaBroken(v, url));
+        v.addEventListener('loadeddata', () => markMediaLoaded(v), { once: true });
         // cached failures never fire events — probe after a moment
         setTimeout(() => {
-          if (v.readyState === 0 && v.networkState === 3) markMediaBroken(v); // NETWORK_NO_SOURCE
+          if (v.readyState === 0 && v.networkState === 3) markMediaBroken(v, url); // NETWORK_NO_SOURCE
         }, 800);
         return v;
       }
@@ -1358,8 +1389,8 @@
         v.preload = 'metadata';
         v.muted = true;
         v.src = url;
-        v.addEventListener('error', () => markMediaBroken(v));
-        v.addEventListener('loadedmetadata', () => { if (im.parentNode) im.replaceWith(v); });
+        v.addEventListener('error', () => markMediaBroken(v, url));
+        v.addEventListener('loadedmetadata', () => { if (im.parentNode) im.replaceWith(v); markMediaLoaded(v); });
         v.load();
       });
       im.src = url;
@@ -1367,7 +1398,7 @@
       // 1×1 placeholders (svg data-URIs, hotlink-block pixels) "load" as a
       // single stretched pixel = a blank cell. nw<=1 + complete = dead either
       // way — probe for both, or the cell renders blank forever.
-      const checkDead = () => { if (im.complete && im.naturalWidth <= 1) markMediaBroken(im); };
+      const checkDead = () => { if (im.complete && im.naturalWidth <= 1) markMediaBroken(im, url); };
       const checkTiny = () => {
         // 2..120px square-ish = smilie/sticker (no URL marker exists) —
         // retire the item. A mid-list removal invalidates every cached row
@@ -1381,9 +1412,9 @@
           schedulePanelRender();
         }
       };
-      if (im.complete) { checkDead(); checkTiny(); }
+      if (im.complete) { checkDead(); checkTiny(); if (im.naturalWidth > 1) markMediaLoaded(im); }
       else {
-        im.addEventListener('load', () => { checkDead(); checkTiny(); });
+        im.addEventListener('load', () => { checkDead(); checkTiny(); markMediaLoaded(im); });
         setTimeout(() => { checkDead(); checkTiny(); }, 800);
       }
       return im;
@@ -1450,6 +1481,14 @@
       const v = document.createElement('div');
       v.id = 'xft-viewer';
       const media = buildMediaEl(it.kind, it.url, false);
+      // every viewer media occupies the SAME fixed slot — no size popping
+      // between items of different dimensions; shimmer until loaded
+      let mediaBox = media;
+      if (it.kind === 'image' || it.kind === 'video') {
+        mediaBox = document.createElement('div');
+        mediaBox.className = 'xft-vslot xft-loading';
+        mediaBox.appendChild(media);
+      }
       const bar = document.createElement('div');
       bar.className = 'xft-viewer-bar';
       const info = document.createElement('span');
@@ -1461,7 +1500,7 @@
       const go = mkBtn('Go to comment', () => { closeViewer(); jumpTo(it.postId); });
       const close = mkBtn('✕ Close', closeViewer);
       bar.append(info, prev, next, go, close);
-      v.append(bar, media);
+      v.append(bar, mediaBox);
       if (viewerItems.length > 1) {
         const strip = document.createElement('div');
         strip.className = 'xft-viewer-strip';
@@ -1525,7 +1564,7 @@
         // their real URLs (attachment-scan twins) — drop the placeholders so
         // already-cached threads heal without a Refresh; smilies and
         // signature/footer boilerplate are filtered the same way
-        const real = (list) => (list || []).filter((u) => !/^(data|blob):/i.test(u || '') && !isSmilieUrl(u) && !boiler.has(String(u || '')) && !tinyMediaUrls.has(String(u || '')));
+        const real = (list) => (list || []).filter((u) => !/^(data|blob):/i.test(u || '') && !isSmilieUrl(u) && !boiler.has(String(u || '')) && !tinyMediaUrls.has(String(u || '')) && !brokenMediaUrls.has(String(u || '')));
         for (const r of ordered) {
           for (const url of real(r.images)) all.push({ r: r, url: url, pos: posMap.get(r.postId) || 0, kind: 'image' });
           for (const url of real(r.videos)) all.push({ r: r, url: url, pos: posMap.get(r.postId) || 0, kind: 'video' });
@@ -1610,6 +1649,10 @@
                 cell.title = '[#' + it.pos + '] ' + (it.r.author || '?') + ' — open';
                 const isVideo = it.kind === 'video' || it.kind === 'embed';
                 const thumb = buildMediaEl(it.kind, it.url, true);
+                // shimmer while the media loads (cached-complete images come
+                // back already ok'd — no flash for them)
+                if ((it.kind === 'image' || it.kind === 'embed')
+                  && !(thumb.tagName === 'IMG' && thumb.classList.contains('xft-ok'))) cell.classList.add('xft-loading');
                 const label = document.createElement('span');
                 label.className = 'xft-cell-label';
                 label.textContent = '#' + it.pos + ' ' + (it.r.author || '?');
@@ -2110,10 +2153,21 @@
         '.xft-set-row input:focus-visible{outline:2px solid transparent;border-color:hsl(var(--xft-ring));box-shadow:0 0 0 2px hsl(var(--xft-ring)/.25)}',
         // ---- viewer (always dark media surface, independent of theme) ----
         '#xft-viewer{position:fixed;inset:0;background:hsl(240 10% 3.9%/.94);z-index:10000;display:flex;flex-direction:column;align-items:center;justify-content:center;gap:12px}',
-        '#xft-viewer img,#xft-viewer video{max-width:92vw;max-height:80vh;object-fit:contain;border-radius:calc(var(--xft-radius) - 2px)}',
+        '#xft-viewer iframe{width:min(92vw,1120px);aspect-ratio:16/9;max-height:80vh;border:0;border-radius:calc(var(--xft-radius) - 2px);background:#000}',
+        // every viewer media sits in ONE fixed-size slot: no size popping
+        // between items; content fades in once loaded, shimmer until then
+        '.xft-vslot{position:relative;height:80vh;width:min(92vw,1120px);display:flex;align-items:center;justify-content:center;background:#000;border-radius:calc(var(--xft-radius) - 2px);overflow:hidden}',
+        '.xft-vslot img,.xft-vslot video{max-width:100%;max-height:100%;object-fit:contain;opacity:0;transition:opacity .18s ease}',
+        '.xft-vslot img.xft-ok,.xft-vslot video.xft-ok{opacity:1}',
+        // grid cells shimmer while their media loads; media fades in on load
+        '.xft-cell img{opacity:0;transition:opacity .18s ease}',
+        '.xft-cell img.xft-ok{opacity:1}',
+        '.xft-cell.xft-loading::after,.xft-vslot.xft-loading::after,.xft-embed-host.xft-loading::after{content:"";position:absolute;inset:0;pointer-events:none;background:linear-gradient(100deg,hsl(0 0% 98%/.03) 30%,hsl(0 0% 98%/.09) 50%,hsl(0 0% 98%/.03) 70%);animation:xft-shimmer 1.3s linear infinite}',
+        '@keyframes xft-shimmer{from{transform:translateX(-100%)}to{transform:translateX(100%)}}',
+        '@media (prefers-reduced-motion: reduce){.xft-cell.xft-loading::after,.xft-vslot.xft-loading::after,.xft-embed-host.xft-loading::after{animation:none}}',
         // embed viewer box is sized BEFORE the video arrives (sign round-trip
         // + metadata load would otherwise grow the box from zero and pop)
-        '.xft-embed-host{display:flex;align-items:center;justify-content:center;width:min(92vw,1120px);aspect-ratio:16/9;max-height:80vh;border-radius:calc(var(--xft-radius) - 2px);background:#000;overflow:hidden}',
+        '.xft-embed-host{position:relative;display:flex;align-items:center;justify-content:center;width:min(92vw,1120px);aspect-ratio:16/9;max-height:80vh;border-radius:calc(var(--xft-radius) - 2px);background:#000;overflow:hidden}',
         '#xft-viewer .xft-embed-host video{width:100%;height:100%;object-fit:contain;display:block;background:#000}',
         '#xft-viewer .xft-embed-host iframe{width:100%;height:100%;border:0;background:#000}',
         '.xft-viewer-bar{display:flex;gap:8px;align-items:center;color:hsl(0 0% 98%);font-size:12px}',
