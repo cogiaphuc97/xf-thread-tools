@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         xf-thread-tools
 // @namespace    xf-thread-tools
-// @version      0.7.17
+// @version      0.7.18
 // @description  XenForo 2: sort thread posts by reaction count across all pages (cached) + floating media panel (images / external links).
 // @author       xf-thread-tools
 // @match        *://*/threads/*
@@ -972,40 +972,87 @@
       }
       writeStore(EMBED_POSTERS_KEY, embedPosters);
     }
+    // Poster look-ups run through a serialized queue: firing every visible
+    // tile's request at once (a dense Video tab = 8-16 parallel GETs, cookie
+    // -less) trips the host's CDN challenges — the first few come back 200,
+    // the rest 403 and stayed blank for the whole session. Two concurrent
+    // max, 350ms between starts, and each URL retries with backoff before
+    // its session cap kicks in.
+    const posterNetQueue = [];
+    let posterNetActive = 0;
+    let posterNetLast = 0;
+    const POSTER_NET_MAX = 2;
+    const POSTER_NET_GAP = 350;
+    function runPosterNet(job) {
+      posterNetQueue.push(job);
+      pumpPosterNet();
+    }
+    function pumpPosterNet() {
+      if (posterNetActive >= POSTER_NET_MAX || !posterNetQueue.length) return;
+      const job = posterNetQueue.shift();
+      posterNetActive++; // reserve the slot at SCHEDULE time — the delayed
+      // start still counts, or parallel 350ms waits expire together and
+      // start several jobs in the same tick (burst is exactly what breaks)
+      const now = Date.now();
+      const wait = Math.max(0, posterNetLast + POSTER_NET_GAP - now);
+      posterNetLast = now + wait; // chain the NEXT start off this reserved
+      // time — both slots must not compute from the same stale timestamp
+      setTimeout(() => {
+        job(() => { posterNetActive--; pumpPosterNet(); });
+      }, wait);
+    }
     function fetchEmbedPoster(url, cb) {
       if (embedPosterInflight.has(url)) { embedPosterInflight.get(url).push(cb); return; }
       const queue = [cb];
       embedPosterInflight.set(url, queue);
-      const done = (poster) => {
+      let attempts = 0;
+      const finish = (poster) => {
         if (poster) {
           embedPosters[url] = poster;
           saveEmbedPosters();
         } else {
-          // failures are NOT persisted — a transient network error would
-          // otherwise blank the tile on every future visit; retry once per
-          // page load instead (session set below caps the retry)
+          // exhausted — not persisted (a transient failure would blank the
+          // tile on every future visit); retried on the next page load
           failedEmbedPosters.add(url);
         }
         for (const fn of queue) fn(poster || '');
         embedPosterInflight.delete(url);
       };
-      if (typeof GM_xmlhttpRequest === 'function') {
-        try {
-          GM_xmlhttpRequest({
-            method: 'GET',
-            url: url,
-            timeout: 10000,
-            onload: (r) => done(parseEmbedPoster(r.responseText)),
-            onerror: () => done(''),
-            ontimeout: () => done('')
+      const attempt = () => {
+        attempts++;
+        // non-200 / network error / challenge page: retry with backoff, then cap
+        const retryable = () => {
+          if (attempts >= 3) finish('');
+          else setTimeout(attempt, 1200 * attempts);
+        };
+        const ok = (text) => {
+          const poster = parseEmbedPoster(text);
+          if (poster) finish(poster);
+          else retryable(); // 200 but no poster — may be an interstitial
+        };
+        if (typeof GM_xmlhttpRequest === 'function') {
+          runPosterNet((done) => {
+            try {
+              GM_xmlhttpRequest({
+                method: 'GET',
+                url: url,
+                timeout: 10000,
+                onload: (r) => { done(); if (r && r.status && r.status !== 200) retryable(); else ok(r ? r.responseText : ''); },
+                onerror: () => { done(); retryable(); },
+                ontimeout: () => { done(); retryable(); }
+              });
+            } catch (e) { done(); retryable(); }
           });
           return;
-        } catch (e) { /* fall through to fetch */ }
-      }
-      fetch(url, { credentials: 'omit' })
-        .then((r) => r.text())
-        .then((t) => done(parseEmbedPoster(t)))
-        .catch(() => done(''));
+        }
+        runPosterNet((done) => {
+          fetch(url, { credentials: 'omit' })
+            .then((r) => r.text())
+            .then((t) => { done(); ok(t); })
+            .catch(() => { done(); retryable(); });
+        });
+      };
+      attempt();
     }
     function ensureEmbedPoster(url, cb) {
       if (Object.prototype.hasOwnProperty.call(embedPosters, url)) { cb(embedPosters[url]); return; }
