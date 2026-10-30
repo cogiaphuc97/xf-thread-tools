@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         xf-thread-tools
 // @namespace    xf-thread-tools
-// @version      0.7.16
+// @version      0.7.17
 // @description  XenForo 2: sort thread posts by reaction count across all pages (cached) + floating media panel (images / external links).
 // @author       xf-thread-tools
 // @match        *://*/threads/*
@@ -964,6 +964,7 @@
     const EMBED_POSTERS_KEY = 'xfThreadTools:embedPosters';
     const embedPosters = readStore(EMBED_POSTERS_KEY, {}) || {};
     const embedPosterInflight = new Map();
+    const failedEmbedPosters = new Set();
     function saveEmbedPosters() {
       const keys = Object.keys(embedPosters);
       if (keys.length > 300) {
@@ -976,9 +977,16 @@
       const queue = [cb];
       embedPosterInflight.set(url, queue);
       const done = (poster) => {
-        embedPosters[url] = poster || '';
-        saveEmbedPosters();
-        for (const fn of queue) fn(embedPosters[url]);
+        if (poster) {
+          embedPosters[url] = poster;
+          saveEmbedPosters();
+        } else {
+          // failures are NOT persisted — a transient network error would
+          // otherwise blank the tile on every future visit; retry once per
+          // page load instead (session set below caps the retry)
+          failedEmbedPosters.add(url);
+        }
+        for (const fn of queue) fn(poster || '');
         embedPosterInflight.delete(url);
       };
       if (typeof GM_xmlhttpRequest === 'function') {
@@ -1001,6 +1009,7 @@
     }
     function ensureEmbedPoster(url, cb) {
       if (Object.prototype.hasOwnProperty.call(embedPosters, url)) { cb(embedPosters[url]); return; }
+      if (failedEmbedPosters.has(url)) { cb(''); return; } // one retry per page load
       fetchEmbedPoster(url, cb);
     }
     let settingsView = null;
@@ -1049,7 +1058,10 @@
           const tile = document.createElement('div');
           tile.className = 'xft-vtile';
           const fill = (poster) => {
-            if (!poster || !tile.isConnected || tile.querySelector('img')) return;
+            // no isConnected gate: the row may be scrolled out of range (kept
+            // in vrowCache, detached) when the poster arrives — filling a
+            // detached tile is fine, the image loads and shows on re-insert
+            if (!poster || tile.querySelector('img')) return;
             const im = document.createElement('img');
             im.alt = '';
             im.addEventListener('error', () => im.remove(), { once: true });
@@ -1057,7 +1069,7 @@
             tile.appendChild(im);
           };
           // deferred a tick: the cached path resolves synchronously, before
-          // renderRange has inserted the row (tile.isConnected would be false)
+          // renderRange has inserted the row into the document
           ensureEmbedPoster(url, (p) => setTimeout(() => fill(p), 0));
           return tile;
         }
