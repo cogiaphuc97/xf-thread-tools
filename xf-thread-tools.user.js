@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         xf-thread-tools
 // @namespace    xf-thread-tools
-// @version      0.7.20
+// @version      0.7.21
 // @description  XenForo 2: sort thread posts by reaction count across all pages (cached) + floating media panel (images / external links).
 // @author       xf-thread-tools
 // @match        *://*/threads/*
@@ -208,6 +208,55 @@
       }
     } catch (e) { /* not JSON / error page */ }
     return null;
+  }
+
+  // Token-sign parser (bunkr-style sign endpoints answer {token, ex}, and the
+  // caller appends ?token=&ex= to the unsigned CDN url themselves).
+  function parseSignToken(text) {
+    try {
+      const j = JSON.parse(String(text || ''));
+      if (j && typeof j.token === 'string' && j.token && j.ex) {
+        return { token: j.token, exp: parseInt(j.ex, 10) || 0 };
+      }
+    } catch (e) { /* not JSON / error page */ }
+    return null;
+  }
+
+  // File-page carrier parser: given the HTML of a host's /v/ or /f/ page,
+  // find the direct media. Carriers, in trust order:
+  //   1. jsCDN + signUrl vars (bunkr family) — unsigned CDN url + a sign
+  //      endpoint that must be called with ?path=<pathname> first
+  //   2. og:video / og:video:secure_url meta
+  //   3. <video src> / <source src> absolute http
+  // Returns {src, sign} | {src} | null.
+  function parseVideoPage(html) {
+    const h = String(html || '');
+    if (!h) return null;
+    const unesc = (s) => s.replace(/\\\//g, '/').replace(/&amp;/g, '&').replace(/&quot;/g, '"');
+    const cdn = h.match(/var\s+jsCDN\s*=\s*"([^"]+)"/);
+    const sgn = h.match(/var\s+signUrl\s*=\s*"([^"]+)"/);
+    if (cdn && /^https?:\/\//.test(unesc(cdn[1]))) {
+      if (sgn && /^https?:\/\//.test(unesc(sgn[1]))) return { src: unesc(cdn[1]), sign: unesc(sgn[1]) };
+      return { src: unesc(cdn[1]) };
+    }
+    const og = h.match(/<meta[^>]+property=["']og:video(?::secure_url|:url)?["'][^>]+content=["']([^"']+)["']/i)
+      || h.match(/<meta[^>]+content=["']([^"']+)["'][^>]+property=["']og:video(?::secure_url|:url)?["']/i);
+    if (og && /^https?:\/\//i.test(og[1])) return { src: unesc(og[1]) };
+    const st = h.match(/<source[^>]+src=["'](https?:\/\/[^"']+)["']/i)
+      || h.match(/<video[^>]+src=["'](https?:\/\/[^"']+)["']/i);
+    if (st) return { src: unesc(st[1]) };
+    return null;
+  }
+
+  // Videos-tab URLs that are actually host file PAGES (the .mp4-looking path
+  // 403s or serves HTML as a direct <video> src) — these resolve through
+  // parseVideoPage before playback. /v/<name>.mp4 and /f/<something> are the
+  // file-page shapes; extension-bearing URLs elsewhere are real direct files.
+  function isVideoPageUrl(u) {
+    const s = String(u || '');
+    if (!/^https?:\/\//i.test(s)) return false;
+    const path = s.replace(/^https?:\/\/[^/]+/i, '').split(/[?#]/)[0];
+    return /^\/v\/[^/]+\.(mp4|webm|mkv|mov|m4v)$/i.test(path) || /^\/f\/[^/]+$/i.test(path);
   }
 
   function partitionLinks(hrefList) {
@@ -1101,15 +1150,36 @@
       }
       writeStore(EMBED_STREAMS_KEY, embedStreams);
     }
+    // GM-or-fetch GET returning responseText; single-shot, no queue (stream
+    // resolution is click-driven, one URL at a time)
+    function gmGetText(url, onOk, onErr) {
+      if (typeof GM_xmlhttpRequest === 'function') {
+        try {
+          GM_xmlhttpRequest({
+            method: 'GET',
+            url: url,
+            timeout: 10000,
+            onload: (r) => onOk(r && r.responseText || ''),
+            onerror: onErr,
+            ontimeout: onErr
+          });
+          return;
+        } catch (e) { /* fall through to fetch */ }
+      }
+      fetch(url, { credentials: 'omit' })
+        .then((r) => r.text())
+        .then(onOk)
+        .catch(onErr);
+    }
     function resolveEmbedStream(url, cb) {
       const now = Math.floor(Date.now() / 1000);
       const c = embedStreams[url];
       if (c && c.exp - now > 60) { cb(c.url); return; }
       const sign = embedSignUrl(url);
-      if (!sign) { cb(''); return; }
-      if (embedStreamInflight.has(sign)) { embedStreamInflight.get(sign).push(cb); return; }
+      if (!sign && !isVideoPageUrl(url)) { cb(''); return; }
+      if (embedStreamInflight.has(url)) { embedStreamInflight.get(url).push(cb); return; }
       const queue = [cb];
-      embedStreamInflight.set(sign, queue);
+      embedStreamInflight.set(url, queue);
       const finish = (hit) => {
         if (hit) {
           embedStreams[url] = { url: hit.url, exp: hit.exp || (now + 600) };
@@ -1118,26 +1188,36 @@
         } else {
           for (const fn of queue) fn('');
         }
-        embedStreamInflight.delete(sign);
+        embedStreamInflight.delete(url);
+      };
+      // route 2: file-page hosts (bunkr-style /v/ or /f/ pages) — fetch the
+      // page, extract the carrier, sign it if the page says so
+      const resolveViaPage = () => {
+        const pageDone = (text) => {
+          const carrier = parseVideoPage(text);
+          if (!carrier) { finish(null); return; }
+          if (carrier.sign) {
+            let path = '';
+            try { path = new URL(carrier.src).pathname; } catch (e) { finish(null); return; }
+            const signDone = (st) => {
+              const tok = parseSignToken(st);
+              if (!tok) { finish(null); return; }
+              finish({ url: carrier.src + (carrier.src.indexOf('?') === -1 ? '?' : '&')
+                + 'token=' + encodeURIComponent(tok.token) + '&ex=' + tok.exp, exp: tok.exp });
+            };
+            gmGetText(carrier.sign + '?path=' + encodeURIComponent(path), signDone, () => finish(null));
+          } else {
+            finish({ url: carrier.src, exp: 0 });
+          }
+        };
+        gmGetText(url, pageDone, () => finish(null));
       };
       const ok = (text) => finish(parseSignResponse(text));
-      if (typeof GM_xmlhttpRequest === 'function') {
-        try {
-          GM_xmlhttpRequest({
-            method: 'GET',
-            url: sign,
-            timeout: 10000,
-            onload: (r) => ok(r && r.responseText || ''),
-            onerror: () => finish(null),
-            ontimeout: () => finish(null)
-          });
-          return;
-        } catch (e) { /* fall through to fetch */ }
+      if (sign) {
+        gmGetText(sign, ok, () => finish(null));
+      } else {
+        resolveViaPage();
       }
-      fetch(sign, { credentials: 'omit' })
-        .then((r) => r.text())
-        .then(ok)
-        .catch(() => finish(null));
     }
     let settingsView = null;
     let panelTab = 'files';
@@ -1247,7 +1327,20 @@
         const v = document.createElement('video');
         v.controls = true;
         v.autoplay = true;
-        v.src = url;
+        // file-PAGE urls (host /v/ or /f/ pages carrying the media behind a
+        // sign endpoint or page parse) resolve to the direct src first; the
+        // raw page URL is never playable as bytes. Resolution failure falls
+        // back to the raw URL — same broken-tile behavior as before.
+        if (isVideoPageUrl(url)) {
+          resolveEmbedStream(url, (src) => {
+            if (!src) { v.src = url; return; }
+            // resolved CDNs reject foreign Referers — request with none
+            v.referrerPolicy = 'no-referrer';
+            v.src = src;
+          });
+        } else {
+          v.src = url;
+        }
         v.addEventListener('error', () => markMediaBroken(v));
         // cached failures never fire events — probe after a moment
         setTimeout(() => {
@@ -2095,5 +2188,5 @@
   }
 
   // UMD export of the pure functions for node:test (no DOM / GM usage in them).
-  if (typeof module !== 'undefined' && module.exports) module.exports = { parseReactionCount, filterLinks, sortPosts, estimateSize, partitionLinks, extractDomain, groupLinkItems, applyLinkFilters, boilerplateUrls, isSmilieUrl, parseEmbedPoster, embedSignUrl, parseSignResponse };
+  if (typeof module !== 'undefined' && module.exports) module.exports = { parseReactionCount, filterLinks, sortPosts, estimateSize, partitionLinks, extractDomain, groupLinkItems, applyLinkFilters, boilerplateUrls, isSmilieUrl, parseEmbedPoster, embedSignUrl, parseSignResponse, parseSignToken, parseVideoPage, isVideoPageUrl };
 })();

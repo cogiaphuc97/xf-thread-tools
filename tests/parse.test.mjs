@@ -8,7 +8,7 @@ import path from 'node:path';
 
 const require = createRequire(import.meta.url);
 const userJsPath = path.join(path.dirname(fileURLToPath(import.meta.url)), '..', 'xf-thread-tools.user.js');
-const { parseReactionCount, filterLinks, sortPosts, estimateSize, partitionLinks, extractDomain, groupLinkItems, applyLinkFilters, boilerplateUrls, isSmilieUrl, parseEmbedPoster, embedSignUrl, parseSignResponse } = require(userJsPath);
+const { parseReactionCount, filterLinks, sortPosts, estimateSize, partitionLinks, extractDomain, groupLinkItems, applyLinkFilters, boilerplateUrls, isSmilieUrl, parseEmbedPoster, embedSignUrl, parseSignResponse, parseSignToken, parseVideoPage, isVideoPageUrl } = require(userJsPath);
 
 test('UMD export exposes the four pure functions', () => {
   assert.equal(typeof parseReactionCount, 'function');
@@ -304,4 +304,46 @@ test('parseSignResponse: success shape, \\u0026 unescaping, exp capture, rejects
   assert.equal(parseSignResponse('<html>challenge</html>'), null);
   assert.equal(parseSignResponse(''), null);
   assert.equal(parseSignResponse(null), null);
+});
+
+// ---- parseSignToken / parseVideoPage / isVideoPageUrl (file-page route) ----
+test('parseSignToken: bunkr-style {token, ex}; rejects other shapes', () => {
+  const hit = parseSignToken('{"ex":1793358356,"token":"083587a093769d9fe3e91d1d3013aa9fb089bfaa"}');
+  assert.equal(hit.token, '083587a093769d9fe3e91d1d3013aa9fb089bfaa');
+  assert.equal(hit.exp, 1793358356);
+  assert.equal(parseSignToken('{"success":true,"url":"https://x/f.mp4"}'), null);
+  assert.equal(parseSignToken('{}'), null);
+  assert.equal(parseSignToken(''), null);
+  assert.equal(parseSignToken(null), null);
+});
+
+test('parseVideoPage: jsCDN+signUrl carrier (escaped slashes), og:video, source tag', () => {
+  // bunkr-style inline vars — values come JSON-escaped in the page
+  const bunkr = 'var jsCDN = "https:\\/\\/c4ta-b.cdn.cr\\/storage\\/media\\/a.mp4";'
+    + 'var signUrl = "https:\\/\\/glb-apisign.cdn.cr\\/sign";';
+  const hit = parseVideoPage(bunkr);
+  assert.equal(hit.src, 'https://c4ta-b.cdn.cr/storage/media/a.mp4');
+  assert.equal(hit.sign, 'https://glb-apisign.cdn.cr/sign');
+  // jsCDN without signUrl: unsigned carrier
+  assert.deepEqual(parseVideoPage('var jsCDN = "https:\\/\\/cdn.example\\/a.mp4";'), { src: 'https://cdn.example/a.mp4' });
+  // og:video meta
+  assert.deepEqual(parseVideoPage('<meta property="og:video" content="https://cdn.example/v.mp4">'), { src: 'https://cdn.example/v.mp4' });
+  // <source> tag
+  assert.deepEqual(parseVideoPage('<video><source src="https://cdn.example/s.mp4" type="video/mp4"></video>'), { src: 'https://cdn.example/s.mp4' });
+  // nothing
+  assert.equal(parseVideoPage('<html>plain page</html>'), null);
+  assert.equal(parseVideoPage(''), null);
+  assert.equal(parseVideoPage(null), null);
+});
+
+test('isVideoPageUrl: /v/<name>.mp4 and /f/<x> are pages; direct files and forum URLs are not', () => {
+  assert.equal(isVideoPageUrl('https://h.example/v/clip-Ab12.mp4'), true);
+  assert.equal(isVideoPageUrl('https://h.example/v/clip-Ab12.mp4?x=1'), true);
+  assert.equal(isVideoPageUrl('https://h.example/f/some-File9Z.mp4'), true);
+  assert.equal(isVideoPageUrl('https://h.example/f/aB3xY9'), true);
+  assert.equal(isVideoPageUrl('https://cdn.example/data/attachments/video.mp4'), false);
+  assert.equal(isVideoPageUrl('https://h.example/embed/abc123'), false);
+  assert.equal(isVideoPageUrl('https://voz.example/threads/some.3871/'), false);
+  assert.equal(isVideoPageUrl(''), false);
+  assert.equal(isVideoPageUrl(null), false);
 });
