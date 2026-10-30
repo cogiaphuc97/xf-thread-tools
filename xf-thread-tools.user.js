@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         xf-thread-tools
 // @namespace    xf-thread-tools
-// @version      0.7.19
+// @version      0.7.20
 // @description  XenForo 2: sort thread posts by reaction count across all pages (cached) + floating media panel (images / external links).
 // @author       xf-thread-tools
 // @match        *://*/threads/*
@@ -2018,9 +2018,11 @@
         // ---- viewer (always dark media surface, independent of theme) ----
         '#xft-viewer{position:fixed;inset:0;background:hsl(240 10% 3.9%/.94);z-index:10000;display:flex;flex-direction:column;align-items:center;justify-content:center;gap:12px}',
         '#xft-viewer img,#xft-viewer video{max-width:92vw;max-height:80vh;object-fit:contain;border-radius:calc(var(--xft-radius) - 2px)}',
-        '#xft-viewer iframe{width:min(92vw,1120px);aspect-ratio:16/9;max-height:80vh;border:0;border-radius:calc(var(--xft-radius) - 2px);background:#000}',
-        '.xft-embed-host{display:flex;align-items:center;justify-content:center;max-width:100%}',
-        '#xft-viewer .xft-embed-host video{width:min(92vw,1120px);max-height:80vh;background:#000;border-radius:calc(var(--xft-radius) - 2px)}',
+        // embed viewer box is sized BEFORE the video arrives (sign round-trip
+        // + metadata load would otherwise grow the box from zero and pop)
+        '.xft-embed-host{display:flex;align-items:center;justify-content:center;width:min(92vw,1120px);aspect-ratio:16/9;max-height:80vh;border-radius:calc(var(--xft-radius) - 2px);background:#000;overflow:hidden}',
+        '#xft-viewer .xft-embed-host video{width:100%;height:100%;object-fit:contain;display:block;background:#000}',
+        '#xft-viewer .xft-embed-host iframe{width:100%;height:100%;border:0;background:#000}',
         '.xft-viewer-bar{display:flex;gap:8px;align-items:center;color:hsl(0 0% 98%);font-size:12px}',
         '#xft-viewer .xft-btn{background:hsl(240 5% 20%/.85);color:hsl(0 0% 98%);border-color:hsl(240 5% 32%)}',
         '#xft-viewer .xft-btn:hover{background:hsl(240 5% 28%);color:hsl(0 0% 98%)}',
