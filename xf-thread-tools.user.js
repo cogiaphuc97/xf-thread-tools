@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         xf-thread-tools
 // @namespace    xf-thread-tools
-// @version      0.7.33
+// @version      0.7.34
 // @description  XenForo 2: sort thread posts by reaction count across all pages (cached) + floating media panel (images / external links).
 // @author       xf-thread-tools
 // @match        *://*/threads/*
@@ -1708,7 +1708,9 @@
       for (const g of groups.values()) {
         lay.push({ hdr: 'main', label: g.label, postId: g.postId });
         for (const s of g.subs.values()) {
-          if (mode !== 'post') lay.push({ hdr: 'sub', label: '#' + s.pos + ' - ' + s.author, postId: s.postId });
+          // user groups already name the author in their main header — the
+          // post sub-header shows the number only
+          if (mode !== 'post') lay.push({ hdr: 'sub', label: mode === 'user' ? '#' + s.pos : '#' + s.pos + ' - ' + s.author, postId: s.postId });
           chunk(s.list);
         }
       }
