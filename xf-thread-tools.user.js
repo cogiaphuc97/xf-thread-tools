@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         xf-thread-tools
 // @namespace    xf-thread-tools
-// @version      0.7.34
+// @version      0.7.35
 // @description  XenForo 2: sort thread posts by reaction count across all pages (cached) + floating media panel (images / external links).
 // @author       xf-thread-tools
 // @match        *://*/threads/*
@@ -1375,6 +1375,21 @@
       });
     }
 
+    // HQ image upgrade (0.7.35): some hosts embed a MEDIUM variant in post
+    // bodies — filename `<WxH>_<name>.md.jpg` (original dims + .md/.th
+    // marker). The original hides at a marker-free path in the same dir.
+    // Shape-based only (no hostnames); hosts without the marker (site
+    // attachments, plain uploaders) never enter the chain. Candidates walk
+    // drop-dims+marker → drop-marker → the post URL itself; the reached
+    // stage is remembered per session so rebuilds skip dead candidates.
+    const HQ_IMG_RE = /^(.*\/)(\d+x\d+)_(.+)\.(md|th)\.(jpe?g|png|webp|gif)$/i;
+    const hqStage = new Map();
+    function hqCandidates(url) {
+      const m = String(url || '').match(HQ_IMG_RE);
+      if (!m) return [url];
+      return [m[1] + m[3] + '.' + m[5], m[1] + m[2] + '_' + m[3] + '.' + m[5], url];
+    }
+
     // Build the <img>/<video> element for a grid cell, viewer, or filmstrip
     // thumb. An <img> that fails to load is retried once as <video> —
     // extension-based classification cannot know a URL's real bytes (video
@@ -1484,7 +1499,13 @@
       // thumbs are only created in-range by the virtualizer — eager loading
       // avoids loading=lazy deferral bugs on re-inserted cached rows
       if (!thumb) im.loading = 'lazy';
+      const cands = hqCandidates(url);
+      let ci = Math.min(hqStage.get(url) || 0, cands.length - 1);
+      const useStage = (i) => { ci = i; hqStage.set(url, i); im.src = cands[i]; };
       im.addEventListener('error', function onErr() {
+        // HQ candidates first: a dead upgrade falls through to the next
+        // candidate; only the post URL itself failing starts the video retry
+        if (ci < cands.length - 1) { useStage(ci + 1); return; }
         im.removeEventListener('error', onErr);
         const v = document.createElement('video');
         v.preload = 'metadata';
@@ -1494,7 +1515,7 @@
         v.addEventListener('loadedmetadata', () => { if (im.parentNode) im.replaceWith(v); markMediaLoaded(v); });
         v.load();
       });
-      im.src = url;
+      useStage(ci);
       // A failure cached by Chrome replays instantly with NO error event, and
       // 1×1 placeholders (svg data-URIs, hotlink-block pixels) "load" as a
       // single stretched pixel = a blank cell. nw<=1 + complete = dead either
