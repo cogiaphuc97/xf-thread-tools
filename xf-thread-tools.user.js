@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         xf-thread-tools
 // @namespace    xf-thread-tools
-// @version      0.7.26
+// @version      0.7.27
 // @description  XenForo 2: sort thread posts by reaction count across all pages (cached) + floating media panel (images / external links).
 // @author       xf-thread-tools
 // @match        *://*/threads/*
@@ -1032,6 +1032,11 @@
     function clearVRows() {
       for (const el of vrowCache.values()) el.remove();
       vrowCache.clear();
+      // cleared rows MUST rebuild: with the signature intact, renderPanelBody
+      // early-returns on its sig guard and the grid stays empty forever
+      // (broken-removal rerenders that change no counts, Refresh when the
+      // refetched data has the same shape)
+      lastPanelSignature = '';
     }
     let vRowHMeasured = 0;
     let vGrid = null; // live media-grid state {topPad,vrows,bottomPad,items,identity,renderRange}
@@ -1050,6 +1055,10 @@
     // ONE layout pass instead of cells popping out one by one.
     const brokenMediaUrls = new Set();
     let brokenRerenderTimer = null;
+    // while a removal wave animates out, rebuilt rows must NOT re-run the
+    // pop-in (the whole grid would flash). Rows built inside this window
+    // carry .xft-nopop.
+    let popSuppressUntil = 0;
     function scheduleBrokenRerender() {
       if (brokenRerenderTimer) return;
       brokenRerenderTimer = setTimeout(() => {
@@ -1276,8 +1285,23 @@
       (host || el).classList.add('xft-broken');
       if (url) {
         brokenMediaUrls.add(url);
+        animateOutCells(url);
         scheduleBrokenRerender();
       }
+    }
+    // fade every visible cell showing this URL out BEFORE the batched
+    // removal re-render, so dead items shrink away instead of popping out
+    function animateOutCells(url) {
+      const pan = document.getElementById('xft-panel');
+      if (!pan) return;
+      let n = 0;
+      for (const el of pan.querySelectorAll('.xft-cell img, .xft-cell video')) {
+        if (el.src === url) {
+          const c = el.closest('.xft-cell');
+          if (c) { c.classList.add('xft-out'); n++; }
+        }
+      }
+      if (n) popSuppressUntil = performance.now() + 450;
     }
     // loaded media: fade the element in and stop the cell/slot shimmer
     function markMediaLoaded(el) {
@@ -1426,16 +1450,15 @@
       // way — probe for both, or the cell renders blank forever.
       const checkDead = () => { if (im.complete && im.naturalWidth <= 1) markMediaBroken(im, url); };
       const checkTiny = () => {
-        // 2..120px square-ish = smilie/sticker (no URL marker exists) —
-        // retire the item. A mid-list removal invalidates every cached row
-        // index, so drop the live-grid state too; the render pass rebuilds.
+        // 2..140px square-ish = smilie/sticker (no URL marker exists) —
+        // retire the item. Animate the cell out first, then the debounced
+        // rerender (same one broken media uses) drops it in one batched pass.
         if (im.naturalWidth > 1 && im.naturalWidth <= TINY_MEDIA_MAX
           && im.naturalHeight > 1 && im.naturalHeight <= TINY_MEDIA_MAX
           && !tinyMediaUrls.has(url)) {
           tinyMediaUrls.add(url);
-          clearVRows();
-          vGrid = null;
-          schedulePanelRender();
+          animateOutCells(url);
+          scheduleBrokenRerender();
         }
       };
       if (im.complete) { checkDead(); checkTiny(); if (im.naturalWidth > 1) markMediaLoaded(im); }
@@ -1449,7 +1472,10 @@
     function updateProgressText() {
       const t = hub.progress.total ? (hub.progress.done + '/' + hub.progress.total) : '–';
       const busy = !!hub.fetchRunning;
-      if (progressEl) progressEl.textContent = busy ? '⟳ ' + t : t;
+      if (progressEl) {
+        if (busy) progressEl.innerHTML = '<span class="xft-spinner" aria-hidden="true"></span>' + t;
+        else progressEl.textContent = t;
+      }
       // while a fetch is in flight the panel buttons lock: no re-Refresh
       // mid-run and no accidental Stop (fetch runs to completion)
       if (panelCancelBtn) panelCancelBtn.disabled = busy;
@@ -1495,22 +1521,28 @@
 
     // fullscreen media viewer: prev/next, thumbnail filmstrip below the
     // preview (the media around the current item), keyboard arrows, Esc
-    function closeViewer() {
+    function closeViewer(instant) {
       const v = document.getElementById('xft-viewer');
-      if (v) v.remove();
       if (viewerKeyHandler) {
         document.removeEventListener('keydown', viewerKeyHandler);
         viewerKeyHandler = null;
       }
+      if (!v) return;
+      if (!instant) {
+        v.classList.add('xft-vclose');
+        setTimeout(() => v.remove(), 160);
+      } else v.remove();
     }
 
     function openViewerAt(i) {
+      const nav = !!document.getElementById('xft-viewer');
       if (i < 0 || i >= viewerItems.length) return;
       viewerIndex = i;
       const it = viewerItems[i];
-      closeViewer();
+      closeViewer(true); // navigation swaps instantly — no close animation
       const v = document.createElement('div');
       v.id = 'xft-viewer';
+      if (!nav) v.classList.add('xft-vwin'); // animate only a fresh open
       const media = buildMediaEl(it.kind, it.url, false);
       // every viewer media occupies the SAME fixed slot — no size popping
       // between items of different dimensions; shimmer until loaded
@@ -1697,6 +1729,9 @@
             if (!rowEl) {
               rowEl = document.createElement('div');
               rowEl.className = 'xft-vrow';
+              // removal wave just animated cells out — rebuilt rows must not
+              // pop back in or the whole grid flashes
+              if (performance.now() < popSuppressUntil) rowEl.classList.add('xft-nopop');
               for (let c = 0; c < cols; c++) {
                 const i = r * cols + c;
                 if (i >= gItems.length) break;
@@ -2032,6 +2067,27 @@
       document.body.appendChild(b);
     }
 
+    // settings drawer: slide/drop in on open, fade out on close (the plain
+    // hidden flip is instant and reads as a glitch)
+    let settingsCloseTimer = null;
+    function toggleSettings() {
+      if (!settingsView) return;
+      if (settingsCloseTimer) { clearTimeout(settingsCloseTimer); settingsCloseTimer = null; }
+      if (settingsView.hidden) {
+        settingsView.hidden = false;
+        settingsView.classList.remove('xft-vclose');
+        requestAnimationFrame(() => settingsView.classList.add('xft-vwin'));
+      } else {
+        settingsView.classList.remove('xft-vwin');
+        settingsView.classList.add('xft-vclose');
+        settingsCloseTimer = setTimeout(() => {
+          settingsCloseTimer = null;
+          settingsView.hidden = true;
+          settingsView.classList.remove('xft-vclose');
+        }, 160);
+      }
+    }
+
     function buildPanel() {
       panel = document.createElement('div');
       panel.id = 'xft-panel';
@@ -2049,7 +2105,7 @@
       const refreshBtn = mkBtn('↻ Refresh', () => { ensure(true); });
       panelCancelBtn = cancelBtn;
       panelRefreshBtn = refreshBtn;
-      const gearBtn = mkBtn('⚙', () => { settingsView.hidden = !settingsView.hidden; });
+      const gearBtn = mkBtn('⚙', () => toggleSettings());
       const closeBtn = mkBtn('✕', () => setPanelOpen(false));
       head.append(title, progressEl, cancelBtn, refreshBtn, gearBtn, closeBtn);
 
@@ -2140,6 +2196,18 @@
         '.xft-btn:hover{background:hsl(var(--xft-accent));color:hsl(var(--xft-accent-fg))}',
         '.xft-btn:focus-visible,#xft-edge-btn:focus-visible,.xft-cell:focus-visible,.xft-vthumb:focus-visible{outline:2px solid transparent;box-shadow:0 0 0 2px hsl(var(--xft-bg)),0 0 0 4px hsl(var(--xft-ring))}',
         '.xft-btn:disabled{opacity:.45;cursor:default;pointer-events:none}',
+        // fetch spinner (page-loading indicator)
+        '.xft-spinner{display:inline-block;vertical-align:-1px;width:11px;height:11px;margin-right:4px;border:2px solid hsl(var(--xft-border));border-top-color:hsl(var(--xft-primary));border-radius:50%;animation:xft-rot .7s linear infinite}',
+        '@keyframes xft-rot{to{transform:rotate(360deg)}}',
+        // removal fade-out + pop suppression on rebuild
+        '.xft-cell.xft-out{animation:xft-out .22s ease-in both;pointer-events:none}',
+        '.xft-vrow.xft-nopop img,.xft-vrow.xft-nopop video,.xft-vrow.xft-nopop .xft-vtile{animation:none}',
+        // viewer + settings open/close
+        '#xft-viewer.xft-vwin{animation:xft-pop .2s ease-out}',
+        '#xft-viewer.xft-vclose{animation:xft-out .16s ease-in both}',
+        '.xft-settings.xft-vwin{animation:xft-drop .18s ease-out}',
+        '.xft-settings.xft-vclose{animation:xft-out .14s ease-in both}',
+        '@keyframes xft-drop{from{opacity:0;transform:translateY(-6px)}to{opacity:1;transform:translateY(0)}}',
         // ---- bars / rows ----
         '.xft-head{display:flex;align-items:center;gap:6px;padding:8px 10px;border-bottom:1px solid hsl(var(--xft-border));user-select:none}',
         '.xft-title{font-weight:600;letter-spacing:-.01em;margin-right:auto;white-space:nowrap}',
@@ -2234,7 +2302,12 @@
         '@keyframes xft-shimmer{from{transform:translateX(-100%)}to{transform:translateX(100%)}}',
         '@keyframes xft-pop{from{opacity:0;transform:scale(.97)}to{opacity:1;transform:scale(1)}}',
         '@keyframes xft-skel-pulse{0%,100%{background-color:hsl(240 6% 16%)}50%{background-color:hsl(240 6% 20%)}}',
-        '@media (prefers-reduced-motion: reduce){.xft-cell.xft-loading::after,.xft-vslot.xft-loading::after,.xft-embed-host.xft-loading::after{animation:none}.xft-cell.xft-loading,.xft-vslot.xft-loading,.xft-embed-host.xft-loading{animation:none}.xft-cell img,.xft-cell video,.xft-cell .xft-vtile{animation:none}}',
+        // AFTER the loading rules on purpose: a cell that is both loading
+        // and dying must fade out, not keep shimmering (same specificity,
+        // source order wins)
+        '.xft-cell.xft-out{animation:xft-out .22s ease-in both;pointer-events:none}',
+        '@keyframes xft-out{to{opacity:0;transform:scale(.9)}}',
+        '@media (prefers-reduced-motion: reduce){.xft-cell.xft-loading::after,.xft-vslot.xft-loading::after,.xft-embed-host.xft-loading::after{animation:none}.xft-cell.xft-loading,.xft-vslot.xft-loading,.xft-embed-host.xft-loading{animation:none}.xft-cell img,.xft-cell video,.xft-cell .xft-vtile{animation:none}.xft-spinner,#xft-viewer,.xft-settings,.xft-cell.xft-out{animation:none}}',
         // embed viewer box is sized BEFORE the video arrives (sign round-trip
         // + metadata load would otherwise grow the box from zero and pop)
         '.xft-embed-host{position:relative;display:flex;align-items:center;justify-content:center;width:min(92vw,1120px);aspect-ratio:16/9;max-height:80vh;border-radius:calc(var(--xft-radius) - 2px);background:#000;overflow:hidden}',
