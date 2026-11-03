@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         xf-thread-tools
 // @namespace    xf-thread-tools
-// @version      0.7.28
+// @version      0.7.29
 // @description  XenForo 2: sort thread posts by reaction count across all pages (cached) + floating media panel (images / external links).
 // @author       xf-thread-tools
 // @match        *://*/threads/*
@@ -1323,6 +1323,18 @@
       const hMax = window.innerHeight * 0.8;
       const w = Math.min(window.innerWidth * 0.92, 1120, hMax * ar);
       slot.style.width = Math.round(Math.max(120, w)) + 'px';
+      // naturalWidth can lie (EXIF-rotated phone photos) and the 80vh slot
+      // height letterboxes when contain fits a hair smaller — after layout,
+      // fit the slot to the img's RENDERED box on BOTH axes so no black
+      // edge remains anywhere
+      requestAnimationFrame(() => {
+        if (!slot.isConnected || !img.isConnected) return;
+        const b = img.getBoundingClientRect();
+        if (b.width > 20 && b.height > 20) {
+          slot.style.width = Math.round(b.width) + 'px';
+          slot.style.height = Math.round(b.height) + 'px';
+        }
+      });
     }
 
     // Build the <img>/<video> element for a grid cell, viewer, or filmstrip
