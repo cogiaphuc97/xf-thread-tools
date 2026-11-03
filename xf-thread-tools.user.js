@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         xf-thread-tools
 // @namespace    xf-thread-tools
-// @version      0.7.24
+// @version      0.7.25
 // @description  XenForo 2: sort thread posts by reaction count across all pages (cached) + floating media panel (images / external links).
 // @author       xf-thread-tools
 // @match        *://*/threads/*
@@ -787,7 +787,7 @@
           hub.pagesDone.clear();
           recordsVersion += 1;
           seededPage = -1;
-          vrowCache.clear(); // rebuilt records -> cached rows are stale
+          clearVRows(); // rebuilt records -> cached rows are stale
         }
         seedLivePage(); // current page comes free from the live DOM
         if (seededPage > 0) hub.pagesDone.add(seededPage);
@@ -1010,6 +1010,8 @@
     let progressEl = null;
     let panelBodyEl = null;
     let panelCountEl = null;
+    let panelCancelBtn = null;
+    let panelRefreshBtn = null;
     let vScrollRaf = 0;
     let vResizeObserver = null;
     let noteEl = null;
@@ -1024,6 +1026,13 @@
     // image loads mid-flight and leave blank cells. Cleared whenever the
     // item list itself changes identity (tab/sub-tab/search/filter/refresh).
     const vrowCache = new Map();
+    // clearing the MAP alone leaves the row ELEMENTS in the DOM as orphans —
+    // after a Refresh they keep showing pre-refresh cells (short/blank rows
+    // mid-grid). Always detach on clear.
+    function clearVRows() {
+      for (const el of vrowCache.values()) el.remove();
+      vrowCache.clear();
+    }
     let vRowHMeasured = 0;
     let vGrid = null; // live media-grid state {topPad,vrows,bottomPad,items,identity,renderRange}
     // Smilies/stickers rehosted on image hosts carry NO url/class marker —
@@ -1042,7 +1051,7 @@
       if (brokenRerenderTimer) return;
       brokenRerenderTimer = setTimeout(() => {
         brokenRerenderTimer = null;
-        vrowCache.clear();
+        clearVRows();
         vGrid = null;
         schedulePanelRender();
       }, 300);
@@ -1271,7 +1280,21 @@
     function markMediaLoaded(el) {
       el.classList.add('xft-ok');
       const host = el.closest('.xft-cell, .xft-vslot, .xft-embed-host');
-      if (host) host.classList.remove('xft-loading');
+      if (host) {
+        host.classList.remove('xft-loading');
+        // image viewer slot: size the box to the image's own aspect so
+        // vertical photos don't sit in a fixed-width box with black gaps
+        if (el.tagName === 'IMG' && host.classList.contains('xft-vimg')) sizeVImgSlot(host, el);
+      }
+    }
+
+    // width for an aspect-fit image slot: 80vh tall, capped at 92vw/1120px
+    function sizeVImgSlot(slot, img) {
+      const ar = img.naturalWidth / img.naturalHeight;
+      if (!isFinite(ar) || ar <= 0) return;
+      const hMax = window.innerHeight * 0.8;
+      const w = Math.min(window.innerWidth * 0.92, 1120, hMax * ar);
+      slot.style.width = Math.round(Math.max(120, w)) + 'px';
     }
 
     // Build the <img>/<video> element for a grid cell, viewer, or filmstrip
@@ -1407,7 +1430,7 @@
           && im.naturalHeight > 1 && im.naturalHeight <= TINY_MEDIA_MAX
           && !tinyMediaUrls.has(url)) {
           tinyMediaUrls.add(url);
-          vrowCache.clear();
+          clearVRows();
           vGrid = null;
           schedulePanelRender();
         }
@@ -1422,7 +1445,12 @@
 
     function updateProgressText() {
       const t = hub.progress.total ? (hub.progress.done + '/' + hub.progress.total) : '–';
-      if (progressEl) progressEl.textContent = t;
+      const busy = !!hub.fetchRunning;
+      if (progressEl) progressEl.textContent = busy ? '⟳ ' + t : t;
+      // while a fetch is in flight the panel buttons lock: no re-Refresh
+      // mid-run and no accidental Stop (fetch runs to completion)
+      if (panelCancelBtn) panelCancelBtn.disabled = busy;
+      if (panelRefreshBtn) panelRefreshBtn.disabled = busy;
       // NOT disabled while pending: the second click cancels + sorts partial
       if (sorterPending) setSortBtn('⚡ ' + t + '…', false);
     }
@@ -1439,7 +1467,7 @@
     function setTab(t) {
       panelTab = t;
       rowLimit = settings.rowCap;
-      vrowCache.clear(); // row indices no longer map to the same items
+      clearVRows(); // row indices no longer map to the same items
       if (tabFilesBtn) tabFilesBtn.classList.toggle('xft-tab-active', t === 'media');
       if (tabLinksBtn) tabLinksBtn.classList.toggle('xft-tab-active', t === 'links');
       if (subtabsEl) subtabsEl.hidden = t !== 'media';
@@ -1449,7 +1477,7 @@
 
     function setSubTab(t) {
       panelSubTab = t;
-      vrowCache.clear(); // different kind filter -> different item list
+      clearVRows(); // different kind filter -> different item list
       for (const k of ['all', 'image', 'video']) {
         if (subTabBtns[k]) subTabBtns[k].classList.toggle('xft-tab-active', k === t);
       }
@@ -1486,7 +1514,9 @@
       let mediaBox = media;
       if (it.kind === 'image' || it.kind === 'video') {
         mediaBox = document.createElement('div');
-        mediaBox.className = 'xft-vslot xft-loading';
+        // image slots shrink to the image's own aspect once loaded (no
+        // black side gaps on vertical photos); video keeps the 16:9 box
+        mediaBox.className = 'xft-vslot xft-loading' + (it.kind === 'image' ? ' xft-vimg' : '');
         mediaBox.appendChild(media);
       }
       const bar = document.createElement('div');
@@ -1523,6 +1553,11 @@
       }
       v.addEventListener('click', (e) => { if (e.target === v) closeViewer(); });
       document.body.appendChild(v);
+      // cached-complete images never fire load — size their slot now
+      if (it.kind === 'image' && media.complete && media.naturalWidth) {
+        sizeVImgSlot(mediaBox, media);
+        mediaBox.classList.remove('xft-loading');
+      }
       viewerKeyHandler = (e) => {
         if (e.key === 'ArrowLeft') openViewerAt(viewerIndex - 1);
         else if (e.key === 'ArrowRight') openViewerAt(viewerIndex + 1);
@@ -1551,6 +1586,15 @@
     function renderPanelBody() {
       if (!panelIsOpen() || !panelBodyEl) return;
       const ordered = orderedRecords();
+      // while a fetch runs, media renders strictly page 1 → last: the live
+      // page is seeded instantly but must NOT appear until every earlier
+      // page has landed (jump to page 20 → grid fills 1,2,3… in order)
+      let orderedShown = ordered;
+      if (hub.fetchRunning) {
+        let f = 0;
+        while (hub.pagesDone.has(f + 1)) f += 1;
+        orderedShown = ordered.filter((r) => r.pageN <= f);
+      }
       const posMap = new Map(ordered.map((r, i) => [r.postId, i + 1]));
       // signature/"sent via app" boilerplate: URLs recurring across >=3
       // distinct authors — filtered at render so stale caches heal without Refresh
@@ -1565,7 +1609,7 @@
         // already-cached threads heal without a Refresh; smilies and
         // signature/footer boilerplate are filtered the same way
         const real = (list) => (list || []).filter((u) => !/^(data|blob):/i.test(u || '') && !isSmilieUrl(u) && !boiler.has(String(u || '')) && !tinyMediaUrls.has(String(u || '')) && !brokenMediaUrls.has(String(u || '')));
-        for (const r of ordered) {
+        for (const r of orderedShown) {
           for (const url of real(r.images)) all.push({ r: r, url: url, pos: posMap.get(r.postId) || 0, kind: 'image' });
           for (const url of real(r.videos)) all.push({ r: r, url: url, pos: posMap.get(r.postId) || 0, kind: 'video' });
           for (const url of real(r.embeds)) all.push({ r: r, url: url, pos: posMap.get(r.postId) || 0, kind: 'embed' });
@@ -1577,7 +1621,7 @@
         items = panelSubTab === 'all' ? all : all.filter((it) => it.kind === panelSubTab || (panelSubTab === 'video' && it.kind === 'embed'));
         viewerItems = items.map((it) => ({ kind: it.kind, url: it.url, postId: it.r.postId, pos: it.pos, author: it.r.author }));
       } else {
-        for (const r of ordered) {
+        for (const r of orderedShown) {
           for (const url of r.links) if (!boiler.has(url)) items.push({ r: r, url: url, pos: posMap.get(r.postId) || 0, kind: 'link' });
         }
         filtered = applyLinkFilters(items, {
@@ -1637,6 +1681,16 @@
           }
           for (let r = first; r < last; r++) {
             let rowEl = vrowCache.get(r);
+            // a row cached while the list was SHORTER (refresh seeded 3
+            // items, fetch ticks grew it) keeps its old cell count — a
+            // mid-grid row stuck at 3/4 cells. Rebuild short rows so they
+            // fill as the list grows.
+            const want = Math.min(cols, gItems.length - r * cols);
+            if (rowEl && (+rowEl.dataset.xftLen || 0) < want) {
+              rowEl.remove();
+              vrowCache.delete(r);
+              rowEl = null;
+            }
             if (!rowEl) {
               rowEl = document.createElement('div');
               rowEl.className = 'xft-vrow';
@@ -1667,6 +1721,7 @@
                 rowEl.appendChild(cell);
               }
               vrowCache.set(r, rowEl);
+              rowEl.dataset.xftLen = rowEl.children.length;
             }
             // reconcile in place: re-inserting a row (appendChild is remove+
             // insert) makes Chrome re-evaluate loading=lazy visibility and
@@ -1935,7 +1990,7 @@
       let debounce = 0;
       linkSearchEl.addEventListener('input', () => {
         clearTimeout(debounce);
-        debounce = setTimeout(() => { rowLimit = settings.rowCap; vrowCache.clear(); renderPanelBody(); }, 150);
+        debounce = setTimeout(() => { rowLimit = settings.rowCap; clearVRows(); renderPanelBody(); }, 150);
       });
       bar.appendChild(linkSearchEl);
       // user column: one checkbox per author that has at least one link
@@ -1989,6 +2044,8 @@
       progressEl.textContent = '–';
       const cancelBtn = mkBtn('■ Stop', () => { if (hub.abortRef) hub.abortRef.aborted = true; });
       const refreshBtn = mkBtn('↻ Refresh', () => { ensure(true); });
+      panelCancelBtn = cancelBtn;
+      panelRefreshBtn = refreshBtn;
       const gearBtn = mkBtn('⚙', () => { settingsView.hidden = !settingsView.hidden; });
       const closeBtn = mkBtn('✕', () => setPanelOpen(false));
       head.append(title, progressEl, cancelBtn, refreshBtn, gearBtn, closeBtn);
@@ -2157,6 +2214,9 @@
         // every viewer media sits in ONE fixed-size slot: no size popping
         // between items; shimmer until loaded
         '.xft-vslot{position:relative;height:80vh;width:min(92vw,1120px);display:flex;align-items:center;justify-content:center;background:#000;border-radius:calc(var(--xft-radius) - 2px);overflow:hidden}',
+        // image slot: narrow placeholder box while loading; JS sets the
+        // exact aspect width on load (markMediaLoaded / openViewerAt)
+        '.xft-vslot.xft-vimg{width:min(45vh,420px)}',
         '.xft-vslot img,.xft-vslot video{max-width:100%;max-height:100%;object-fit:contain}',
         // media renders PROGRESSIVELY while loading (no opacity gate): a
         // progressive JPEG paints blurry-then-sharp on its own — a real
