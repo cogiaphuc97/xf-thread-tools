@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         xf-thread-tools
 // @namespace    xf-thread-tools
-// @version      0.7.35
+// @version      0.7.36
 // @description  XenForo 2: sort thread posts by reaction count across all pages (cached) + floating media panel (images / external links).
 // @author       xf-thread-tools
 // @match        *://*/threads/*
@@ -1375,19 +1375,24 @@
       });
     }
 
-    // HQ image upgrade (0.7.35): some hosts embed a MEDIUM variant in post
-    // bodies — filename `<WxH>_<name>.md.jpg` (original dims + .md/.th
-    // marker). The original hides at a marker-free path in the same dir.
-    // Shape-based only (no hostnames); hosts without the marker (site
-    // attachments, plain uploaders) never enter the chain. Candidates walk
-    // drop-dims+marker → drop-marker → the post URL itself; the reached
-    // stage is remembered per session so rebuilds skip dead candidates.
-    const HQ_IMG_RE = /^(.*\/)(\d+x\d+)_(.+)\.(md|th)\.(jpe?g|png|webp|gif)$/i;
+    // HQ image upgrade (0.7.35–0.7.36): some hosts embed a MEDIUM variant in
+    // post bodies — filename `<name>.md.jpg` (uuid form, VERIFIED: the
+    // original is `<name>.jpg` in the same dir) or `<WxH>_<name>.md.jpg`
+    // (dims-prefixed form). Shape-based only (no hostnames); hosts without
+    // the .md/.th marker (site attachments, plain uploaders) never enter
+    // the chain. Candidates walk drop-marker(+dims) → drop-marker → the
+    // post URL itself; the reached stage is remembered per session so
+    // rebuilds skip dead candidates.
+    const HQ_IMG_RE = /^(.*\/)(.+)\.(md|th)\.(jpe?g|png|webp|gif)$/i;
     const hqStage = new Map();
     function hqCandidates(url) {
       const m = String(url || '').match(HQ_IMG_RE);
       if (!m) return [url];
-      return [m[1] + m[3] + '.' + m[5], m[1] + m[2] + '_' + m[3] + '.' + m[5], url];
+      const d = m[2].match(/^(\d+x\d+)_(.+)$/);
+      const cands = [m[1] + (d ? d[2] : m[2]) + '.' + m[4]]; // drop marker (+ dims if present)
+      if (d) cands.push(m[1] + m[2] + '.' + m[4]);            // drop marker, keep dims
+      cands.push(url);
+      return cands;
     }
 
     // Build the <img>/<video> element for a grid cell, viewer, or filmstrip
