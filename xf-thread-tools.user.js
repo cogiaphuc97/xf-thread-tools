@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         xf-thread-tools
 // @namespace    xf-thread-tools
-// @version      0.7.40
+// @version      0.7.41
 // @description  XenForo 2: sort thread posts by reaction count across all pages (cached) + floating media panel (images / external links).
 // @author       xf-thread-tools
 // @match        *://*/threads/*
@@ -171,7 +171,12 @@
     let b = '';
     try { b = new URL(url).pathname.split('/').filter(Boolean).pop() || ''; } catch (e) { /* keep '' */ }
     b = sanitizeFileSeg(b);
-    if (!b) b = (kind === 'video' ? 'video-' : 'image-') + (idx + 1) + (kind === 'video' ? '.mp4' : '.jpg');
+    // attachment URLs end without a real extension (`/attachments/name-jpg.12345/`)
+    // — a `.12345` ext is unopenable. Force a kind-based one when missing.
+    const extOk = /\.(jpe?g|png|gif|webp|avif|jfif|bmp|mp4|webm|mov|mkv|m4v)$/i.test(b);
+    const dflt = kind === 'video' ? '.mp4' : '.jpg';
+    if (!b) b = (kind === 'video' ? 'video-' : 'image-') + (idx + 1) + dflt;
+    else if (!extOk) b = b.replace(/\.+$/, '') + dflt;
     return b;
   }
 
@@ -1193,6 +1198,10 @@
       if (brokenRerenderTimer) return;
       brokenRerenderTimer = setTimeout(() => {
         brokenRerenderTimer = null;
+        // a rebuild mid-wheel is what made the bottom of the list fight the
+        // user (restore yanked scrollTop while they scrolled) — hold the
+        // removal wave until the wheel stream pauses
+        if (performance.now() - lastUserScrollAt < 300) { scheduleBrokenRerender(); return; }
         clearVRows();
         vGrid = null;
         schedulePanelRender();
@@ -1558,7 +1567,7 @@
     }
     function updateDlBtn(text, running) {
       if (!dlBtnEl) return;
-      dlBtnEl.textContent = text || '⬇';
+      dlBtnEl.textContent = text || 'Download';
       dlBtnEl.classList.toggle('xft-dl-run', !!running);
       dlBtnEl.title = dlRun.running
         ? 'Building zip — click to stop. ' + dlRun.done + ' ok, ' + dlRun.fail + ' failed, '
@@ -1581,7 +1590,7 @@
       }, wait);
     }
     function dlAfter(release) {
-      if (dlRun.running) updateDlBtn('⬇ ' + (dlRun.done + dlRun.fail) + '/' + dlRun.total, true);
+      if (dlRun.running) updateDlBtn((dlRun.done + dlRun.fail) + '/' + dlRun.total, true);
       release();
     }
     function dlTry(job, ci, release) {
@@ -1661,8 +1670,8 @@
     function dlFinish() {
       dlRun.running = false;
       const label = dlRun.cancel
-        ? '⬇ stopped ' + dlRun.done + '/' + dlRun.total
-        : '⬇ ✓ ' + dlRun.done + '/' + dlRun.total
+        ? 'stopped ' + dlRun.done + '/' + dlRun.total
+        : '✓ ' + dlRun.done + '/' + dlRun.total
           + (dlRun.fail ? ' (' + dlRun.fail + ' fail)' : '')
           + (dlRun.skip ? ' · ' + dlRun.skip + ' embeds' : '');
       updateDlBtn(label, true);
@@ -1677,7 +1686,7 @@
           .then(dlSaveZip)
           .catch((e) => {
             dlRun.lastErr = 'zip failed: ' + (e && e.message ? e.message : e);
-            updateDlBtn('⬇ zip error', true);
+            updateDlBtn('zip error', true);
             setTimeout(() => { if (!dlRun.running) updateDlBtn('', false); }, 4000);
           });
       }, 30);
@@ -1703,12 +1712,12 @@
       dlRun.lastErr = '';
       if (!dlJobs.length) {
         dlRun.running = false;
-        updateDlBtn(res.skip ? '⬇ embeds only' : '⬇ empty', true);
+        updateDlBtn(res.skip ? 'embeds only' : 'empty', true);
         setTimeout(() => { if (!dlRun.running) updateDlBtn('', false); }, 2000);
         return;
       }
       dlNet.queue = dlJobs.slice();
-      updateDlBtn('⬇ 0/' + dlJobs.length, true);
+      updateDlBtn('0/' + dlJobs.length, true);
       dlPump();
     }
 
@@ -1992,7 +2001,7 @@
       const next = mkBtn('Next ›', () => openViewerAt(viewerIndex + 1));
       prev.disabled = viewerIndex === 0;
       next.disabled = viewerIndex === viewerItems.length - 1;
-      const go = mkBtn('Go to comment', () => { closeViewer(); jumpTo(it.postId); });
+      const go = mkBtn('Go to comment', () => { jumpTo(it.postId); }); // viewer stays open — user request
       const close = mkBtn('✕ Close', closeViewer);
       bar.append(info, prev, next, go, close);
       v.append(bar, stage || mediaBox);
@@ -2395,7 +2404,11 @@
           const want = Math.min(target, max);
           const displace = Math.abs(panelBodyEl.scrollTop - want);
           const userActive = performance.now() - lastUserScrollAt < 250;
-          if (displace > 80 && (!userActive || displace > panelBodyEl.clientHeight)) {
+          // never fight an active wheel — EXCEPT the collapse signature
+          // (scrollTop clamped to the very top), where the list must be
+          // recovered even mid-scroll or the view stays lost
+          const collapsed = panelBodyEl.scrollTop < 80 && target > 80;
+          if (displace > 80 && (!userActive || collapsed)) {
             panelBodyEl.scrollTop = want;
             if (panelTab === 'media' && vGrid) vGrid.renderRange();
             requestAnimationFrame(() => apply(n - 1)); // height keeps settling — re-assert once more
@@ -2715,7 +2728,7 @@
         renderPanelBody();
       });
       // bulk download: zips the current list (Pics/ + Videos/) as one file
-      const dlBtn = mkBtn('⬇', startBulkDownload, 'xft-btn xft-subtab xft-dlbtn');
+      const dlBtn = mkBtn('Download', startBulkDownload, 'xft-btn xft-subtab xft-dlbtn');
       dlBtnEl = dlBtn;
       updateDlBtn('', false);
       subtabsEl.append(subTabBtns.all, subTabBtns.image, subTabBtns.video, groupSel, dlBtn);
@@ -2825,7 +2838,7 @@
         // shadcn Toggle active: secondary chip, readable on the plain panel bg
         '.xft-subtab.xft-tab-active,.xft-subtab.xft-tab-active:hover{background:hsl(var(--xft-secondary));color:hsl(var(--xft-fg));font-weight:600}',
         '.xft-gsel{margin-left:auto;height:22px;font-size:11px;background:hsl(var(--xft-secondary));color:hsl(var(--xft-fg));border:1px solid hsl(var(--xft-border));border-radius:6px;padding:0 4px;cursor:pointer;outline:none}',
-        '.xft-dlbtn{min-width:64px;text-align:center}',
+        '.xft-dlbtn{min-width:70px;text-align:center}',
         '.xft-dl-run{background:hsl(var(--xft-ring)/.18)!important;border-color:hsl(var(--xft-ring))!important}',
         '.xft-jumps{position:absolute;right:10px;bottom:14px;display:flex;flex-direction:column;gap:6px;z-index:5}',
         '.xft-jumpbtn{width:30px;height:30px;padding:0;font-size:14px;line-height:1;border-radius:8px;box-shadow:0 2px 8px hsl(240 10% 3.9%/.25)}',

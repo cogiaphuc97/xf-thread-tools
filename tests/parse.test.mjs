@@ -368,7 +368,8 @@ test('sanitizeFileSeg + dlBasename: hostile names defused, empties fall back', (
   assert.equal(sanitizeFileSeg('...hidden'), 'hidden');
   assert.equal(sanitizeFileSeg('x'.repeat(300)).length, 120);
   assert.equal(dlBasename('https://h.test/p/some_Img-01.JPEG?q=2', 'image', 3), 'some_Img-01.JPEG');
-  assert.equal(dlBasename('https://h.test/p/', 'video', 6), 'p'); // last path segment still wins
+  assert.equal(dlBasename('https://h.test/attachments/img-jpg.12345/', 'image', 0), 'img-jpg.12345.jpg'); // no real ext → forced
+  assert.equal(dlBasename('https://h.test/p/', 'video', 6), 'p.mp4'); // segment without ext → forced by kind
   assert.equal(dlBasename('https://h.test/', 'image', 0), 'image-1.jpg');
 });
 
