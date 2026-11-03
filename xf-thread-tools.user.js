@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         xf-thread-tools
 // @namespace    xf-thread-tools
-// @version      0.7.32
+// @version      0.7.33
 // @description  XenForo 2: sort thread posts by reaction count across all pages (cached) + floating media panel (images / external links).
 // @author       xf-thread-tools
 // @match        *://*/threads/*
@@ -1032,6 +1032,11 @@
     // after a Refresh they keep showing pre-refresh cells (short/blank rows
     // mid-grid). Always detach on clear.
     function clearVRows() {
+      // stash the scroll BEFORE detaching rows: removing them collapses the
+      // content height, the browser clamps scrollTop to 0, and the rebuild
+      // would then "keep" a zero position (the list jumps to the top on
+      // every broken-item rerender)
+      if (panelBodyEl && vScrollKeep === null) vScrollKeep = panelBodyEl.scrollTop;
       for (const el of vrowCache.values()) el.remove();
       vrowCache.clear();
       // cleared rows MUST rebuild: with the signature intact, renderPanelBody
@@ -1057,6 +1062,7 @@
     // ONE layout pass instead of cells popping out one by one.
     const brokenMediaUrls = new Set();
     let brokenRerenderTimer = null;
+    let vScrollKeep = null; // scroll stashed by clearVRows, consumed by the rebuild
     // while a removal wave animates out, rebuilt rows must NOT re-run the
     // pop-in (the whole grid would flash). Rows built inside this window
     // carry .xft-nopop.
@@ -1259,6 +1265,29 @@
     let settingsView = null;
     let panelTab = 'files';
     let panelSubTab = 'all';        // media sub-tab: all | image | video
+    // every view (tab × sub-tab × group) remembers its own scroll position —
+    // switching views restores where the user left THAT list, it must not
+    // inherit the scroll of the list being left
+    const scrollMemory = {};
+    let lastRenderedView = null;
+    function viewKey() { return panelTab === 'links' ? 'links' : panelSubTab + ':' + settings.mediaGroup; }
+    function saveViewScroll() { if (panelBodyEl) scrollMemory[viewKey()] = panelBodyEl.scrollTop; }
+    // smooth for short hops, instant for long virtualized jumps (a smooth
+    // glide across 50k px of virtual padding is a blur, not an animation).
+    // The bottom target is re-asserted for a few frames: virtualized content
+    // height settles as the row pitch is measured, and the first landing can
+    // end short of the true bottom.
+    function jumpScroll(top) {
+      if (!panelBodyEl) return;
+      const apply = (n, smooth) => {
+        if (!panelBodyEl || n < 0) return;
+        const target = top ? 0 : panelBodyEl.scrollHeight - panelBodyEl.clientHeight;
+        const far = Math.abs(target - panelBodyEl.scrollTop) > 4000;
+        panelBodyEl.scrollTo({ top: target, behavior: smooth && !far ? 'smooth' : 'auto' });
+        if (!top) requestAnimationFrame(() => apply(n - 1, false));
+      };
+      apply(3, true);
+    }
     let subtabsEl = null;
     let subTabBtns = {};
     let linksBarEl = null;
@@ -1516,6 +1545,7 @@
     }
 
     function setTab(t) {
+      saveViewScroll();
       panelTab = t;
       rowLimit = settings.rowCap;
       clearVRows(); // row indices no longer map to the same items
@@ -1527,6 +1557,7 @@
     }
 
     function setSubTab(t) {
+      saveViewScroll();
       panelSubTab = t;
       clearVRows(); // different kind filter -> different item list
       for (const k of ['all', 'image', 'video']) {
@@ -1762,7 +1793,15 @@
         updateCountOnly(items.length); // growth ticks must refresh the count too
         return;
       }
-      const keepScroll = panelBodyEl.scrollTop;
+      // clearVRows stashed the pre-collapse position — prefer it over the
+      // now-clamped live scrollTop. A VIEW switch (tab/sub-tab/group) instead
+      // restores the position the user left the NEW view at — each list owns
+      // its own scroll; it must not inherit the outgoing view's offset.
+      const keepScroll = vScrollKeep !== null ? vScrollKeep : panelBodyEl.scrollTop;
+      vScrollKeep = null;
+      const viewChanged = viewKey() !== lastRenderedView;
+      lastRenderedView = viewKey();
+      const scrollTarget = viewChanged ? (scrollMemory[viewKey()] || 0) : keepScroll;
       panelCountEl.textContent = panelTab === 'links' && filtered.length !== items.length
         ? filtered.length + '/' + items.length + ' items'
         : items.length + ' items';
@@ -1875,11 +1914,13 @@
           // measure the REAL row pitch once and keep it across rebuilds: a
           // few px of estimate drift per row turns into thousands of px of
           // scroll jumps on huge virtualized lists (measure a MEDIA row —
-          // group headers have fixed CSS heights of their own)
+          // group headers have fixed CSS heights of their own). Sub-50px
+          // readings are garbage (half-attached row / mid-transition width)
+          // and would poison every later pad computation — reject them.
           const mediaRow = vrows.querySelector('.xft-vrow');
           if (mediaRow) {
             const real = mediaRow.getBoundingClientRect().height + gap;
-            if (real > 0) vRowHMeasured = real;
+            if (real > 50) vRowHMeasured = real;
           }
           topPad.style.height = tops[first] + 'px';
           bottomPad.style.height = Math.max(0, tops[lay.length] - tops[last]) + 'px';
@@ -1942,7 +1983,20 @@
         frag.appendChild(empty);
       }
       panelBodyEl.appendChild(frag);
-      if (keepScroll) panelBodyEl.scrollTop = keepScroll;
+      if (keepScroll || scrollTarget) {
+        // restore AFTER a frame: at sync time the pads may still carry a
+        // stale pitch and the content height can be briefly smaller than
+        // the target — a sync set clamps to 0 and the view lands at the
+        // top. The pre-pass re-renders with ATTACHED rows (refreshing the
+        // measured pitch and pads) before the offset is applied.
+        const target = scrollTarget;
+        requestAnimationFrame(() => {
+          if (!panelBodyEl || !panelBodyEl.isConnected) return;
+          if (panelTab === 'media' && vGrid) vGrid.renderRange();
+          panelBodyEl.scrollTop = Math.min(target, panelBodyEl.scrollHeight - panelBodyEl.clientHeight);
+          if (panelTab === 'media' && vGrid) vGrid.renderRange();
+        });
+      }
       // media grid is window-virtualized and renders what the viewport shows —
       // row capping (and this button) only applies to the Links tab
       // auto-load replaces the old Show-more button: a sentinel at the list
@@ -2247,6 +2301,7 @@
       }
       groupSel.value = settings.mediaGroup;
       groupSel.addEventListener('change', () => {
+        saveViewScroll();
         settings.mediaGroup = groupSel.value;
         writeStore(SETTINGS_KEY, settings);
         clearVRows();
@@ -2259,11 +2314,19 @@
       settingsView = buildSettingsView();
       panelBodyEl = document.createElement('div');
       panelBodyEl.className = 'xft-body';
+      // go-to-top / go-to-bottom shortcuts, floating over the list
+      const jumps = document.createElement('div');
+      jumps.className = 'xft-jumps';
+      const jumpTop = mkBtn('⤒', () => jumpScroll(true), 'xft-btn xft-jumpbtn');
+      const jumpBottom = mkBtn('⤓', () => jumpScroll(false), 'xft-btn xft-jumpbtn');
+      jumpTop.title = 'Go to top';
+      jumpBottom.title = 'Go to bottom';
+      jumps.append(jumpTop, jumpBottom);
       noteEl = document.createElement('div');
       noteEl.className = 'xft-note';
       noteEl.hidden = true;
 
-      panel.append(head, tabs, subtabsEl, linksBarEl, settingsView, panelBodyEl, noteEl);
+      panel.append(head, tabs, subtabsEl, linksBarEl, settingsView, panelBodyEl, jumps, noteEl);
       document.body.appendChild(panel);
       setTab('media');
       buildEdgeButton();
@@ -2351,6 +2414,8 @@
         // shadcn Toggle active: secondary chip, readable on the plain panel bg
         '.xft-subtab.xft-tab-active,.xft-subtab.xft-tab-active:hover{background:hsl(var(--xft-secondary));color:hsl(var(--xft-fg));font-weight:600}',
         '.xft-gsel{margin-left:auto;height:22px;font-size:11px;background:hsl(var(--xft-secondary));color:hsl(var(--xft-fg));border:1px solid hsl(var(--xft-border));border-radius:6px;padding:0 4px;cursor:pointer;outline:none}',
+        '.xft-jumps{position:absolute;right:10px;bottom:14px;display:flex;flex-direction:column;gap:6px;z-index:5}',
+        '.xft-jumpbtn{width:30px;height:30px;padding:0;font-size:14px;line-height:1;border-radius:8px;box-shadow:0 2px 8px hsl(240 10% 3.9%/.25)}',
         // group headers: label + hairline filler; heights are FIXED (30/24px)
         // and mirrored in layoutTops() — the virtualizer's scroll math
         // depends on them
