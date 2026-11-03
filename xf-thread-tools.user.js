@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         xf-thread-tools
 // @namespace    xf-thread-tools
-// @version      0.7.27
+// @version      0.7.28
 // @description  XenForo 2: sort thread posts by reaction count across all pages (cached) + floating media panel (images / external links).
 // @author       xf-thread-tools
 // @match        *://*/threads/*
@@ -38,6 +38,7 @@
     capBytes: DEFAULT_CAP_BYTES, // IndexedDB persistence cap
     autoFetch: 1,                // 1 = fetch the whole thread in background on page load
     basePath: '',                // '' = forum at site root; '/forum' for subpath installs
+    forceAnimations: 0,          // 1 = run UI animations even under prefers-reduced-motion
     selectors: {}                // per-site selector overrides, merged over BASE_SEL
   };
   const BASE_SEL = {
@@ -1893,6 +1894,7 @@
       const inChunk = mkField('render chunk', settings.chunkSize);
       const inRows = mkField('panel row cap (Links)', settings.rowCap);
       const inAuto = mkField('auto fetch on load (1/0)', settings.autoFetch ? 1 : 0);
+      const inAnim = mkField('force animations (1/0)', settings.forceAnimations ? 1 : 0);
       const inBase = mkField('base path (subpath installs)', settings.basePath);
       const save = mkBtn('Save', () => {
         const num = (v, def) => {
@@ -1903,7 +1905,9 @@
         settings.chunkSize = num(inChunk.value, DEFAULT_SETTINGS.chunkSize);
         settings.rowCap = num(inRows.value, DEFAULT_SETTINGS.rowCap);
         settings.autoFetch = parseInt(inAuto.value, 10) === 1 ? 1 : 0;
+        settings.forceAnimations = parseInt(inAnim.value, 10) === 1 ? 1 : 0;
         settings.basePath = inBase.value.trim().replace(/\/+$/, '');
+        applyAnimOverride();
         writeStore(SETTINGS_KEY, settings);
         wrap.hidden = true;
         setTab(panelTab);
@@ -1911,6 +1915,13 @@
       wrap.appendChild(save);
       wrap.hidden = true;
       return wrap;
+    }
+
+    // prefers-reduced-motion kills every animation + the drawer transition.
+    // With forceAnimations the <html> gains .xft-anim-force and the
+    // reduce-motion rules (scoped to html:not(.xft-anim-force)) stop applying.
+    function applyAnimOverride() {
+      document.documentElement.classList.toggle('xft-anim-force', settings.forceAnimations === 1);
     }
 
     function panelIsOpen() {
@@ -2307,7 +2318,7 @@
         // source order wins)
         '.xft-cell.xft-out{animation:xft-out .22s ease-in both;pointer-events:none}',
         '@keyframes xft-out{to{opacity:0;transform:scale(.9)}}',
-        '@media (prefers-reduced-motion: reduce){.xft-cell.xft-loading::after,.xft-vslot.xft-loading::after,.xft-embed-host.xft-loading::after{animation:none}.xft-cell.xft-loading,.xft-vslot.xft-loading,.xft-embed-host.xft-loading{animation:none}.xft-cell img,.xft-cell video,.xft-cell .xft-vtile{animation:none}.xft-spinner,#xft-viewer,.xft-settings,.xft-cell.xft-out{animation:none}}',
+        '@media (prefers-reduced-motion: reduce){html:not(.xft-anim-force) .xft-cell.xft-loading::after,html:not(.xft-anim-force) .xft-vslot.xft-loading::after,html:not(.xft-anim-force) .xft-embed-host.xft-loading::after{animation:none}html:not(.xft-anim-force) .xft-cell.xft-loading,html:not(.xft-anim-force) .xft-vslot.xft-loading,html:not(.xft-anim-force) .xft-embed-host.xft-loading{animation:none}html:not(.xft-anim-force) .xft-cell img,html:not(.xft-anim-force) .xft-cell video,html:not(.xft-anim-force) .xft-cell .xft-vtile{animation:none}html:not(.xft-anim-force) .xft-spinner,html:not(.xft-anim-force) #xft-viewer,html:not(.xft-anim-force) .xft-settings,html:not(.xft-anim-force) .xft-cell.xft-out{animation:none}}',
         // embed viewer box is sized BEFORE the video arrives (sign round-trip
         // + metadata load would otherwise grow the box from zero and pop)
         '.xft-embed-host{position:relative;display:flex;align-items:center;justify-content:center;width:min(92vw,1120px);aspect-ratio:16/9;max-height:80vh;border-radius:calc(var(--xft-radius) - 2px);background:#000;overflow:hidden}',
@@ -2332,7 +2343,7 @@
         '.xft-pulse{outline:3px solid transparent;animation:xftpulse 1.6s ease-out 2}',
         '@keyframes xftpulse{0%{outline-color:hsl(38 92% 50%)}100%{outline-color:transparent}}',
         '#xft-sort-btn{margin-left:4px;cursor:pointer}',
-        '@media (prefers-reduced-motion:reduce){#xft-panel,.xft-btn,#xft-edge-btn,.xft-cell{transition:none}.xft-pulse{animation:none}}'
+        '@media (prefers-reduced-motion:reduce){html:not(.xft-anim-force) #xft-panel,html:not(.xft-anim-force) .xft-btn,html:not(.xft-anim-force) #xft-edge-btn,html:not(.xft-anim-force) .xft-cell{transition:none}html:not(.xft-anim-force) .xft-pulse{animation:none}}'
       ].join('');
       document.head.appendChild(st);
     }
@@ -2375,6 +2386,7 @@
       }
       injectToolbar();
       buildPanel();
+      applyAnimOverride();
       updateProgressText();
       // background full-thread fetch: starts on page load, resumes partials,
       // never waits for the user to open the panel (setting: autoFetch)
