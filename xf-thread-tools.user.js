@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         xf-thread-tools
 // @namespace    xf-thread-tools
-// @version      0.7.31
+// @version      0.7.32
 // @description  XenForo 2: sort thread posts by reaction count across all pages (cached) + floating media panel (images / external links).
 // @author       xf-thread-tools
 // @match        *://*/threads/*
@@ -1317,23 +1317,31 @@
       }
     }
 
-    // width for an aspect-fit image slot: 80vh tall, capped at 92vw/1120px
+    // image slot sizing: 80vh tall (or width-capped), sized on BOTH axes to
+    // the image's aspect. Small images are SCALED UP to fill the slot — a
+    // tiny natural size must not leave a big black box. Two phases:
+    // 1) sync, from naturalWidth (may lie: EXIF-rotated phone photos)
+    // 2) rAF, from the img's RENDERED rect — under max-w/max-h contain CSS
+    //    the rect carries the true aspect (EXIF-corrected). The slot is then
+    //    re-fit to that aspect and the img is told to fill it 100%
+    //    (object-fit:contain UPSCALES, so small images fill the height too)
     function sizeVImgSlot(slot, img) {
+      const fit = (ar) => {
+        const hMax = window.innerHeight * 0.8;
+        const h = Math.min(hMax, Math.min(window.innerWidth * 0.92, 1120) / ar);
+        slot.style.width = Math.round(Math.max(120, h * ar)) + 'px';
+        slot.style.height = Math.round(Math.max(120, h)) + 'px';
+      };
       const ar = img.naturalWidth / img.naturalHeight;
-      if (!isFinite(ar) || ar <= 0) return;
-      const hMax = window.innerHeight * 0.8;
-      const w = Math.min(window.innerWidth * 0.92, 1120, hMax * ar);
-      slot.style.width = Math.round(Math.max(120, w)) + 'px';
-      // naturalWidth can lie (EXIF-rotated phone photos) and the 80vh slot
-      // height letterboxes when contain fits a hair smaller — after layout,
-      // fit the slot to the img's RENDERED box on BOTH axes so no black
-      // edge remains anywhere
+      if (isFinite(ar) && ar > 0) fit(ar);
       requestAnimationFrame(() => {
         if (!slot.isConnected || !img.isConnected) return;
         const b = img.getBoundingClientRect();
         if (b.width > 20 && b.height > 20) {
-          slot.style.width = Math.round(b.width) + 'px';
-          slot.style.height = Math.round(b.height) + 'px';
+          fit(b.width / b.height);
+          img.style.width = '100%';
+          img.style.height = '100%';
+          img.style.objectFit = 'contain';
         }
       });
     }
@@ -1558,15 +1566,20 @@
       v.id = 'xft-viewer';
       if (!nav) v.classList.add('xft-vwin'); // animate only a fresh open
       const media = buildMediaEl(it.kind, it.url, false);
-      // every viewer media occupies the SAME fixed slot — no size popping
-      // between items of different dimensions; shimmer until loaded
+      // every viewer media sits in a FIXED-HEIGHT stage so paging next/prev
+      // never shifts the bar/filmstrip; the slot inside is sized to the
+      // image's own aspect once loaded (small images upscale to fill)
       let mediaBox = media;
+      let stage = null;
       if (it.kind === 'image' || it.kind === 'video') {
+        stage = document.createElement('div');
+        stage.className = 'xft-vstage';
         mediaBox = document.createElement('div');
         // image slots shrink to the image's own aspect once loaded (no
         // black side gaps on vertical photos); video keeps the 16:9 box
         mediaBox.className = 'xft-vslot xft-loading' + (it.kind === 'image' ? ' xft-vimg' : '');
         mediaBox.appendChild(media);
+        stage.appendChild(mediaBox);
       }
       const bar = document.createElement('div');
       bar.className = 'xft-viewer-bar';
@@ -1579,7 +1592,7 @@
       const go = mkBtn('Go to comment', () => { closeViewer(); jumpTo(it.postId); });
       const close = mkBtn('✕ Close', closeViewer);
       bar.append(info, prev, next, go, close);
-      v.append(bar, mediaBox);
+      v.append(bar, stage || mediaBox);
       if (viewerItems.length > 1) {
         const strip = document.createElement('div');
         strip.className = 'xft-viewer-strip';
@@ -2408,6 +2421,8 @@
         // every viewer media sits in ONE fixed-size slot: no size popping
         // between items; shimmer until loaded
         '.xft-vslot{position:relative;height:80vh;width:min(92vw,1120px);display:flex;align-items:center;justify-content:center;background:#000;border-radius:calc(var(--xft-radius) - 2px);overflow:hidden}',
+        // fixed-height media stage: paging must not move bar/filmstrip
+        '.xft-vstage{height:80vh;width:min(92vw,1120px);display:flex;align-items:center;justify-content:center}',
         // image slot: narrow placeholder box while loading; JS sets the
         // exact aspect width on load (markMediaLoaded / openViewerAt)
         '.xft-vslot.xft-vimg{width:min(45vh,420px)}',
