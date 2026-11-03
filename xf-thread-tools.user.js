@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         xf-thread-tools
 // @namespace    xf-thread-tools
-// @version      0.7.30
+// @version      0.7.31
 // @description  XenForo 2: sort thread posts by reaction count across all pages (cached) + floating media panel (images / external links).
 // @author       xf-thread-tools
 // @match        *://*/threads/*
@@ -39,6 +39,7 @@
     autoFetch: 1,                // 1 = fetch the whole thread in background on page load
     basePath: '',                // '' = forum at site root; '/forum' for subpath installs
     forceAnimations: 0,          // 1 = run UI animations even under prefers-reduced-motion
+    mediaGroup: 'flat',          // media grid grouping: flat | post | page | user
     selectors: {}                // per-site selector overrides, merged over BASE_SEL
   };
   const BASE_SEL = {
@@ -1631,6 +1632,53 @@
 
     let lastPanelSignature = '';
 
+    // ---------- media grouping (v0.7.31) ----------
+    // layout = ordered render entries for the virtualizer: full-width group
+    // headers ({hdr:'main'|'sub', label}) and media rows ({idxs:[item
+    // indices]}). 'post' groups by post; 'page'/'user' add a '#pos - author'
+    // sub-header per post inside each group. flat = media rows only.
+    // Groups are built from the FILTERED item list, so sub-tab switches
+    // (All/Image/Video) keep the grouping but drop empty groups.
+    function buildMediaLayout(items, mode) {
+      const lay = [];
+      const chunk = (list) => { for (let j = 0; j < list.length; j += 4) lay.push({ idxs: list.slice(j, j + 4) }); };
+      if (mode !== 'post' && mode !== 'page' && mode !== 'user') {
+        chunk(items.map((_, i) => i));
+        return lay;
+      }
+      const groups = new Map(); // insertion order = first-appearance order
+      for (let i = 0; i < items.length; i++) {
+        const it = items[i];
+        const author = it.r.author || '?';
+        const gkey = mode === 'page' ? 'p' + (it.r.pageN || 1) : mode === 'user' ? 'u' + author : it.r.postId;
+        let g = groups.get(gkey);
+        if (!g) {
+          g = { label: mode === 'page' ? 'Page ' + (it.r.pageN || 1) : mode === 'user' ? author : '#' + it.pos + ' - ' + author,
+            postId: it.r.postId, subs: new Map() };
+          groups.set(gkey, g);
+        }
+        let s = g.subs.get(it.r.postId);
+        if (!s) { s = { pos: it.pos, author: author, postId: it.r.postId, list: [] }; g.subs.set(it.r.postId, s); }
+        s.list.push(i);
+      }
+      for (const g of groups.values()) {
+        lay.push({ hdr: 'main', label: g.label, postId: g.postId });
+        for (const s of g.subs.values()) {
+          if (mode !== 'post') lay.push({ hdr: 'sub', label: '#' + s.pos + ' - ' + s.author, postId: s.postId });
+          chunk(s.list);
+        }
+      }
+      return lay;
+    }
+    // prefix-sum entry tops — headers (24/30px + gap) are shorter than media
+    // rows, so the virtualizer can no longer assume a uniform pitch
+    function layoutTops(lay, pitch) {
+      const tops = new Array(lay.length + 1);
+      tops[0] = 0;
+      for (let i = 0; i < lay.length; i++) tops[i + 1] = tops[i] + (lay[i].idxs ? pitch : (lay[i].hdr === 'sub' ? 24 : 30) + 6);
+      return tops;
+    }
+
     function renderPanelBody() {
       if (!panelIsOpen() || !panelBodyEl) return;
       const ordered = orderedRecords();
@@ -1681,7 +1729,7 @@
       // skip rebuild when nothing changed — background fetch progress ticks
       // must not churn the grid or reset the user's scroll position
       // (sub-tab + search + filter selections are part of the signature)
-      const sig = panelTab + ':' + panelSubTab + ':' + rowLimit + ':' + JSON.stringify([
+      const sig = panelTab + ':' + panelSubTab + ':' + settings.mediaGroup + ':' + rowLimit + ':' + JSON.stringify([
         linkSearchEl ? linkSearchEl.value : '',
         linkUserSel ? Array.from(linkUserSel).sort() : null,
         linkDomainSel ? Array.from(linkDomainSel).sort() : null,
@@ -1694,8 +1742,9 @@
       // item GROWTH from fetch ticks. Keep the DOM exactly as-is — point the
       // grid at the longer list and re-range. A teardown here is what caused
       // blank cells (lazy loads killed mid-flight) and scroll-position loss.
-      if (panelTab === 'media' && vGrid && vGrid.topPad.isConnected && vGrid.identity === panelSubTab) {
+      if (panelTab === 'media' && vGrid && vGrid.topPad.isConnected && vGrid.identity === panelSubTab + ':' + settings.mediaGroup) {
         vGrid.items = items;
+        vGrid.layout = buildMediaLayout(items, settings.mediaGroup);
         vGrid.renderRange();
         updateCountOnly(items.length); // growth ticks must refresh the count too
         return;
@@ -1713,66 +1762,86 @@
         vrows.className = 'xft-vrows';
         const bottomPad = document.createElement('div');
         frag.append(topPad, vrows, bottomPad);
-        const cols = 4;
         const gap = 6;
         let rowH = gridRowH(); // estimate; corrected by measurement below
+        const builtLayout = buildMediaLayout(items, settings.mediaGroup);
         const renderRange = () => {
           const gItems = vGrid ? vGrid.items : items;
-          const gRows = Math.ceil(gItems.length / cols);
+          const lay = vGrid ? vGrid.layout : builtLayout;
           const st = panelBodyEl.scrollTop;
           const vh = panelBodyEl.clientHeight || 600;
           const pitch = vRowHMeasured || rowH;
-          const first = Math.max(0, Math.floor(st / pitch) - 1);
-          const last = Math.min(gRows, Math.ceil((st + vh) / pitch) + 1);
+          const tops = layoutTops(lay, pitch);
+          // first entry whose bottom passes the viewport top (headers make
+          // the pitch non-uniform — binary search over the prefix sums)
+          let lo = 0, hi = lay.length;
+          while (lo < hi) { const mid = (lo + hi) >> 1; if (tops[mid + 1] > st) hi = mid; else lo = mid + 1; }
+          const first = Math.max(0, lo - 1); // one look-back keeps a header above the fold mounted
+          lo = first; hi = lay.length;
+          while (lo < hi) { const mid = (lo + hi) >> 1; if (tops[mid] < st + vh) lo = mid + 1; else hi = mid; }
+          const last = Math.min(lay.length, lo + 1);
           for (const idx of Array.from(vrowCache.keys())) {
-            if (idx < first || idx >= last) vrowCache.get(idx).remove();
+            if (idx < first || idx >= last) { vrowCache.get(idx).remove(); vrowCache.delete(idx); }
           }
           for (let r = first; r < last; r++) {
+            const e = lay[r];
+            // entry signature: a row cached while the list was SHORTER (or a
+            // header whose group moved) must rebuild — sig mismatch = rebuild
+            const esig = e.idxs ? 'r' + e.idxs[0] + ':' + e.idxs.length : 'h' + e.hdr + ':' + e.label;
             let rowEl = vrowCache.get(r);
-            // a row cached while the list was SHORTER (refresh seeded 3
-            // items, fetch ticks grew it) keeps its old cell count — a
-            // mid-grid row stuck at 3/4 cells. Rebuild short rows so they
-            // fill as the list grows.
-            const want = Math.min(cols, gItems.length - r * cols);
-            if (rowEl && (+rowEl.dataset.xftLen || 0) < want) {
+            if (rowEl && rowEl.dataset.xftSig !== esig) {
               rowEl.remove();
               vrowCache.delete(r);
               rowEl = null;
             }
             if (!rowEl) {
-              rowEl = document.createElement('div');
-              rowEl.className = 'xft-vrow';
-              // removal wave just animated cells out — rebuilt rows must not
-              // pop back in or the whole grid flashes
-              if (performance.now() < popSuppressUntil) rowEl.classList.add('xft-nopop');
-              for (let c = 0; c < cols; c++) {
-                const i = r * cols + c;
-                if (i >= gItems.length) break;
-                const it = gItems[i];
-                const cell = document.createElement('div');
-                cell.className = 'xft-cell';
-                cell.title = '[#' + it.pos + '] ' + (it.r.author || '?') + ' — open';
-                const isVideo = it.kind === 'video' || it.kind === 'embed';
-                const thumb = buildMediaEl(it.kind, it.url, true);
-                // shimmer while the media loads (cached-complete images come
-                // back already ok'd — no flash for them)
-                if ((it.kind === 'image' || it.kind === 'embed')
-                  && !(thumb.tagName === 'IMG' && thumb.classList.contains('xft-ok'))) cell.classList.add('xft-loading');
-                const label = document.createElement('span');
-                label.className = 'xft-cell-label';
-                label.textContent = '#' + it.pos + ' ' + (it.r.author || '?');
-                cell.append(thumb, label);
-                if (isVideo) {
-                  const badge = document.createElement('span');
-                  badge.className = 'xft-cell-badge';
-                  badge.textContent = '▶';
-                  cell.appendChild(badge);
+              if (e.idxs) {
+                rowEl = document.createElement('div');
+                rowEl.className = 'xft-vrow';
+                // removal wave just animated cells out — rebuilt rows must not
+                // pop back in or the whole grid flashes
+                if (performance.now() < popSuppressUntil) rowEl.classList.add('xft-nopop');
+                for (const i of e.idxs) {
+                  const it = gItems[i];
+                  const cell = document.createElement('div');
+                  cell.className = 'xft-cell';
+                  cell.title = '[#' + it.pos + '] ' + (it.r.author || '?') + ' — open';
+                  const isVideo = it.kind === 'video' || it.kind === 'embed';
+                  const thumb = buildMediaEl(it.kind, it.url, true);
+                  // shimmer while the media loads (cached-complete images come
+                  // back already ok'd — no flash for them)
+                  if ((it.kind === 'image' || it.kind === 'embed')
+                    && !(thumb.tagName === 'IMG' && thumb.classList.contains('xft-ok'))) cell.classList.add('xft-loading');
+                  const label = document.createElement('span');
+                  label.className = 'xft-cell-label';
+                  label.textContent = '#' + it.pos + ' ' + (it.r.author || '?');
+                  cell.append(thumb, label);
+                  if (isVideo) {
+                    const badge = document.createElement('span');
+                    badge.className = 'xft-cell-badge';
+                    badge.textContent = '▶';
+                    cell.appendChild(badge);
+                  }
+                  cell.addEventListener('click', () => openViewerAt(i));
+                  rowEl.appendChild(cell);
                 }
-                cell.addEventListener('click', () => openViewerAt(i));
-                rowEl.appendChild(cell);
+              } else {
+                rowEl = document.createElement('div');
+                rowEl.className = 'xft-ghead' + (e.hdr === 'sub' ? ' xft-gsub' : '');
+                const lab = document.createElement('span');
+                lab.className = 'xft-glabel';
+                lab.textContent = e.label;
+                const line = document.createElement('span');
+                line.className = 'xft-gline';
+                rowEl.append(lab, line);
+                if (e.postId) {
+                  rowEl.classList.add('xft-gjump');
+                  rowEl.title = e.label + ' — jump to post';
+                  rowEl.addEventListener('click', () => jumpTo(e.postId));
+                }
               }
+              rowEl.dataset.xftSig = esig;
               vrowCache.set(r, rowEl);
-              rowEl.dataset.xftLen = rowEl.children.length;
             }
             // reconcile in place: re-inserting a row (appendChild is remove+
             // insert) makes Chrome re-evaluate loading=lazy visibility and
@@ -1792,15 +1861,17 @@
           }
           // measure the REAL row pitch once and keep it across rebuilds: a
           // few px of estimate drift per row turns into thousands of px of
-          // scroll jumps on huge virtualized lists
-          if (vrows.firstElementChild) {
-            const real = vrows.firstElementChild.getBoundingClientRect().height + gap;
+          // scroll jumps on huge virtualized lists (measure a MEDIA row —
+          // group headers have fixed CSS heights of their own)
+          const mediaRow = vrows.querySelector('.xft-vrow');
+          if (mediaRow) {
+            const real = mediaRow.getBoundingClientRect().height + gap;
             if (real > 0) vRowHMeasured = real;
           }
-          topPad.style.height = (first * pitch) + 'px';
-          bottomPad.style.height = (Math.max(0, gRows - last) * pitch) + 'px';
+          topPad.style.height = tops[first] + 'px';
+          bottomPad.style.height = Math.max(0, tops[lay.length] - tops[last]) + 'px';
         };
-        vGrid = { topPad: topPad, vrows: vrows, bottomPad: bottomPad, items: items, identity: panelSubTab, renderRange: renderRange };
+        vGrid = { topPad: topPad, vrows: vrows, bottomPad: bottomPad, items: items, layout: builtLayout, identity: panelSubTab + ':' + settings.mediaGroup, renderRange: renderRange };
         renderRange();
         panelBodyEl.onscroll = () => {
           if (vScrollRaf) return;
@@ -2149,7 +2220,26 @@
       subTabBtns.image = mkBtn('Image', () => setSubTab('image'), 'xft-btn xft-subtab');
       subTabBtns.video = mkBtn('Video', () => setSubTab('video'), 'xft-btn xft-subtab');
       subTabBtns.all.classList.add('xft-tab-active');
-      subtabsEl.append(subTabBtns.all, subTabBtns.image, subTabBtns.video);
+      // group-by picker lives in the sub-tab row: flat | post | page | user.
+      // Persisted in settings, so switching All/Image/Video keeps the group.
+      const groupSel = document.createElement('select');
+      groupSel.className = 'xft-gsel';
+      groupSel.title = 'Group media by';
+      groupSel.setAttribute('aria-label', 'Group media by');
+      for (const g of [['flat', 'Flat'], ['post', 'Post'], ['page', 'Page'], ['user', 'User']]) {
+        const o = document.createElement('option');
+        o.value = g[0];
+        o.textContent = 'Group: ' + g[1];
+        groupSel.appendChild(o);
+      }
+      groupSel.value = settings.mediaGroup;
+      groupSel.addEventListener('change', () => {
+        settings.mediaGroup = groupSel.value;
+        writeStore(SETTINGS_KEY, settings);
+        clearVRows();
+        renderPanelBody();
+      });
+      subtabsEl.append(subTabBtns.all, subTabBtns.image, subTabBtns.video, groupSel);
 
       linksBarEl = buildLinksBar();
 
@@ -2247,6 +2337,16 @@
         '.xft-subtab:hover{background:hsl(var(--xft-accent));color:hsl(var(--xft-accent-fg))}',
         // shadcn Toggle active: secondary chip, readable on the plain panel bg
         '.xft-subtab.xft-tab-active,.xft-subtab.xft-tab-active:hover{background:hsl(var(--xft-secondary));color:hsl(var(--xft-fg));font-weight:600}',
+        '.xft-gsel{margin-left:auto;height:22px;font-size:11px;background:hsl(var(--xft-secondary));color:hsl(var(--xft-fg));border:1px solid hsl(var(--xft-border));border-radius:6px;padding:0 4px;cursor:pointer;outline:none}',
+        // group headers: label + hairline filler; heights are FIXED (30/24px)
+        // and mirrored in layoutTops() — the virtualizer's scroll math
+        // depends on them
+        '.xft-ghead{display:flex;align-items:center;gap:8px;height:30px;user-select:none}',
+        '.xft-ghead.xft-gjump{cursor:pointer}',
+        '.xft-glabel{font-size:12px;font-weight:600;color:hsl(var(--xft-fg));white-space:nowrap;overflow:hidden;text-overflow:ellipsis;max-width:70%}',
+        '.xft-gline{flex:1 1 auto;border-top:1px solid hsl(var(--xft-border))}',
+        '.xft-gsub{height:24px;padding-left:14px}',
+        '.xft-gsub .xft-glabel{font-weight:500;font-size:11px;color:hsl(var(--xft-muted-fg))}',
         '.xft-linksbar{display:flex;align-items:center;gap:6px;padding:6px 8px;border-bottom:1px solid hsl(var(--xft-border))}',
         '.xft-linksbar[hidden]{display:none}',
         // shadcn Input

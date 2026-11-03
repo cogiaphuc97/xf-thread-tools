@@ -1,0 +1,58 @@
+# CLAUDE.md
+
+## What this is
+
+A single-file Tampermonkey userscript (`xf-thread-tools.user.js`, ~1300 lines) for XenForo 2 forums: reaction-based post sorting + a media/links drawer panel. The userscript is the only deliverable; `package.json` exists only as dev scaffolding for tests. Repo: `cogiaphuc97/xf-thread-tools` (public, branch `main`), auto-update via `https://raw.githubusercontent.com/cogiaphuc97/xf-thread-tools/main/xf-thread-tools.user.js`.
+
+## Commands
+
+```bash
+npm test                          # unit tests (node:test, pure functions only)
+node --check xf-thread-tools.user.js   # syntax gate after every edit
+node tests/live-headless.mjs      # live verification vs a real thread page (needs Chrome + network)
+```
+
+`tests/live-headless.mjs` is NOT part of `npm test`. It drives `/opt/google/chrome/chrome --headless=new` over raw CDP WebSocket (node stdlib, zero deps), injects `/tmp/xf-serve/inject.js`, and asserts boot/panel/sub-tabs/quote-exclusion/unfurl-exclusion/sort-resume/partial-label/restore.
+
+**Rebuild the inject bundle after every userscript edit, or the harness tests stale code:**
+
+```bash
+cat /tmp/xf-serve/stub.js xf-thread-tools.user.js > /tmp/xf-serve/inject.js
+```
+
+(`stub.js` = GM_setValue/GM_getValue shims backed by localStorage, prefix `xft_`.)
+
+## Release rules
+
+- **Every change request bumps `@version` in `xf-thread-tools.user.js` AND `package.json` (kept in sync), then commit + push.** State the version in the reply.
+- raw.githubusercontent.com can serve a stale version for minutes after a push. Verify via `https://api.github.com/repos/cogiaphuc97/xf-thread-tools/commits/main`, not the raw URL.
+- Commit messages end with `Co-Authored-By: Claude Code <noreply@anthropic.com>`.
+
+## Architecture
+
+One IIFE with a runtime guard: all DOM/GM code runs only on `<html id="XF" data-template="thread_view">`. Under Node (tests) the guard keeps it inert, so the same file is both deliverable and test target.
+
+- **Pure functions** (`parseReactionCount`, `filterLinks`, `sortPosts`, `estimateSize`, `partitionLinks`, `extractDomain`, `groupLinkItems`, `applyLinkFilters`) are exported through a UMD tail (`module.exports`); `tests/parse.test.mjs` imports them via `createRequire`.
+- **Extraction**: `extractPost(art)` collects media/links from `.bbWrapper` + whole-article attachment scan. Skips anything inside `blockquote.bbCodeBlock--quote` (quotes are copies of other posts' content).
+- **Cache**: IndexedDB `xf-thread-tools`, stores `posts` (per-post records with bodyHtml) + `threads` (meta incl. `pagesDone[]` resume set). `ensure(force)` = panel path, partial data usable, never auto-refetch; `ensureForSort()` = sorter path, resumes missing pages. 100 MB persistence cap with in-memory fallback.
+- **Panel**: virtualized 4-col media grid (wheel clamped to ±1 row, media tab only), Links tab native scroll. Render-signature guard skips rebuilds on progress ticks.
+- **Selector overrides**: `BASE_SEL` merged with `settings.selectors` (GM key `xfThreadTools:settings`); every selector user-overridable.
+
+## Gotchas
+
+- Media-extraction changes don't retro-fix old data: per-thread IndexedDB records persist across versions. After shipping an extraction fix, tell the user to hit **↻ Refresh** in the panel on affected threads.
+- XF quote markup: `blockquote.bbCodeBlock--quote` is the selector that matches; `.bbCodeBlock.quote` matches nothing.
+- `img.bbCodeBlockUnfurl-image` (link-preview cards) is deliberately NOT collected — those cards carry brand logos and placeholder art, not content media. Do not re-add.
+- Sort button must never be disabled while its fetch is pending — the second click is the cancel affordance (disabled = cancel branch unreachable).
+- Video cells append `#t=0.1` to src for poster-frame seeking — normalize the hash when comparing URLs in tests.
+
+- Lazy-image XF themes (voz): `<img src="data:image/svg+xml,1x1" data-src="REAL">` — src is a 145-byte placeholder. Extraction must prefer data-src/data-url when src is data:/blob: (v0.7.9, 0f08cd1). 1x1 loads "successfully" (nw=1, complete, no error) — blank-cell class; probe for complete+nw<=1, not just nw===0.
+
+- Boilerplate fingerprint: same URL in >=3 distinct authors = signature/"via app" footer — skipped at extraction AND filtered at render (renderPanelBody, boilerplateUrls). Smilies: class smilie*/URL /smilies/ — same double gate. Footer links live INSIDE body markup, no structural marker — only the fingerprint catches them.
+- Embed iframes (v0.7.15–0.7.19): third-party video hosts embed `<iframe src=…/embed/ID>` in bodies; the inner `<video>` src is signed+expiring — collect only the iframe URL (record field `embeds`; old records lack it, render must guard undefined). Rendered as no-fetch ▶ tiles under Video. Tile posters come from the embed page's og:image/data-poster via parseEmbedPoster + GM_xmlhttpRequest (host sends no CORS headers; fetch() fallback), cached in GM storage. Poster fill rules: defer a tick after tile build (renderRange inserts rows synchronously), never gate on isConnected (rows detach in vrowCache while scrolled out — the poster must still land), persist successes only. Poster fetches are QUEUED (2 concurrent, 350ms spacing, slot reserved at schedule time so parallel waits can't expire into a same-tick burst) with 3 backoff retries on non-200/network/challenge before session-capping — parallel bursts trip the host's CDN challenges, which is what blanked all tiles past the first rows. Viewer playback (0.7.19): embed URLs with a working `<origin>/api/sign?v=<ID>` endpoint (turbo-style players) play as native `<video controls referrerpolicy="no-referrer">` — the CDNs 403 foreign Referers but serve no-referer, and Chrome sniffs the octet-stream mp4 fine; signed URL cached until 60s before exp; any failure (no endpoint/sign/stream error) falls back to the embed iframe — do NOT add a sandbox attr to that iframe (players need scripts). File-page videos (v0.7.21): Videos-tab URLs shaped `/v/<name>.mp4` or `/f/<x>` are HTML pages, not bytes — resolveEmbedStream route 2 fetches the page and parses carriers (jsCDN+signUrl vars → sign endpoint `{token,ex}` appended to the CDN url; else og:video; else `<video>/<source>` src) before playback; raw-URL fallback keeps old behavior. Sticker gate: both-axis naturalWidth/Height ≤ TINY_MEDIA_MAX (**140**, not 200 — a real 180px image was retired: cell appeared, loaded, then vanished) retires the item at render; mid-list removal must clear vrowCache + vGrid (use `clearVRows()`) or the virtualizer serves stale rows.
+- Loading UX (v0.7.22–0.7.30): pending image/embed cells carry `.xft-loading` — breathing skeleton bg (`xft-skel-pulse`) + bright sweep band (`xft-shimmer`, alpha ≥ .20 — fainter reads as a static tint). Images are GATED while streaming (v0.7.30, replaces the 0.7.23 native-progressive experiment the user rejected): `opacity:0 + blur(6px)` until `.xft-ok`, then a .35s opacity+blur reveal — progressive JPEGs otherwise paint part-by-part and read as broken tiles. Cached images are ok'd at build → instant. Tiles/video thumbs keep the build pop (`xft-pop`); filmstrip + viewer images share the gate. Failed media retire via brokenMediaUrls Set + 300ms-debounced BATCHED re-render — never placeholder-then-hide.
+- Panel fetch UX (v0.7.25): while `hub.fetchRunning`, progress shows `⟳ n/N` and Stop/Refresh are DISABLED (user request — fetch is uninterruptible from the panel; the SORT button keeps its click-to-cancel). While fetching, media/links render strictly page 1 → last (frontier = contiguous `pagesDone`): the live page seeds instantly but stays hidden until earlier pages land — jumping to page 20 fills the grid in page order. Idle (no fetch) shows all cached partial data.
+- Row cache (v0.7.25): `vrowCache.clear()` alone left row ELEMENTS in the DOM — orphan rows showed pre-refresh cells after Refresh (the user's short/blank mid-grid rows). ALWAYS use `clearVRows()` (detaches + clears). Stale-row rebuild is sig-based since 0.7.31: every layout entry gets a signature (`r<first>:<len>` / `h<kind>:<label>`) stored in `dataset.xftSig`; a cached row whose sig mismatches rebuilds (covers short rows AND moved group headers).
+- Media grouping (v0.7.31): `Group` select in the sub-tab row — flat | post | page | user; persisted as `settings.mediaGroup`, so All/Image/Video switches keep the group. The virtualizer renders LAYOUT entries, not raw rows: `buildMediaLayout()` emits full-width headers (`Page x` / `username` / `#pos - author`, page+user modes add a `#pos - author` sub-header per post) + ≤4-cell rows; `layoutTops()` prefix-sums entry heights because headers (CSS-fixed 30/24px + 6 gap — mirrored in code) are shorter than media rows. Visible range = binary search over tops, ±1 entry buffer. Growth ticks (fetch progress) rebuild the layout and re-range without teardown; user-mode groups reorder items (first-appearance order) but stay append-stable. `vGrid.identity` = `subTab:groupMode`. Row pitch measurement must use `.xft-vrow` (a media row), never `vrows.firstElementChild` (may be a header).
+- Image viewer (v0.7.25 + 0.7.29): `.xft-vslot.xft-vimg` sizes to the image's own aspect (`sizeVImgSlot`: 80vh tall, capped 92vw/1120px; set on load via markMediaLoaded AND synchronously for cached-complete images, which never fire load) — then a post-layout rAF re-fits the slot to the img's RENDERED getBoundingClientRect on BOTH axes: fixed-80vh height letterboxed thin black bars when contain fit a hair smaller, and EXIF-rotated phone photos make naturalWidth lie (wide slot + portrait render = black side panel). Verified slot==img for tall and wide. Videos keep the fixed 16:9 box.
+- Motion pass (v0.7.27–0.7.28): dead/tiny cells fade+shrink out (`.xft-out`, declared AFTER the xft-loading rules — a loading+dying cell must fade, not shimmer; same specificity, source order wins) before the batched removal render; rebuilt rows carry `.xft-nopop` for 450ms (`popSuppressUntil`) so removals don't re-pop the whole grid. Viewer opens with `xft-pop` only on FRESH opens (`nav` flag — prev/next calls `closeViewer(true)` instant-swap, real closes animate out via `.xft-vclose`). Settings uses `toggleSettings()` (rAF class add on open, 160ms close timer), not the raw hidden flip. Fetch spinner = `.xft-spinner` span inside progressEl. CRITICAL: `clearVRows()` resets `lastPanelSignature` — cleared rows + unchanged signature made renderPanelBody early-return and leave the grid EMPTY forever (hit by the img→video retry erroring the same URL ~1s after the first removal; also a Refresh race). The user's OS runs prefers-reduced-motion: reduce — that killed ALL animation ("nothing works"); the reduce-motion rules are scoped `html:not(.xft-anim-force)` and setting `force animations (1/0)` toggles that class (`applyAnimOverride()`, boot + save).
