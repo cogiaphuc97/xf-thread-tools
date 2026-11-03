@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         xf-thread-tools
 // @namespace    xf-thread-tools
-// @version      0.7.39
+// @version      0.7.40
 // @description  XenForo 2: sort thread posts by reaction count across all pages (cached) + floating media panel (images / external links).
 // @author       xf-thread-tools
 // @match        *://*/threads/*
@@ -158,6 +158,128 @@
     try { d = decodeURIComponent(s); } catch (e) { /* malformed escape — raw test still applies */ }
     return s.indexOf('/smilies/') !== -1 || s.indexOf('/smilie.') !== -1
       || d.indexOf('/smilies/') !== -1 || d.indexOf('/smilie.') !== -1;
+  }
+
+  // ---------- bulk download: pure helpers ----------
+  // Filenames are embedded in a zip this script writes itself (STORE — media
+  // is already compressed, so re-compressing gains nothing). Every segment is
+  // sanitized (no traversal, no control chars) and capped at 120 chars.
+  function sanitizeFileSeg(s) {
+    return String(s || '').replace(/[^a-zA-Z0-9._-]+/g, '_').replace(/^[._-]+/, '').replace(/\.{2,}/g, '.').slice(0, 120);
+  }
+  function dlBasename(url, kind, idx) {
+    let b = '';
+    try { b = new URL(url).pathname.split('/').filter(Boolean).pop() || ''; } catch (e) { /* keep '' */ }
+    b = sanitizeFileSeg(b);
+    if (!b) b = (kind === 'video' ? 'video-' : 'image-') + (idx + 1) + (kind === 'video' ? '.mp4' : '.jpg');
+    return b;
+  }
+
+  // HQ image candidate chain: post-body images with a `.md`/`.th` marker
+  // before the extension are MEDIUM variants. Two shapes: marker-only
+  // `<uuid>.md.jpg` (full size = same path minus the marker) and
+  // dims-prefixed `<WxH>_<name>.md.jpg`. Shape-based only (no hostnames);
+  // hosts without the marker never enter the chain. Candidates walk
+  // drop-marker(+dims) → drop-marker → the post URL itself.
+  const HQ_IMG_RE = /^(.*\/)(.+)\.(md|th)\.(jpe?g|png|webp|gif)$/i;
+  function hqCandidates(url) {
+    const m = String(url || '').match(HQ_IMG_RE);
+    if (!m) return [url];
+    const d = m[2].match(/^(\d+x\d+)_(.+)$/);
+    const cands = [m[1] + (d ? d[2] : m[2]) + '.' + m[4]]; // drop marker (+ dims if present)
+    if (d) cands.push(m[1] + m[2] + '.' + m[4]);            // drop marker, keep dims
+    cands.push(url);
+    return cands;
+  }
+  // Turn the current media list into download jobs. Images walk the same HQ
+  // candidate chain as the grid (full-size first, marker variant fallback) so
+  // a download run grabs never-rendered cells at full size too; embed player
+  // tiles have no direct media file and are counted as skips. Duplicate URLs
+  // are dropped. Names are seq-prefixed so two posts sharing a basename
+  // cannot clobber each other inside the zip.
+  function buildDlJobs(items) {
+    const seen = new Set();
+    const jobs = [];
+    let skip = 0;
+    for (const it of (Array.isArray(items) ? items : [])) {
+      if (it.kind === 'embed') { skip++; continue; }
+      const base = it.kind === 'video' ? String(it.url || '').replace(/#.*$/, '') : String(it.url || '');
+      if (!base || seen.has(base)) continue;
+      seen.add(base);
+      const cands = it.kind === 'image' ? hqCandidates(base) : [base];
+      jobs.push({
+        cands: cands,
+        kind: it.kind,
+        name: String(jobs.length + 1).padStart(3, '0') + '_' + dlBasename(cands[0], it.kind, jobs.length)
+      });
+    }
+    return { jobs: jobs, skip: skip };
+  }
+
+  // Minimal zip (method 0 / STORE) writer — no dependencies. Layout per
+  // PKWARE APPNOTE: per-file local header + bytes, then the central
+  // directory, then the end-of-central-directory record. UTF-8 names via the
+  // general-purpose flag 0x0800. Offsets/sizes are 32-bit; the caller caps
+  // the run well under 4 GB.
+  const CRC_TABLE = (() => {
+    const t = new Uint32Array(256);
+    for (let n = 0; n < 256; n++) {
+      let c = n;
+      for (let k = 0; k < 8; k++) c = (c & 1) ? (0xEDB88320 ^ (c >>> 1)) : (c >>> 1);
+      t[n] = c >>> 0;
+    }
+    return t;
+  })();
+  function crc32(u8) {
+    let c = 0xFFFFFFFF;
+    for (let i = 0; i < u8.length; i++) c = CRC_TABLE[(c ^ u8[i]) & 0xFF] ^ (c >>> 8);
+    return (c ^ 0xFFFFFFFF) >>> 0;
+  }
+  function dosDateTime(d) {
+    const y = Math.max(1980, d.getFullYear());
+    const time = ((d.getHours() << 11) | (d.getMinutes() << 5) | (d.getSeconds() >> 1)) & 0xFFFF;
+    const date = (((y - 1980) << 9) | ((d.getMonth() + 1) << 5) | d.getDate()) & 0xFFFF;
+    return { time: time, date: date };
+  }
+  function u16le(v) { return new Uint8Array([v & 255, (v >>> 8) & 255]); }
+  function u32le(v) { return new Uint8Array([v & 255, (v >>> 8) & 255, (v >>> 16) & 255, (v >>> 24) & 255]); }
+  function concatU8(list) {
+    let n = 0;
+    for (const a of list) n += a.length;
+    const out = new Uint8Array(n);
+    let o = 0;
+    for (const a of list) { out.set(a, o); o += a.length; }
+    return out;
+  }
+  function zipLocalHeader(nameU8, crc, size, dt) {
+    return concatU8([u32le(0x04034b50), u16le(20), u16le(0x0800), u16le(0), u16le(dt.time), u16le(dt.date),
+      u32le(crc), u32le(size), u32le(size), u16le(nameU8.length), u16le(0), nameU8]);
+  }
+  function zipCentralEntry(nameU8, crc, size, dt, offset) {
+    return concatU8([u32le(0x02014b50), u16le(20), u16le(20), u16le(0x0800), u16le(0), u16le(dt.time), u16le(dt.date),
+      u32le(crc), u32le(size), u32le(size), u16le(nameU8.length), u16le(0), u16le(0), u16le(0), u16le(0),
+      u32le(0), u32le(offset), nameU8]);
+  }
+  function zipEocd(count, cdSize, cdOffset) {
+    return concatU8([u32le(0x06054b50), u16le(0), u16le(0), u16le(count), u16le(count), u32le(cdSize), u32le(cdOffset), u16le(0)]);
+  }
+  // files: [{ name, data: Uint8Array }] -> Uint8Array of the whole zip.
+  function zipStoreU8(files) {
+    const enc = new TextEncoder();
+    const dt = dosDateTime(new Date());
+    const parts = [];
+    const cds = [];
+    let off = 0;
+    for (const f of files) {
+      const nameU8 = enc.encode(f.name);
+      const crc = crc32(f.data);
+      const lh = zipLocalHeader(nameU8, crc, f.data.length, dt);
+      parts.push(lh, f.data);
+      cds.push(zipCentralEntry(nameU8, crc, f.data.length, dt, off));
+      off += lh.length + f.data.length;
+    }
+    const cd = concatU8(cds);
+    return concatU8(parts.concat([cd, zipEocd(files.length, cd.length, off)]));
   }
 
   // Embed-page poster extractor: given the HTML of a video-host /embed/ page,
@@ -1392,8 +1514,8 @@
     // the .md/.th marker (site attachments, plain uploaders) never enter
     // the chain. Candidates walk drop-marker(+dims) → drop-marker → the
     // post URL itself; the reached stage is remembered per session so
-    // rebuilds skip dead candidates.
-    const HQ_IMG_RE = /^(.*\/)(.+)\.(md|th)\.(jpe?g|png|webp|gif)$/i;
+    // rebuilds skip dead candidates. (HQ_IMG_RE + hqCandidates live in the
+    // pure section — the bulk-download job builder shares them.)
     const hqStage = new Map();
     const hqTriedRetry = new Set(); // URLs whose HQ candidate got its one retry
     // full-size fetches are much heavier than the medium files the page
@@ -1413,14 +1535,181 @@
       hqNet.last = now + wait;
       setTimeout(() => job(() => { hqNet.active--; pumpHqNet(); }), wait);
     }
-    function hqCandidates(url) {
-      const m = String(url || '').match(HQ_IMG_RE);
-      if (!m) return [url];
-      const d = m[2].match(/^(\d+x\d+)_(.+)$/);
-      const cands = [m[1] + (d ? d[2] : m[2]) + '.' + m[4]]; // drop marker (+ dims if present)
-      if (d) cands.push(m[1] + m[2] + '.' + m[4]);            // drop marker, keep dims
-      cands.push(url);
-      return cands;
+
+    // ---------- bulk download (media tab) ----------
+    // Fetches every listed file (GM XHR — no CORS limits; fetch() fallback),
+    // zips them STORE into ONE <thread title>.zip (Pics/ + Videos/ inside)
+    // and saves it via a blob anchor — no GM_download needed, no per-file
+    // download prompts. Embed player tiles have no direct media file and are
+    // skipped + reported. Fetches are serialized 2-at-a-time for the same
+    // CDN-burst reason as the HQ queue; a second click cancels the run.
+    const dlRun = { running: false, cancel: false, total: 0, done: 0, fail: 0, skip: 0, bytes: 0, lastErr: '' };
+    const dlNet = { active: 0, queue: [], last: 0 };
+    const DL_NET_MAX = 2;
+    const DL_NET_GAP = 400;
+    const DL_BYTE_CAP = 3500 * 1024 * 1024; // zip offsets are 32-bit — stop well under 4 GB
+    let dlJobs = [];
+    let dlBtnEl = null;
+    function threadTitle() {
+      const h = document.querySelector('h1.p-title-value');
+      let t = (h ? h.textContent : '') || document.title || '';
+      t = t.split('|')[0].trim();
+      return sanitizeFileSeg(t) || 'thread';
+    }
+    function updateDlBtn(text, running) {
+      if (!dlBtnEl) return;
+      dlBtnEl.textContent = text || '⬇';
+      dlBtnEl.classList.toggle('xft-dl-run', !!running);
+      dlBtnEl.title = dlRun.running
+        ? 'Building zip — click to stop. ' + dlRun.done + ' ok, ' + dlRun.fail + ' failed, '
+          + (dlRun.bytes / 1048576).toFixed(1) + ' MB' + (dlRun.lastErr ? ', ' + dlRun.lastErr : '')
+        : 'Download the ' + panelSubTab + ' list as one zip (Pics/ + Videos/, named after the thread). '
+          + 'Embed player tiles are skipped (no direct file). Click again while running to stop.';
+    }
+    function dlPump() {
+      if (!dlRun.running) return;
+      if (!dlNet.queue.length) { if (dlNet.active === 0) dlFinish(); return; }
+      if (dlNet.active >= DL_NET_MAX) return;
+      const job = dlNet.queue.shift();
+      dlNet.active++;
+      const now = Date.now();
+      const wait = Math.max(0, dlNet.last + DL_NET_GAP - now);
+      dlNet.last = now + wait;
+      setTimeout(() => {
+        if (!dlRun.running) { dlNet.active--; return; }
+        dlTry(job, 0, () => { dlNet.active--; dlPump(); });
+      }, wait);
+    }
+    function dlAfter(release) {
+      if (dlRun.running) updateDlBtn('⬇ ' + (dlRun.done + dlRun.fail) + '/' + dlRun.total, true);
+      release();
+    }
+    function dlTry(job, ci, release) {
+      dlFetch(job.cands[ci], (blob) => {
+        if (dlRun.cancel) { release(); return; }
+        if (blob) {
+          dlRun.done++;
+          dlRun.bytes += blob.size;
+          job.blob = blob;
+          if (dlRun.bytes > DL_BYTE_CAP) { // stop scheduling; keep what's fetched
+            dlRun.lastErr = 'size cap reached — zip truncated';
+            dlNet.queue.length = 0;
+          }
+          dlAfter(release);
+          return;
+        }
+        if (dlRun.running && ci + 1 < job.cands.length) { dlTry(job, ci + 1, release); return; }
+        dlRun.fail++;
+        dlAfter(release);
+      });
+    }
+    function dlFetch(url, cb) {
+      let settled = false;
+      const done = (blob) => { if (!settled) { settled = true; cb(blob); } };
+      if (typeof GM_xmlhttpRequest === 'function') {
+        GM_xmlhttpRequest({
+          method: 'GET', url: url, responseType: 'blob', timeout: 180000,
+          onload: (r) => done(r && (r.status === 200 || r.status === 0) && r.response ? r.response : null),
+          onerror: () => done(null),
+          ontimeout: () => done(null)
+        });
+        return;
+      }
+      fetch(url, { referrerPolicy: 'no-referrer' })
+        .then(async (r) => {
+          if (!r.ok) { done(null); return; }
+          if (!r.body || !r.body.getReader) { done(await r.blob()); return; }
+          const reader = r.body.getReader();
+          const chunks = [];
+          for (;;) {
+            const st = await reader.read();
+            if (st.done) break;
+            chunks.push(st.value);
+          }
+          done(new Blob(chunks));
+        })
+        .catch(() => done(null));
+    }
+    async function buildZipBlob(files) { // files: [{ name, blob }]
+      const enc = new TextEncoder();
+      const dt = dosDateTime(new Date());
+      const parts = [];
+      const cds = [];
+      let off = 0;
+      for (const f of files) {
+        const buf = new Uint8Array(await f.blob.arrayBuffer()); // one full read for the CRC
+        const crc = crc32(buf);
+        const nameU8 = enc.encode(f.name);
+        const lh = zipLocalHeader(nameU8, crc, buf.length, dt);
+        parts.push(lh, f.blob); // splice the original blob — bytes are not copied twice
+        cds.push(zipCentralEntry(nameU8, crc, buf.length, dt, off));
+        off += lh.length + buf.length;
+      }
+      const cd = concatU8(cds);
+      return new Blob(parts.concat([cd, zipEocd(files.length, cd.length, off)]), { type: 'application/zip' });
+    }
+    function dlSaveZip(zip) {
+      const u = URL.createObjectURL(zip);
+      const a = document.createElement('a');
+      a.href = u;
+      a.download = threadTitle() + '.zip';
+      document.body.appendChild(a);
+      a.click();
+      a.remove();
+      setTimeout(() => URL.revokeObjectURL(u), 60000);
+    }
+    function dlFinish() {
+      dlRun.running = false;
+      const label = dlRun.cancel
+        ? '⬇ stopped ' + dlRun.done + '/' + dlRun.total
+        : '⬇ ✓ ' + dlRun.done + '/' + dlRun.total
+          + (dlRun.fail ? ' (' + dlRun.fail + ' fail)' : '')
+          + (dlRun.skip ? ' · ' + dlRun.skip + ' embeds' : '');
+      updateDlBtn(label, true);
+      setTimeout(() => { if (!dlRun.running) updateDlBtn('', false); }, 4000);
+      if (dlRun.cancel || !dlRun.done) return;
+      // zip assembly needs the main thread free for arrayBuffer reads — defer
+      // a tick so the final label paints first
+      setTimeout(() => {
+        buildZipBlob(dlJobs.filter((j) => j.blob).map((j) => ({
+          name: (j.kind === 'video' ? 'Videos/' : 'Pics/') + j.name, blob: j.blob
+        })))
+          .then(dlSaveZip)
+          .catch((e) => {
+            dlRun.lastErr = 'zip failed: ' + (e && e.message ? e.message : e);
+            updateDlBtn('⬇ zip error', true);
+            setTimeout(() => { if (!dlRun.running) updateDlBtn('', false); }, 4000);
+          });
+      }, 30);
+    }
+    function startBulkDownload() {
+      if (dlRun.running) { // second click = cancel affordance
+        dlRun.cancel = true;
+        dlRun.running = false;
+        dlNet.queue.length = 0;
+        dlFinish();
+        return;
+      }
+      const pd = panelData();
+      const res = buildDlJobs(collectMediaItems(pd).items);
+      dlJobs = res.jobs;
+      dlRun.running = true;
+      dlRun.cancel = false;
+      dlRun.total = dlJobs.length;
+      dlRun.done = 0;
+      dlRun.fail = 0;
+      dlRun.skip = res.skip;
+      dlRun.bytes = 0;
+      dlRun.lastErr = '';
+      if (!dlJobs.length) {
+        dlRun.running = false;
+        updateDlBtn(res.skip ? '⬇ embeds only' : '⬇ empty', true);
+        setTimeout(() => { if (!dlRun.running) updateDlBtn('', false); }, 2000);
+        return;
+      }
+      dlNet.queue = dlJobs.slice();
+      updateDlBtn('⬇ 0/' + dlJobs.length, true);
+      dlPump();
     }
 
     // Build the <img>/<video> element for a grid cell, viewer, or filmstrip
@@ -1808,8 +2097,10 @@
       return tops;
     }
 
-    function renderPanelBody() {
-      if (!panelIsOpen() || !panelBodyEl) return;
+    // shared preamble for the render pass AND bulk download: ordered records
+    // (fetch-frontier filtered), post positions, boilerplate set. The
+    // download list must match the grid exactly — one source of truth.
+    function panelData() {
       const ordered = orderedRecords();
       // while a fetch runs, media renders strictly page 1 → last: the live
       // page is seeded instantly but must NOT appear until every earlier
@@ -1824,30 +2115,44 @@
       // signature/"sent via app" boilerplate: URLs recurring across >=3
       // distinct authors — filtered at render so stale caches heal without Refresh
       const boiler = boilerplateUrls(ordered, 3);
+      return { ordered: ordered, orderedShown: orderedShown, posMap: posMap, boiler: boiler };
+    }
+    // media items for the active sub-tab + per-kind counts
+    function collectMediaItems(d) {
+      const all = [];
+      // stale caches (pre-0.7.9) hold 1×1 data-URI placeholders alongside
+      // their real URLs (attachment-scan twins) — drop the placeholders so
+      // already-cached threads heal without a Refresh; smilies and
+      // signature/footer boilerplate are filtered the same way
+      const real = (list) => (list || []).filter((u) => !/^(data|blob):/i.test(u || '') && !isSmilieUrl(u) && !d.boiler.has(String(u || '')) && !tinyMediaUrls.has(String(u || '')) && !brokenMediaUrls.has(String(u || '')));
+      for (const r of d.orderedShown) {
+        for (const url of real(r.images)) all.push({ r: r, url: url, pos: d.posMap.get(r.postId) || 0, kind: 'image' });
+        for (const url of real(r.videos)) all.push({ r: r, url: url, pos: d.posMap.get(r.postId) || 0, kind: 'video' });
+        for (const url of real(r.embeds)) all.push({ r: r, url: url, pos: d.posMap.get(r.postId) || 0, kind: 'embed' });
+      }
+      // embeds are videos hosted elsewhere — they count under the Video tab
+      const mediaCounts = { all: all.length, image: 0, video: 0 };
+      for (const it of all) mediaCounts[it.kind === 'embed' ? 'video' : it.kind] += 1;
+      const items = panelSubTab === 'all' ? all : all.filter((it) => it.kind === panelSubTab || (panelSubTab === 'video' && it.kind === 'embed'));
+      return { all: all, items: items, mediaCounts: mediaCounts };
+    }
+
+    function renderPanelBody() {
+      if (!panelIsOpen() || !panelBodyEl) return;
+      const pd = panelData();
+      const boiler = pd.boiler;
       let items = [];
       let filtered = [];
       let mediaCounts = null;
       if (panelTab === 'media') {
-        const all = [];
-        // stale caches (pre-0.7.9) hold 1×1 data-URI placeholders alongside
-        // their real URLs (attachment-scan twins) — drop the placeholders so
-        // already-cached threads heal without a Refresh; smilies and
-        // signature/footer boilerplate are filtered the same way
-        const real = (list) => (list || []).filter((u) => !/^(data|blob):/i.test(u || '') && !isSmilieUrl(u) && !boiler.has(String(u || '')) && !tinyMediaUrls.has(String(u || '')) && !brokenMediaUrls.has(String(u || '')));
-        for (const r of orderedShown) {
-          for (const url of real(r.images)) all.push({ r: r, url: url, pos: posMap.get(r.postId) || 0, kind: 'image' });
-          for (const url of real(r.videos)) all.push({ r: r, url: url, pos: posMap.get(r.postId) || 0, kind: 'video' });
-          for (const url of real(r.embeds)) all.push({ r: r, url: url, pos: posMap.get(r.postId) || 0, kind: 'embed' });
-        }
-        // embeds are videos hosted elsewhere — they count under the Video tab
-        mediaCounts = { all: all.length, image: 0, video: 0 };
-        for (const it of all) mediaCounts[it.kind === 'embed' ? 'video' : it.kind] += 1;
+        const m = collectMediaItems(pd);
+        mediaCounts = m.mediaCounts;
         updateSubTabCounts(mediaCounts);
-        items = panelSubTab === 'all' ? all : all.filter((it) => it.kind === panelSubTab || (panelSubTab === 'video' && it.kind === 'embed'));
+        items = m.items;
         viewerItems = items.map((it) => ({ kind: it.kind, url: it.url, postId: it.r.postId, pos: it.pos, author: it.r.author }));
       } else {
-        for (const r of orderedShown) {
-          for (const url of r.links) if (!boiler.has(url)) items.push({ r: r, url: url, pos: posMap.get(r.postId) || 0, kind: 'link' });
+        for (const r of pd.orderedShown) {
+          for (const url of r.links) if (!boiler.has(url)) items.push({ r: r, url: url, pos: pd.posMap.get(r.postId) || 0, kind: 'link' });
         }
         filtered = applyLinkFilters(items, {
           query: linkSearchEl ? linkSearchEl.value : '',
@@ -2409,7 +2714,11 @@
         clearVRows();
         renderPanelBody();
       });
-      subtabsEl.append(subTabBtns.all, subTabBtns.image, subTabBtns.video, groupSel);
+      // bulk download: zips the current list (Pics/ + Videos/) as one file
+      const dlBtn = mkBtn('⬇', startBulkDownload, 'xft-btn xft-subtab xft-dlbtn');
+      dlBtnEl = dlBtn;
+      updateDlBtn('', false);
+      subtabsEl.append(subTabBtns.all, subTabBtns.image, subTabBtns.video, groupSel, dlBtn);
 
       linksBarEl = buildLinksBar();
 
@@ -2516,6 +2825,8 @@
         // shadcn Toggle active: secondary chip, readable on the plain panel bg
         '.xft-subtab.xft-tab-active,.xft-subtab.xft-tab-active:hover{background:hsl(var(--xft-secondary));color:hsl(var(--xft-fg));font-weight:600}',
         '.xft-gsel{margin-left:auto;height:22px;font-size:11px;background:hsl(var(--xft-secondary));color:hsl(var(--xft-fg));border:1px solid hsl(var(--xft-border));border-radius:6px;padding:0 4px;cursor:pointer;outline:none}',
+        '.xft-dlbtn{min-width:64px;text-align:center}',
+        '.xft-dl-run{background:hsl(var(--xft-ring)/.18)!important;border-color:hsl(var(--xft-ring))!important}',
         '.xft-jumps{position:absolute;right:10px;bottom:14px;display:flex;flex-direction:column;gap:6px;z-index:5}',
         '.xft-jumpbtn{width:30px;height:30px;padding:0;font-size:14px;line-height:1;border-radius:8px;box-shadow:0 2px 8px hsl(240 10% 3.9%/.25)}',
         // group headers: label + hairline filler; heights are FIXED (30/24px)
@@ -2696,5 +3007,5 @@
   }
 
   // UMD export of the pure functions for node:test (no DOM / GM usage in them).
-  if (typeof module !== 'undefined' && module.exports) module.exports = { parseReactionCount, filterLinks, sortPosts, estimateSize, partitionLinks, extractDomain, groupLinkItems, applyLinkFilters, boilerplateUrls, isSmilieUrl, parseEmbedPoster, embedSignUrl, parseSignResponse, parseSignToken, parseVideoPage, isVideoPageUrl };
+  if (typeof module !== 'undefined' && module.exports) module.exports = { parseReactionCount, filterLinks, sortPosts, estimateSize, partitionLinks, extractDomain, groupLinkItems, applyLinkFilters, boilerplateUrls, isSmilieUrl, parseEmbedPoster, embedSignUrl, parseSignResponse, parseSignToken, parseVideoPage, isVideoPageUrl, hqCandidates, sanitizeFileSeg, dlBasename, buildDlJobs, crc32, zipStoreU8 };
 })();

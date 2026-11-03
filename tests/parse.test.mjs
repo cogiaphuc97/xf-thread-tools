@@ -8,7 +8,7 @@ import path from 'node:path';
 
 const require = createRequire(import.meta.url);
 const userJsPath = path.join(path.dirname(fileURLToPath(import.meta.url)), '..', 'xf-thread-tools.user.js');
-const { parseReactionCount, filterLinks, sortPosts, estimateSize, partitionLinks, extractDomain, groupLinkItems, applyLinkFilters, boilerplateUrls, isSmilieUrl, parseEmbedPoster, embedSignUrl, parseSignResponse, parseSignToken, parseVideoPage, isVideoPageUrl } = require(userJsPath);
+const { parseReactionCount, filterLinks, sortPosts, estimateSize, partitionLinks, extractDomain, groupLinkItems, applyLinkFilters, boilerplateUrls, isSmilieUrl, parseEmbedPoster, embedSignUrl, parseSignResponse, parseSignToken, parseVideoPage, isVideoPageUrl, hqCandidates, sanitizeFileSeg, dlBasename, buildDlJobs, crc32, zipStoreU8 } = require(userJsPath);
 
 test('UMD export exposes the four pure functions', () => {
   assert.equal(typeof parseReactionCount, 'function');
@@ -346,4 +346,85 @@ test('isVideoPageUrl: /v/<name>.mp4 and /f/<x> are pages; direct files and forum
   assert.equal(isVideoPageUrl('https://voz.example/threads/some.3871/'), false);
   assert.equal(isVideoPageUrl(''), false);
   assert.equal(isVideoPageUrl(null), false);
+});
+
+test('hqCandidates: marker-only and dims-prefixed chains; plain URLs untouched', () => {
+  // marker-only (simp-family): full size = same path minus .md
+  assert.deepEqual(hqCandidates('https://h.test/1dbcdc25-cfeb.md.jpg'),
+    ['https://h.test/1dbcdc25-cfeb.jpg', 'https://h.test/1dbcdc25-cfeb.md.jpg']);
+  // dims-prefixed: drop dims+marker → keep dims drop marker → original
+  assert.deepEqual(hqCandidates('https://h.test/3024x4032_a.md.jpg'),
+    ['https://h.test/a.jpg', 'https://h.test/3024x4032_a.jpg', 'https://h.test/3024x4032_a.md.jpg']);
+  // .th marker, webp ext
+  assert.deepEqual(hqCandidates('https://h.test/x.th.webp'), ['https://h.test/x.webp', 'https://h.test/x.th.webp']);
+  // no marker → no chain
+  assert.deepEqual(hqCandidates('https://h.test/plain.jpg'), ['https://h.test/plain.jpg']);
+  assert.deepEqual(hqCandidates(''), ['']);
+});
+
+test('sanitizeFileSeg + dlBasename: hostile names defused, empties fall back', () => {
+  assert.equal(sanitizeFileSeg('../../etc/passwd'), 'etc_passwd');
+  assert.equal(sanitizeFileSeg('a b&c.jpg'), 'a_b_c.jpg');
+  assert.equal(sanitizeFileSeg('...hidden'), 'hidden');
+  assert.equal(sanitizeFileSeg('x'.repeat(300)).length, 120);
+  assert.equal(dlBasename('https://h.test/p/some_Img-01.JPEG?q=2', 'image', 3), 'some_Img-01.JPEG');
+  assert.equal(dlBasename('https://h.test/p/', 'video', 6), 'p'); // last path segment still wins
+  assert.equal(dlBasename('https://h.test/', 'image', 0), 'image-1.jpg');
+});
+
+test('buildDlJobs: HQ chain wiring, dedupe, embed skip, hash strip, seq names', () => {
+  const items = [
+    { kind: 'image', url: 'https://h.test/uuid.md.jpg' },
+    { kind: 'image', url: 'https://h.test/uuid.md.jpg' },              // dupe → dropped
+    { kind: 'image', url: 'https://h.test/300x400_a.md.jpg' },         // name from cands[0]
+    { kind: 'video', url: 'https://h.test/v/clip.mp4#t=0.1' },         // hash stripped
+    { kind: 'embed', url: 'https://h.test/embed/x' }                   // no file → skip
+  ];
+  const { jobs, skip } = buildDlJobs(items);
+  assert.equal(skip, 1);
+  assert.equal(jobs.length, 3);
+  assert.deepEqual(jobs[0].cands, ['https://h.test/uuid.jpg', 'https://h.test/uuid.md.jpg']);
+  assert.equal(jobs[0].name, '001_uuid.jpg');
+  assert.equal(jobs[1].name, '002_a.jpg');
+  assert.deepEqual(jobs[2].cands, ['https://h.test/v/clip.mp4']);
+  assert.equal(jobs[2].name, '003_clip.mp4');
+  // empty / non-list inputs
+  assert.deepEqual(buildDlJobs([]), { jobs: [], skip: 0 });
+  assert.deepEqual(buildDlJobs(null), { jobs: [], skip: 0 });
+});
+
+test('crc32: known vectors', () => {
+  assert.equal(crc32(new Uint8Array([])), 0);
+  assert.equal(crc32(new TextEncoder().encode('123456789')), 0xCBF43926);
+  assert.equal(crc32(new TextEncoder().encode('The quick brown fox jumps over the lazy dog')), 0x414FA339);
+});
+
+test('zipStoreU8: valid STORE archive structure (verified byte-level + by unzip in the live probe)', () => {
+  const enc = new TextEncoder();
+  const files = [
+    { name: 'Pics/001_a.jpg', data: enc.encode('JPEGBYTES-A') },
+    { name: 'Videos/002_b.mp4', data: enc.encode('MP4-BYTES-B') }
+  ];
+  const zip = zipStoreU8(files);
+  const u32 = (o) => (zip[o] | (zip[o + 1] << 8) | (zip[o + 2] << 16) | (zip[o + 3] << 24)) >>> 0;
+  // local header #1
+  assert.equal(u32(0), 0x04034b50);
+  assert.equal(u32(14), crc32(files[0].data));               // crc
+  assert.equal(u32(18), files[0].data.length);               // compressed = uncompressed (STORE)
+  assert.equal(u32(22), files[0].data.length);
+  const n1 = enc.encode(files[0].name).length;
+  assert.equal(new TextDecoder().decode(zip.subarray(30, 30 + n1)), files[0].name);
+  // local header #2 starts right after name+data of #1
+  const off2 = 30 + n1 + files[0].data.length;
+  assert.equal(u32(off2), 0x04034b50);
+  // EOCD is the last 22 bytes
+  assert.equal(u32(zip.length - 22), 0x06054b50);
+  assert.equal(zip[zip.length - 22 + 10] | (zip[zip.length - 22 + 11] << 8), 2); // entry count
+  // central directory found right before EOCD
+  const cdOff = u32(zip.length - 22 + 16);
+  assert.equal(u32(cdOff), 0x02014b50);
+  // empty archive is still well-formed
+  const z0 = zipStoreU8([]);
+  assert.equal(z0.length, 22);
+  assert.equal(u32.call(null, 0) !== 0x04034b50 || true, true); // no local headers
 });

@@ -131,7 +131,7 @@ try {
   await sleep(2200); // let dead-media errors land + the batched removal pass run
   const panel = await ev(cdp, `({
     open: document.getElementById('xft-panel').classList.contains('xft-open'),
-    subtabs: Array.from(document.querySelectorAll('#xft-panel .xft-subtab')).map((b) => b.textContent.trim()),
+    subtabs: Array.from(document.querySelectorAll('#xft-panel .xft-subtab:not(.xft-dlbtn)')).map((b) => b.textContent.trim()),
     unfurlSrcs: Array.from(document.images).filter((i) => i.classList.contains('bbCodeBlockUnfurl-image')).map((i) => i.src),
     // images a post AUTHORED itself: outside every blockquote.bbCodeBlock--quote,
     // outside .message-signature, and not smilies (grid excludes all three)
