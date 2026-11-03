@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         xf-thread-tools
 // @namespace    xf-thread-tools
-// @version      0.7.38
+// @version      0.7.39
 // @description  XenForo 2: sort thread posts by reaction count across all pages (cached) + floating media panel (images / external links).
 // @author       xf-thread-tools
 // @match        *://*/threads/*
@@ -1084,6 +1084,9 @@
     const embedPosters = readStore(EMBED_POSTERS_KEY, {}) || {};
     const embedPosterInflight = new Map();
     const failedEmbedPosters = new Set();
+    // a capped failure is not permanent within the session: the tile retries
+    // on its next rebuild (scroll back / tab switch / refresh) once cooled
+    const posterCooldown = new Map();
     function saveEmbedPosters() {
       const keys = Object.keys(embedPosters);
       if (keys.length > 300) {
@@ -1131,8 +1134,11 @@
           saveEmbedPosters();
         } else {
           // exhausted — not persisted (a transient failure would blank the
-          // tile on every future visit); retried on the next page load
+          // tile on every future visit); retried on the next page load, and
+          // within THIS session after a cool-down (initial-view bursts that
+          // later succeed must not leave the first tiles blank forever)
           failedEmbedPosters.add(url);
+          posterCooldown.set(url, Date.now() + 30000);
         }
         for (const fn of queue) fn(poster || '');
         embedPosterInflight.delete(url);
@@ -1175,7 +1181,10 @@
     }
     function ensureEmbedPoster(url, cb) {
       if (Object.prototype.hasOwnProperty.call(embedPosters, url)) { cb(embedPosters[url]); return; }
-      if (failedEmbedPosters.has(url)) { cb(''); return; } // one retry per page load
+      if (failedEmbedPosters.has(url)) {
+        if (Date.now() < (posterCooldown.get(url) || 0)) { cb(''); return; }
+        failedEmbedPosters.delete(url); // cooled down — try again on this rebuild
+      }
       fetchEmbedPoster(url, cb);
     }
 
@@ -1386,6 +1395,24 @@
     // rebuilds skip dead candidates.
     const HQ_IMG_RE = /^(.*\/)(.+)\.(md|th)\.(jpe?g|png|webp|gif)$/i;
     const hqStage = new Map();
+    const hqTriedRetry = new Set(); // URLs whose HQ candidate got its one retry
+    // full-size fetches are much heavier than the medium files the page
+    // ships — mounting a big range at once (panel open, jump to bottom)
+    // bursts the CDN and the 403s cascade into permanent .md fallbacks.
+    // Same serialized queue the poster fetches use: 3 concurrent, spaced.
+    const hqNet = { active: 0, queue: [], last: 0 };
+    const HQ_NET_MAX = 3;
+    const HQ_NET_GAP = 250;
+    function runHqNet(job) { hqNet.queue.push(job); pumpHqNet(); }
+    function pumpHqNet() {
+      if (hqNet.active >= HQ_NET_MAX || !hqNet.queue.length) return;
+      const job = hqNet.queue.shift();
+      hqNet.active++;
+      const now = Date.now();
+      const wait = Math.max(0, hqNet.last + HQ_NET_GAP - now);
+      hqNet.last = now + wait;
+      setTimeout(() => job(() => { hqNet.active--; pumpHqNet(); }), wait);
+    }
     function hqCandidates(url) {
       const m = String(url || '').match(HQ_IMG_RE);
       if (!m) return [url];
@@ -1507,11 +1534,38 @@
       if (!thumb) im.loading = 'lazy';
       const cands = hqCandidates(url);
       let ci = Math.min(hqStage.get(url) || 0, cands.length - 1);
-      const useStage = (i) => { ci = i; hqStage.set(url, i); im.src = cands[i]; };
+      const isHqStage = (i) => cands.length > 1 && i < cands.length - 1;
+      const setStage = (i) => {
+        ci = i;
+        hqStage.set(url, i);
+        if (!isHqStage(i)) { im.src = cands[i]; return; } // post URL: unqueued
+        runHqNet((done) => {
+          // stage moved on while queued (cell rebuilt elsewhere) — give the slot back
+          if (ci !== i || im.src === cands[i]) { done(); return; }
+          let released = false;
+          const rel = () => { if (!released) { released = true; done(); } };
+          im.addEventListener('load', rel, { once: true });
+          im.addEventListener('error', rel, { once: true });
+          setTimeout(rel, 20000); // a hung request must not pin the slot
+          im.src = cands[i];
+        });
+      };
       im.addEventListener('error', function onErr() {
-        // HQ candidates first: a dead upgrade falls through to the next
-        // candidate; only the post URL itself failing starts the video retry
-        if (ci < cands.length - 1) { useStage(ci + 1); return; }
+        // HQ candidates first: a transient failure (rate-limit burst) gets ONE
+        // delayed retry — the gate keeps a src-less/failed img invisible, so
+        // the retry happens inside the shimmer with no broken-icon flicker.
+        // A second failure falls to the next candidate; only the post URL
+        // itself failing starts the video retry.
+        if (isHqStage(ci)) {
+          if (ci === 0 && !hqTriedRetry.has(url)) {
+            hqTriedRetry.add(url);
+            im.removeAttribute('src');
+            setTimeout(() => { if (ci === 0) setStage(0); }, 1500);
+            return;
+          }
+          setStage(ci + 1);
+          return;
+        }
         im.removeEventListener('error', onErr);
         const v = document.createElement('video');
         v.preload = 'metadata';
@@ -1521,12 +1575,14 @@
         v.addEventListener('loadedmetadata', () => { if (im.parentNode) im.replaceWith(v); markMediaLoaded(v); });
         v.load();
       });
-      useStage(ci);
+      setStage(ci);
       // A failure cached by Chrome replays instantly with NO error event, and
       // 1×1 placeholders (svg data-URIs, hotlink-block pixels) "load" as a
       // single stretched pixel = a blank cell. nw<=1 + complete = dead either
-      // way — probe for both, or the cell renders blank forever.
-      const checkDead = () => { if (im.complete && im.naturalWidth <= 1) markMediaBroken(im, url); };
+      // way — probe for both, or the cell renders blank forever. A src-LESS
+      // img (waiting in the HQ queue, or mid-retry) is complete with nw=0
+      // but NOT dead — probing it retired whole ranges of healthy cells.
+      const checkDead = () => { if (im.getAttribute('src') && im.complete && im.naturalWidth <= 1) markMediaBroken(im, url); };
       const checkTiny = () => {
         // 2..140px square-ish = smilie/sticker (no URL marker exists) —
         // retire the item. Animate the cell out first, then the debounced
@@ -1539,7 +1595,7 @@
           scheduleBrokenRerender();
         }
       };
-      if (im.complete) { checkDead(); checkTiny(); if (im.naturalWidth > 1) markMediaLoaded(im); }
+      if (im.getAttribute('src') && im.complete) { checkDead(); checkTiny(); if (im.naturalWidth > 1) markMediaLoaded(im); }
       else {
         im.addEventListener('load', () => { checkDead(); checkTiny(); markMediaLoaded(im); });
         setTimeout(() => { checkDead(); checkTiny(); }, 800);
