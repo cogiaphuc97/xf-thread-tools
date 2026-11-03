@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         xf-thread-tools
 // @namespace    xf-thread-tools
-// @version      0.7.36
+// @version      0.7.38
 // @description  XenForo 2: sort thread posts by reaction count across all pages (cached) + floating media panel (images / external links).
 // @author       xf-thread-tools
 // @match        *://*/threads/*
@@ -1270,6 +1270,7 @@
     // inherit the scroll of the list being left
     const scrollMemory = {};
     let lastRenderedView = null;
+    let lastUserScrollAt = 0; // wheel/touch activity — restores must not fight an active scroller
     function viewKey() { return panelTab === 'links' ? 'links' : panelSubTab + ':' + settings.mediaGroup; }
     function saveViewScroll() { if (panelBodyEl) scrollMemory[viewKey()] = panelBodyEl.scrollTop; }
     // smooth for short hops, instant for long virtualized jumps (a smooth
@@ -1833,7 +1834,12 @@
       panelCountEl.textContent = panelTab === 'links' && filtered.length !== items.length
         ? filtered.length + '/' + items.length + ' items'
         : items.length + ' items';
-      panelBodyEl.textContent = '';
+      // build the new body OFF to the side — the old content must stay
+      // mounted while building: wiping first (`textContent=''`) collapses
+      // the height to 0 for a frame, the browser clamps scrollTop, and the
+      // restore then fights the user's active scrolling (bottom-of-list
+      // stutter). replaceChildren swaps in ONE mutation and the scroll
+      // survives natively.
       const frag = document.createDocumentFragment();
       if (panelTab === 'media') {
         // virtualized grid: only visible rows (+buffer) exist in the DOM
@@ -2010,20 +2016,31 @@
           : (mediaCounts && mediaCounts.all > 0 ? 'No ' + panelSubTab + 's in this thread.' : 'Nothing found yet.');
         frag.appendChild(empty);
       }
-      panelBodyEl.appendChild(frag);
+      panelBodyEl.replaceChildren(frag);
       if (keepScroll || scrollTarget) {
         // restore AFTER a frame: at sync time the pads may still carry a
         // stale pitch and the content height can be briefly smaller than
-        // the target — a sync set clamps to 0 and the view lands at the
-        // top. The pre-pass re-renders with ATTACHED rows (refreshing the
-        // measured pitch and pads) before the offset is applied.
+        // the target — a sync set clamps and the view lands at the top.
+        // The pre-pass re-renders with ATTACHED rows (refreshing the
+        // measured pitch and pads) before the offset is applied, and the
+        // restore only moves the list when it landed FAR from where it
+        // belongs: small drift while the user is mid-wheel must be left
+        // alone or the list pushes back against the scroll (bottom stutter).
         const target = scrollTarget;
-        requestAnimationFrame(() => {
-          if (!panelBodyEl || !panelBodyEl.isConnected) return;
+        const apply = (n) => {
+          if (!panelBodyEl || !panelBodyEl.isConnected || n < 0) return;
           if (panelTab === 'media' && vGrid) vGrid.renderRange();
-          panelBodyEl.scrollTop = Math.min(target, panelBodyEl.scrollHeight - panelBodyEl.clientHeight);
-          if (panelTab === 'media' && vGrid) vGrid.renderRange();
-        });
+          const max = panelBodyEl.scrollHeight - panelBodyEl.clientHeight;
+          const want = Math.min(target, max);
+          const displace = Math.abs(panelBodyEl.scrollTop - want);
+          const userActive = performance.now() - lastUserScrollAt < 250;
+          if (displace > 80 && (!userActive || displace > panelBodyEl.clientHeight)) {
+            panelBodyEl.scrollTop = want;
+            if (panelTab === 'media' && vGrid) vGrid.renderRange();
+            requestAnimationFrame(() => apply(n - 1)); // height keeps settling — re-assert once more
+          }
+        };
+        requestAnimationFrame(() => apply(2));
       }
       // media grid is window-virtualized and renders what the viewport shows —
       // row capping (and this button) only applies to the Links tab
@@ -2125,6 +2142,7 @@
       let pend = 0;
       let raf = 0;
       panelBodyEl.addEventListener('wheel', (e) => {
+        lastUserScrollAt = performance.now();
         if (panelTab !== 'media') return; // Links tab keeps native scrolling
         e.preventDefault();
         // every wheel event contributes at most one row of travel, no native
