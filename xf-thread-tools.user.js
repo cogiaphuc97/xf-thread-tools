@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         xf-thread-tools
 // @namespace    xf-thread-tools
-// @version      0.7.22
+// @version      0.7.23
 // @description  XenForo 2: sort thread posts by reaction count across all pages (cached) + floating media panel (images / external links).
 // @author       xf-thread-tools
 // @match        *://*/threads/*
@@ -2155,16 +2155,20 @@
         '#xft-viewer{position:fixed;inset:0;background:hsl(240 10% 3.9%/.94);z-index:10000;display:flex;flex-direction:column;align-items:center;justify-content:center;gap:12px}',
         '#xft-viewer iframe{width:min(92vw,1120px);aspect-ratio:16/9;max-height:80vh;border:0;border-radius:calc(var(--xft-radius) - 2px);background:#000}',
         // every viewer media sits in ONE fixed-size slot: no size popping
-        // between items; content fades in once loaded, shimmer until then
+        // between items; shimmer until loaded
         '.xft-vslot{position:relative;height:80vh;width:min(92vw,1120px);display:flex;align-items:center;justify-content:center;background:#000;border-radius:calc(var(--xft-radius) - 2px);overflow:hidden}',
-        '.xft-vslot img,.xft-vslot video{max-width:100%;max-height:100%;object-fit:contain;opacity:0;transition:opacity .18s ease}',
-        '.xft-vslot img.xft-ok,.xft-vslot video.xft-ok{opacity:1}',
-        // grid cells shimmer while their media loads; media fades in on load
-        '.xft-cell img{opacity:0;transition:opacity .18s ease}',
-        '.xft-cell img.xft-ok{opacity:1}',
-        '.xft-cell.xft-loading::after,.xft-vslot.xft-loading::after,.xft-embed-host.xft-loading::after{content:"";position:absolute;inset:0;pointer-events:none;background:linear-gradient(100deg,hsl(0 0% 98%/.03) 30%,hsl(0 0% 98%/.09) 50%,hsl(0 0% 98%/.03) 70%);animation:xft-shimmer 1.3s linear infinite}',
+        '.xft-vslot img,.xft-vslot video{max-width:100%;max-height:100%;object-fit:contain}',
+        // media renders PROGRESSIVELY while loading (no opacity gate): a
+        // progressive JPEG paints blurry-then-sharp on its own — a real
+        // blur-up with zero extra requests (hosts offer no tiny-image URLs)
+        '.xft-cell img{transition:opacity .18s ease}',
+        // skeleton: bright sweeping band + soft breathing base — strong
+        // enough to read as animation, not a static tint
+        '.xft-cell.xft-loading,.xft-vslot.xft-loading,.xft-embed-host.xft-loading{animation:xft-skel-pulse 1.6s ease-in-out infinite}',
+        '.xft-cell.xft-loading::after,.xft-vslot.xft-loading::after,.xft-embed-host.xft-loading::after{content:"";position:absolute;inset:0;pointer-events:none;background:linear-gradient(100deg,transparent 20%,hsl(0 0% 98%/.20) 46%,hsl(0 0% 98%/.28) 50%,hsl(0 0% 98%/.20) 54%,transparent 80%);animation:xft-shimmer 1.1s linear infinite}',
         '@keyframes xft-shimmer{from{transform:translateX(-100%)}to{transform:translateX(100%)}}',
-        '@media (prefers-reduced-motion: reduce){.xft-cell.xft-loading::after,.xft-vslot.xft-loading::after,.xft-embed-host.xft-loading::after{animation:none}}',
+        '@keyframes xft-skel-pulse{0%,100%{background-color:hsl(240 6% 16%)}50%{background-color:hsl(240 6% 20%)}}',
+        '@media (prefers-reduced-motion: reduce){.xft-cell.xft-loading::after,.xft-vslot.xft-loading::after,.xft-embed-host.xft-loading::after{animation:none}.xft-cell.xft-loading,.xft-vslot.xft-loading,.xft-embed-host.xft-loading{animation:none}}',
         // embed viewer box is sized BEFORE the video arrives (sign round-trip
         // + metadata load would otherwise grow the box from zero and pop)
         '.xft-embed-host{position:relative;display:flex;align-items:center;justify-content:center;width:min(92vw,1120px);aspect-ratio:16/9;max-height:80vh;border-radius:calc(var(--xft-radius) - 2px);background:#000;overflow:hidden}',
