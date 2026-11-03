@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         xf-thread-tools
 // @namespace    xf-thread-tools
-// @version      0.7.25
+// @version      0.7.26
 // @description  XenForo 2: sort thread posts by reaction count across all pages (cached) + floating media panel (images / external links).
 // @author       xf-thread-tools
 // @match        *://*/threads/*
@@ -1041,7 +1041,10 @@
     // render; the next panel pass drops them, so stale caches heal without a
     // Refresh. If a real photo ever gets eaten, lower this constant.
     const tinyMediaUrls = new Set();
-    const TINY_MEDIA_MAX = 200;
+    // 140, not 200: real content images at 180px (cdn.anh.moe) were being
+    // retired — measured stickers top out at 129px, so 140 keeps them out
+    // while real media survives
+    const TINY_MEDIA_MAX = 140;
     // Media that errored at load: dropped from the grid on the next render.
     // Removals are debounced+batched so a wave of dead links collapses into
     // ONE layout pass instead of cells popping out one by one.
