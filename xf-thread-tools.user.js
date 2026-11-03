@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         xf-thread-tools
 // @namespace    xf-thread-tools
-// @version      0.7.29
+// @version      0.7.30
 // @description  XenForo 2: sort thread posts by reaction count across all pages (cached) + floating media panel (images / external links).
 // @author       xf-thread-tools
 // @match        *://*/threads/*
@@ -2315,9 +2315,14 @@
         // media renders PROGRESSIVELY while loading (no opacity gate): a
         // progressive JPEG paints blurry-then-sharp on its own — a real
         // blur-up with zero extra requests (hosts offer no tiny-image URLs)
-        // one-shot fade-in on every cell build (cached loads too): the
-        // grid always shows motion; shimmer still runs behind while loading
-        '.xft-cell img,.xft-cell video,.xft-cell .xft-vtile{animation:xft-pop .3s ease-out both}',
+        // reveal-on-load (lazy-load style): while an image streams, it stays
+        // hidden inside its shimmer skeleton (no progressive part-by-part
+        // painting); when it loads, it fades in sharp as a whole. Cached
+        // images are already .xft-ok at build → render instantly.
+        '.xft-cell img,.xft-vthumb img,.xft-vslot img{opacity:0;filter:blur(6px);transition:opacity .35s ease,filter .35s ease}',
+        '.xft-cell img.xft-ok,.xft-vthumb img.xft-ok,.xft-vslot img.xft-ok{opacity:1;filter:blur(0)}',
+        // tiles and video thumbs still pop on build (no progressive paint)
+        '.xft-cell video,.xft-cell .xft-vtile{animation:xft-pop .3s ease-out both}',
         // skeleton: bright sweeping band + soft breathing base — strong
         // enough to read as animation, not a static tint
         '.xft-cell.xft-loading,.xft-vslot.xft-loading,.xft-embed-host.xft-loading{animation:xft-skel-pulse 1.6s ease-in-out infinite}',
@@ -2330,7 +2335,7 @@
         // source order wins)
         '.xft-cell.xft-out{animation:xft-out .22s ease-in both;pointer-events:none}',
         '@keyframes xft-out{to{opacity:0;transform:scale(.9)}}',
-        '@media (prefers-reduced-motion: reduce){html:not(.xft-anim-force) .xft-cell.xft-loading::after,html:not(.xft-anim-force) .xft-vslot.xft-loading::after,html:not(.xft-anim-force) .xft-embed-host.xft-loading::after{animation:none}html:not(.xft-anim-force) .xft-cell.xft-loading,html:not(.xft-anim-force) .xft-vslot.xft-loading,html:not(.xft-anim-force) .xft-embed-host.xft-loading{animation:none}html:not(.xft-anim-force) .xft-cell img,html:not(.xft-anim-force) .xft-cell video,html:not(.xft-anim-force) .xft-cell .xft-vtile{animation:none}html:not(.xft-anim-force) .xft-spinner,html:not(.xft-anim-force) #xft-viewer,html:not(.xft-anim-force) .xft-settings,html:not(.xft-anim-force) .xft-cell.xft-out{animation:none}}',
+        '@media (prefers-reduced-motion: reduce){html:not(.xft-anim-force) .xft-cell.xft-loading::after,html:not(.xft-anim-force) .xft-vslot.xft-loading::after,html:not(.xft-anim-force) .xft-embed-host.xft-loading::after{animation:none}html:not(.xft-anim-force) .xft-cell.xft-loading,html:not(.xft-anim-force) .xft-vslot.xft-loading,html:not(.xft-anim-force) .xft-embed-host.xft-loading{animation:none}html:not(.xft-anim-force) .xft-cell img,html:not(.xft-anim-force) .xft-cell video,html:not(.xft-anim-force) .xft-cell .xft-vtile{animation:none;transition:none}html:not(.xft-anim-force) .xft-vthumb img,html:not(.xft-anim-force) .xft-vslot img{transition:none}html:not(.xft-anim-force) .xft-spinner,html:not(.xft-anim-force) #xft-viewer,html:not(.xft-anim-force) .xft-settings,html:not(.xft-anim-force) .xft-cell.xft-out{animation:none}}',
         // embed viewer box is sized BEFORE the video arrives (sign round-trip
         // + metadata load would otherwise grow the box from zero and pop)
         '.xft-embed-host{position:relative;display:flex;align-items:center;justify-content:center;width:min(92vw,1120px);aspect-ratio:16/9;max-height:80vh;border-radius:calc(var(--xft-radius) - 2px);background:#000;overflow:hidden}',
