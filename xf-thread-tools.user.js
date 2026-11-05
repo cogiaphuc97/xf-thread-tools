@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         xf-thread-tools
 // @namespace    xf-thread-tools
-// @version      0.7.45
+// @version      0.7.46
 // @description  XenForo 2: sort thread posts by reaction count across all pages (cached) + floating media panel (images / external links).
 // @author       xf-thread-tools
 // @match        *://*/threads/*
@@ -1174,6 +1174,68 @@
     // image loads mid-flight and leave blank cells. Cleared whenever the
     // item list itself changes identity (tab/sub-tab/search/filter/refresh).
     const vrowCache = new Map();
+    // lazy cell fill: every media row mounts as a cheap SHELL (aspect-ratio
+    // placeholder cells — exact height, no media, no events) and one shared
+    // IntersectionObserver fills it the first time it approaches the viewport.
+    // Filled rows stay mounted forever; nothing is ever evicted, so no scroll
+    // math of any kind is needed. The observer holds STRONG refs to targets —
+    // anything detached from the cache must be unobserved or it leaks.
+    let rowFillObserver = null;
+    let gridItems = []; // current render's item list (fill resolves indices against it)
+    function ensureRowFillObserver() {
+      if (rowFillObserver) return rowFillObserver;
+      rowFillObserver = new IntersectionObserver((ents) => {
+        for (const en of ents) {
+          if (!en.isIntersecting) continue;
+          rowFillObserver.unobserve(en.target);
+          fillRowShell(en.target);
+        }
+      }, { root: panelBodyEl, rootMargin: '1600px 0px' });
+      return rowFillObserver;
+    }
+    // build a row's real cells the first time it nears the viewport. The
+    // entry is recovered from the row's own signature (r<first>:<len>) and
+    // resolved against the CURRENT gridItems — sig match guarantees the
+    // indices point at the same items the row was built for.
+    function fillRowShell(rowEl) {
+      if (rowEl.dataset.xftFilled) return;
+      const m = (rowEl.dataset.xftSig || '').match(/^r(\d+):(\d+)$/);
+      if (!m) return;
+      rowEl.dataset.xftFilled = '1';
+      const first = +m[1];
+      rowEl.textContent = '';
+      for (let k = 0; k < +m[2]; k++) {
+        const i = first + k;
+        const it = gridItems[i];
+        if (!it) continue;
+        const cell = document.createElement('div');
+        cell.className = 'xft-cell';
+        cell.title = '[#' + it.pos + '] ' + (it.r.author || '?') + ' — open';
+        const isVideo = it.kind === 'video' || it.kind === 'embed';
+        const thumb = buildMediaEl(it.kind, it.url, true);
+        // shimmer while the media loads (cached-complete images come back
+        // already ok'd — no flash for them)
+        if ((it.kind === 'image' || it.kind === 'embed')
+          && !(thumb.tagName === 'IMG' && thumb.classList.contains('xft-ok'))) cell.classList.add('xft-loading');
+        const label = document.createElement('span');
+        label.className = 'xft-cell-label';
+        label.textContent = '#' + it.pos + ' ' + (it.r.author || '?');
+        cell.append(thumb, label);
+        if (isVideo) {
+          const badge = document.createElement('span');
+          badge.className = 'xft-cell-badge';
+          badge.textContent = '▶';
+          cell.appendChild(badge);
+        }
+        cell.addEventListener('click', () => openViewerAt(i));
+        rowEl.appendChild(cell);
+      }
+      // feed the measured height back as the intrinsic fallback for rows
+      // that have never been laid out (--xft-rowh) — content-visibility then
+      // estimates scroll height with real pixels, not a guess
+      const h = Math.round(rowEl.getBoundingClientRect().height);
+      if (h > 50 && panelBodyEl) panelBodyEl.style.setProperty('--xft-rowh', h + 'px');
+    }
     // clearing the MAP alone leaves the row ELEMENTS in the DOM as orphans —
     // after a Refresh they keep showing pre-refresh cells (short/blank rows
     // mid-grid). Always detach on clear.
@@ -1183,6 +1245,7 @@
       // would then "keep" a zero position (the list jumps to the top on
       // every broken-item rerender)
       if (panelBodyEl && vScrollKeep === null) vScrollKeep = panelBodyEl.scrollTop;
+      if (rowFillObserver) for (const el of vrowCache.values()) rowFillObserver.unobserve(el);
       for (const el of vrowCache.values()) el.remove();
       vrowCache.clear();
       // cleared rows MUST rebuild: with the signature intact, renderPanelBody
@@ -2311,26 +2374,28 @@
       // swaps in ONE mutation and the scroll survives natively.
       const frag = document.createDocumentFragment();
       if (panelTab === 'media') {
-        // FULL render, no window virtualizer: every row lives in the DOM and
-        // loading=lazy defers the bytes. The old machinery (spacer pads,
-        // pitch math, row eviction, range re-render, content-visibility
-        // estimates) is where the bottom push-back, stale-row and
-        // vanish-on-scroll bugs all lived — content-visibility estimates
-        // drift from real row heights and re-introduce native clamp
-        // push-back, so even that is gone. Plain in-flow rows have exact
-        // heights from aspect-ratio cells; the browser skips offscreen
-        // paint on its own.
+        // Shell grid: every row mounts NOW as a cheap placeholder (exact
+        // height via aspect-ratio shell cells), cells fill on viewport
+        // approach (IntersectionObserver), filled rows are never evicted and
+        // reused by signature on rebuilds. No spacer pads, no range windows,
+        // no pitch math — heights are exact, so nothing fights the scroll.
+        // content-visibility skips offscreen layout/paint; its intrinsic
+        // fallback is the MEASURED row height (--xft-rowh), not a guess.
         const vrows = document.createElement('div');
         vrows.className = 'xft-vrows';
         const builtLayout = buildMediaLayout(items, settings.mediaGroup);
+        gridItems = items;
+        const fillObs = ensureRowFillObserver();
         for (let r = 0; r < builtLayout.length; r++) {
           const e = builtLayout[r];
           // entry signature: a row cached while the list was SHORTER (or a
           // header whose group moved) must rebuild — sig match = reuse the
-          // existing element (imgs never reload on rebuild)
+          // existing element (filled rows keep their imgs, shells stay
+          // observed; nothing ever reloads on rebuild)
           const esig = e.idxs ? 'r' + e.idxs[0] + ':' + e.idxs.length : 'h' + e.hdr + ':' + e.label;
           let rowEl = vrowCache.get(r);
           if (rowEl && rowEl.dataset.xftSig !== esig) {
+            if (rowFillObserver) rowFillObserver.unobserve(rowEl);
             rowEl.remove();
             vrowCache.delete(r);
             rowEl = null;
@@ -2342,30 +2407,12 @@
               // removal wave just animated cells out — rebuilt rows must not
               // pop back in or the whole grid flashes
               if (performance.now() < popSuppressUntil) rowEl.classList.add('xft-nopop');
-              for (const i of e.idxs) {
-                const it = items[i];
-                const cell = document.createElement('div');
-                cell.className = 'xft-cell';
-                cell.title = '[#' + it.pos + '] ' + (it.r.author || '?') + ' — open';
-                const isVideo = it.kind === 'video' || it.kind === 'embed';
-                const thumb = buildMediaEl(it.kind, it.url, true);
-                // shimmer while the media loads (cached-complete images come
-                // back already ok'd — no flash for them)
-                if ((it.kind === 'image' || it.kind === 'embed')
-                  && !(thumb.tagName === 'IMG' && thumb.classList.contains('xft-ok'))) cell.classList.add('xft-loading');
-                const label = document.createElement('span');
-                label.className = 'xft-cell-label';
-                label.textContent = '#' + it.pos + ' ' + (it.r.author || '?');
-                cell.append(thumb, label);
-                if (isVideo) {
-                  const badge = document.createElement('span');
-                  badge.className = 'xft-cell-badge';
-                  badge.textContent = '▶';
-                  cell.appendChild(badge);
-                }
-                cell.addEventListener('click', () => openViewerAt(i));
-                rowEl.appendChild(cell);
+              for (let k = 0; k < e.idxs.length; k++) {
+                const sh = document.createElement('div');
+                sh.className = 'xft-cell xft-cellshell';
+                rowEl.appendChild(sh);
               }
+              fillObs.observe(rowEl);
             } else {
               rowEl = document.createElement('div');
               rowEl.className = 'xft-ghead' + (e.hdr === 'sub' ? ' xft-gsub' : '');
@@ -2919,7 +2966,8 @@
         '.xft-body::-webkit-scrollbar-thumb{background:hsl(var(--xft-muted));border-radius:4px}',
         '.xft-grid{display:grid;grid-template-columns:repeat(4,1fr);gap:6px}',
         '.xft-vrows{display:flex;flex-direction:column;gap:6px}',
-        '.xft-vrow{display:grid;grid-template-columns:repeat(4,1fr);gap:6px}',
+        '.xft-vrow{display:grid;grid-template-columns:repeat(4,1fr);gap:6px;content-visibility:auto;contain-intrinsic-size:auto var(--xft-rowh,140px)}',
+        '.xft-cellshell{aspect-ratio:1;border:1px solid hsl(var(--xft-border));border-radius:calc(var(--xft-radius) - 2px);background:hsl(var(--xft-muted))}',
         '.xft-cell{position:relative;aspect-ratio:1;overflow:hidden;border:1px solid hsl(var(--xft-border));border-radius:calc(var(--xft-radius) - 2px);cursor:zoom-in;background:hsl(var(--xft-muted));padding:0;transition:box-shadow .15s}',
         '.xft-cell:hover{box-shadow:0 0 0 2px hsl(var(--xft-ring)/.35)}',
         '.xft-cell img,.xft-cell video{width:100%;height:100%;object-fit:cover;display:block}',
