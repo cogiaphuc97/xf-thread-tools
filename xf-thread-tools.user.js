@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         xf-thread-tools
 // @namespace    xf-thread-tools
-// @version      0.7.47
+// @version      0.7.48
 // @description  XenForo 2: sort thread posts by reaction count across all pages (cached) + floating media panel (images / external links).
 // @author       xf-thread-tools
 // @match        *://*/threads/*
@@ -188,6 +188,45 @@
     if (!t) return (tag || 'thread') + '.zip';
     return '[' + (tag || 'Site') + '] ' + t + '.zip';
   }
+  // Image-page resolution: some hosts embed a RE-ENCODED copy (random uuid,
+  // /th/ directory, ...) while the original full-quality file is only linked
+  // from the image's own landing page (/img/<short-id>, no extension). The
+  // landing href is captured at extraction; the page is fetched and parsed
+  // for its direct-image carriers when quality matters (viewer, downloads).
+  function imagePageHref(href) {
+    try {
+      const u = new URL(String(href || ''), 'https://x.invalid');
+      if (!/^https?:$/.test(u.protocol)) return '';
+      if (!/^\/img\/[A-Za-z0-9_-]{3,12}$/.test(u.pathname)) return '';
+      return u.origin + u.pathname;
+    } catch (e) { return ''; }
+  }
+  // Ordered direct-image candidates from a landing page's HTML, by carrier
+  // trust: meta-refresh redirect > og:image/twitter:image > <img src> > <a>
+  // links. Signed URLs (?s=…) keep their query verbatim.
+  function parseImagePage(html) {
+    const h = String(html || '');
+    if (!h) return [];
+    const out = [];
+    const unesc = (s) => s.replace(/\\\//g, '/').replace(/&amp;/g, '&').replace(/&quot;/g, '"');
+    const IMG_EXT = /\.(jpe?g|png|webp|gif|avif)([?#]|$)/i;
+    const push = (s) => {
+      const t = unesc(String(s || '')).trim();
+      if (/^https?:\/\//i.test(t) && IMG_EXT.test(t) && out.indexOf(t) === -1) out.push(t);
+    };
+    const rf = h.match(/<meta[^>]+http-equiv=["']?refresh["']?[^>]+content=["'][^"']*url=([^"']+)["']/i)
+      || h.match(/<meta[^>]+content=["'][^"']*url=([^"']+)["'][^>]+http-equiv=["']?refresh["']?/i);
+    if (rf) push(rf[1]);
+    const ogs = h.matchAll(/<meta[^>]+(?:property|name)=["'](?:og:image(?::secure_url)?|twitter:image(?::src)?)["'][^>]+content=["']([^"']+)["']/gi);
+    for (const m of ogs) push(m[1]);
+    const ogs2 = h.matchAll(/<meta[^>]+content=["']([^"']+)["'][^>]+(?:property|name)=["'](?:og:image(?::secure_url)?|twitter:image(?::src)?)["']/gi);
+    for (const m of ogs2) push(m[1]);
+    const imgs = h.matchAll(/<img[^>]+src=["'](https?:\/\/[^"']+)["']/gi);
+    for (const m of imgs) push(m[1]);
+    const links = h.matchAll(/<a[^>]+href=["'](https?:\/\/[^"']+)["']/gi);
+    for (const m of links) push(m[1]);
+    return out;
+  }
   function dlBasename(url, kind, idx) {
     let b = '';
     try { b = new URL(url).pathname.split('/').filter(Boolean).pop() || ''; } catch (e) { /* keep '' */ }
@@ -233,9 +272,15 @@
       if (!base || seen.has(base)) continue;
       seen.add(base);
       const cands = it.kind === 'image' ? hqCandidates(base) : [base];
+      // landing-page HQ: when the URL carries no static marker chain (no
+      // .md/.th), the only full-quality source is the image's own page
+      const page = it.kind === 'image' && cands.length === 1
+        ? imagePageHref((it.r && it.r.imgPages && it.r.imgPages[base]) || '')
+        : '';
       jobs.push({
         cands: cands,
         kind: it.kind,
+        page: page,
         name: String(jobs.length + 1).padStart(3, '0') + '_' + dlBasename(cands[0], isVid ? 'video' : it.kind, jobs.length)
       });
     }
@@ -651,6 +696,7 @@
       const images = [];
       const videos = [];
       const embeds = [];
+      const imgPages = {}; // embeddedUrl -> image landing page (/img/<id>)
       // Quoted content is a COPY of another post's media/links — collect only
       // what THIS post authored (probe 2026-10-29: 9 of 19 bbImage were inside
       // blockquote.bbCodeBlock--quote on a live page). Signature content is
@@ -673,7 +719,15 @@
           if (/^(data|blob):/i.test(s)) {
             s = im.getAttribute('data-src') || im.getAttribute('data-url') || im.getAttribute('data-lazy-src') || '';
           }
-          if (s && !isSmilieUrl(s)) images.push(absolutize(s));
+          if (s && !isSmilieUrl(s)) {
+            const abs = absolutize(s);
+            images.push(abs);
+            // a wrapper anchor to the image's own landing page is the only
+            // route to the full-quality original for re-encoded embeds
+            const wrapA = im.closest('a[href]');
+            const page = wrapA ? imagePageHref(wrapA.getAttribute('href') || '') : '';
+            if (page) imgPages[abs] = page;
+          }
         });
         // HTML5 videos: <video class="videotag"><source src> (site media threads)
         body.querySelectorAll('video').forEach((v) => {
@@ -724,7 +778,8 @@
         links: filterLinks(parts.links, location.host).filter((u) => !imgSet.has(u) && !vidSet.has(u) && !embSet.has(u)),
         images: Array.from(new Set(images.filter(Boolean))),
         videos: Array.from(new Set(videos.filter(Boolean))),
-        embeds: Array.from(new Set(embeds.filter(Boolean)))
+        embeds: Array.from(new Set(embeds.filter(Boolean))),
+        imgPages: Object.keys(imgPages).length ? imgPages : undefined // old records: undefined
       };
     }
 
@@ -1513,6 +1568,31 @@
         resolveViaPage();
       }
     }
+    // Image landing pages (/img/<id>): the embed is a re-encoded copy (random
+    // uuid / /th/ thumb) and the full-quality original — often a signed URL —
+    // is only referenced by the page. Cached per page URL; '' = dead page.
+    const imgPageCache = new Map();
+    const imgPageInflight = new Map();
+    function resolveImagePage(pageUrl, embedded, cb) {
+      const c = imgPageCache.get(pageUrl);
+      if (c !== undefined) { cb(c && c !== embedded ? c : ''); return; }
+      if (imgPageInflight.has(pageUrl)) { imgPageInflight.get(pageUrl).push(cb); return; }
+      const queue = [cb];
+      imgPageInflight.set(pageUrl, queue);
+      const finish = (hit) => {
+        imgPageCache.set(pageUrl, hit);
+        imgPageInflight.delete(pageUrl);
+        for (const fn of queue) fn(hit);
+      };
+      gmGetText(pageUrl, (text) => {
+        const cands = parseImagePage(text);
+        let hit = '';
+        for (const u of cands) {
+          if (u !== embedded) { hit = u; break; } // first candidate that is not the embedded copy
+        }
+        finish(hit);
+      }, () => finish(''));
+    }
     let settingsView = null;
     let panelTab = 'files';
     let panelSubTab = 'all';        // media sub-tab: all | image | video
@@ -1776,6 +1856,14 @@
         dlRun.fail++;
         dlAfter(release);
       };
+      if (job.page) {
+        // landing-page HQ: resolve the original, fall back to the embedded
+        resolveImagePage(job.page, job.cands[0], (full) => {
+          if (dlRun.cancel) { release(); return; }
+          dlFetch(full || job.cands[ci], settle, dlByte);
+        });
+        return;
+      }
       if (job.kind === 'embed') {
         // player tiles: resolve to the direct stream (sign endpoint or
         // file-page carrier), then fetch the bytes. Resolution shares the
@@ -1922,7 +2010,7 @@
     // extension-based classification cannot know a URL's real bytes (video
     // links without .mp4 extensions exist); if the video also fails, the
     // element is marked .xft-broken.
-    function buildMediaEl(kind, url, thumb) {
+    function buildMediaEl(kind, url, thumb, pageUrl) {
       if (kind === 'embed') {
         // Embed thumbs: base no-fetch tile (hosts rate-limit, some embeds
         // autostart); the poster — parsed from the embed page's og:image —
@@ -2037,6 +2125,14 @@
         hqStage.set(url, i);
         im.src = cands[i];
       };
+      // full-quality upgrade for the VIEWER (thumbs stay on the embedded
+      // copy — one landing-page fetch per click, not per cell): when there
+      // is no static marker chain, the landing page is the only HQ source
+      if (!thumb && pageUrl && cands.length === 1) {
+        resolveImagePage(pageUrl, url, (full) => {
+          if (full && im.isConnected) im.src = full; // reveal gate covers the swap
+        });
+      }
       im.addEventListener('error', function onErr() {
         // HQ candidates first: a transient failure (rate-limit burst) gets ONE
         // delayed retry — the gate keeps a src-less/failed img invisible, so
@@ -2170,7 +2266,7 @@
       const v = document.createElement('div');
       v.id = 'xft-viewer';
       if (!nav) v.classList.add('xft-vwin'); // animate only a fresh open
-      const media = buildMediaEl(it.kind, it.url, false);
+      const media = buildMediaEl(it.kind, it.url, false, it.page || '');
       // every viewer media sits in a FIXED-HEIGHT stage so paging next/prev
       // never shifts the bar/filmstrip; the slot inside is sized to the
       // image's own aspect once loaded (small images upscale to fill)
@@ -2376,7 +2472,7 @@
         mediaCounts = m.mediaCounts;
         updateSubTabCounts(mediaCounts);
         items = m.items;
-        viewerItems = items.map((it) => ({ kind: it.kind, url: it.url, postId: it.r.postId, pos: it.pos, author: it.r.author }));
+        viewerItems = items.map((it) => ({ kind: it.kind, url: it.url, postId: it.r.postId, pos: it.pos, author: it.r.author, page: (it.r.imgPages || {})[it.url] || '' }));
       } else {
         for (const r of pd.orderedShown) {
           for (const url of r.links) if (!boiler.has(url)) items.push({ r: r, url: url, pos: pd.posMap.get(r.postId) || 0, kind: 'link' });
@@ -3191,5 +3287,5 @@
   }
 
   // UMD export of the pure functions for node:test (no DOM / GM usage in them).
-  if (typeof module !== 'undefined' && module.exports) module.exports = { parseReactionCount, filterLinks, sortPosts, estimateSize, partitionLinks, extractDomain, groupLinkItems, applyLinkFilters, boilerplateUrls, isSmilieUrl, parseEmbedPoster, embedSignUrl, parseSignResponse, parseSignToken, parseVideoPage, isVideoPageUrl, hqCandidates, sanitizeFileSeg, siteTagFromHost, cleanThreadTitle, zipFileName, dlBasename, buildDlJobs, crc32, zipStoreU8 };
+  if (typeof module !== 'undefined' && module.exports) module.exports = { parseReactionCount, filterLinks, sortPosts, estimateSize, partitionLinks, extractDomain, groupLinkItems, applyLinkFilters, boilerplateUrls, isSmilieUrl, parseEmbedPoster, embedSignUrl, parseSignResponse, parseSignToken, parseVideoPage, isVideoPageUrl, hqCandidates, sanitizeFileSeg, siteTagFromHost, cleanThreadTitle, zipFileName, imagePageHref, parseImagePage, dlBasename, buildDlJobs, crc32, zipStoreU8 };
 })();

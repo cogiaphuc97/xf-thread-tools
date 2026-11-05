@@ -8,7 +8,7 @@ import path from 'node:path';
 
 const require = createRequire(import.meta.url);
 const userJsPath = path.join(path.dirname(fileURLToPath(import.meta.url)), '..', 'xf-thread-tools.user.js');
-const { parseReactionCount, filterLinks, sortPosts, estimateSize, partitionLinks, extractDomain, groupLinkItems, applyLinkFilters, boilerplateUrls, isSmilieUrl, parseEmbedPoster, embedSignUrl, parseSignResponse, parseSignToken, parseVideoPage, isVideoPageUrl, hqCandidates, sanitizeFileSeg, siteTagFromHost, cleanThreadTitle, zipFileName, dlBasename, buildDlJobs, crc32, zipStoreU8 } = require(userJsPath);
+const { parseReactionCount, filterLinks, sortPosts, estimateSize, partitionLinks, extractDomain, groupLinkItems, applyLinkFilters, boilerplateUrls, isSmilieUrl, parseEmbedPoster, embedSignUrl, parseSignResponse, parseSignToken, parseVideoPage, isVideoPageUrl, hqCandidates, imagePageHref, parseImagePage, sanitizeFileSeg, siteTagFromHost, cleanThreadTitle, zipFileName, dlBasename, buildDlJobs, crc32, zipStoreU8 } = require(userJsPath);
 
 test('UMD export exposes the four pure functions', () => {
   assert.equal(typeof parseReactionCount, 'function');
@@ -391,6 +391,45 @@ test('zipFileName: Vietnamese + spaces kept, [tag] groups and forum suffix strip
   assert.equal(zipFileName('Xamvn', 'Kit RAM DDR5 6000 tối ưu'), '[Xamvn] Kit RAM DDR5 6000 tối ưu.zip');
   assert.equal(zipFileName('Voz', '[Ảnh]TITLE | VOZ Forums'), '[Voz] TITLE.zip');
   assert.equal(zipFileName('', ''), 'thread.zip');
+});
+
+test('imagePageHref: /img/<short-id> landing shape only', () => {
+  assert.equal(imagePageHref('https://host.test/img/t5kZz2y'), 'https://host.test/img/t5kZz2y');
+  assert.equal(imagePageHref('/img/abc12'), 'https://x.invalid/img/abc12'); // resolved against base
+  assert.equal(imagePageHref('https://host.test/img/has-extension.jpg'), ''); // direct file, not a page
+  assert.equal(imagePageHref('https://host.test/gallery/t5kZz2y'), '');
+  assert.equal(imagePageHref('https://host.test/img/' + 'x'.repeat(13)), ''); // too long = not the shape
+  assert.equal(imagePageHref(''), '');
+});
+
+test('parseImagePage: direct-image carriers in priority order', () => {
+  // og:image wins; signed query kept verbatim
+  const og = parseImagePage('<meta property="og:image" content="https://cdn.test/panda/UUID.jpg?s=SIG123"><img src="https://cdn.test/th/UUID2.jpg">');
+  assert.equal(og[0], 'https://cdn.test/panda/UUID.jpg?s=SIG123');
+  assert.ok(og.length >= 2); // the page's own <img> is a later candidate
+  // meta refresh redirect
+  assert.equal(parseImagePage('<meta http-equiv="refresh" content="0;url=https://cdn.test/direct/UUID.png">')[0], 'https://cdn.test/direct/UUID.png');
+  // twitter:image before plain imgs
+  const tw = parseImagePage('<meta name="twitter:image:src" content="https://cdn.test/tw/UUID.webp"><img src="https://cdn.test/a.jpg"><img src="https://cdn.test/b.jpg">');
+  assert.equal(tw[0], 'https://cdn.test/tw/UUID.webp');
+  assert.equal(tw.length, 3);
+  // non-image and relative URLs dropped; duplicates deduped
+  assert.deepEqual(parseImagePage('<img src="/relative.jpg"><a href="https://x.test/page">link</a><img src="https://cdn.test/a.jpg"><img src="https://cdn.test/a.jpg">'), ['https://cdn.test/a.jpg']);
+  assert.deepEqual(parseImagePage(''), []);
+  assert.deepEqual(parseImagePage('<html>no media here</html>'), []);
+});
+
+test('buildDlJobs: landing page attached for chain-less images only', () => {
+  const rec = { imgPages: { 'https://cdn.test/uuid.jpg': 'https://host.test/img/t5kZz2y' } };
+  const jobs = buildDlJobs([
+    { kind: 'image', url: 'https://cdn.test/uuid.jpg', r: rec },            // page job
+    { kind: 'image', url: 'https://cdn.test/x.md.jpg', r: rec },             // marker chain wins
+    { kind: 'image', url: 'https://cdn.test/plain.jpg', r: {} }              // no page recorded
+  ]).jobs;
+  assert.equal(jobs[0].page, 'https://host.test/img/t5kZz2y');
+  assert.equal(jobs[1].page, ''); // .md chain present — no page fetch
+  assert.equal(jobs[2].page, '');
+  assert.deepEqual(jobs[1].cands, ['https://cdn.test/x.jpg', 'https://cdn.test/x.md.jpg']);
 });
 
 test('buildDlJobs: HQ chain wiring, dedupe, embed jobs, hash strip, seq names', () => {
