@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         xf-thread-tools
 // @namespace    xf-thread-tools
-// @version      0.7.49
+// @version      0.7.50
 // @description  XenForo 2: sort thread posts by reaction count across all pages (cached) + floating media panel (images / external links).
 // @author       xf-thread-tools
 // @match        *://*/threads/*
@@ -1267,7 +1267,7 @@
       cell.dataset.xftUrl = it.url;
       cell.title = '[#' + it.pos + '] ' + (it.r.author || '?') + ' — open';
       const isVideo = it.kind === 'video' || it.kind === 'embed';
-      const thumb = buildMediaEl(it.kind, it.url, true);
+      const thumb = buildMediaEl(it.kind, it.url, true, (it.r.imgPages || {})[it.url] || '');
       // shimmer while the media loads (cached-complete images come back
       // already ok'd — no flash for them)
       if ((it.kind === 'image' || it.kind === 'embed')
@@ -1584,6 +1584,26 @@
     // is only referenced by the page. Cached per page URL; '' = dead page.
     const imgPageCache = new Map();
     const imgPageInflight = new Map();
+    // landing-page/API fetches run serialized (2 concurrent, 350ms apart) —
+    // scrolling a dense grid resolves one page per cell and a burst would
+    // trip the host's challenge, the same lesson the poster queue learned
+    const imgPageNet = { active: 0, queue: [], last: 0 };
+    function runImgPageNet(job) {
+      imgPageNet.queue.push(job);
+      pumpImgPageNet();
+    }
+    function pumpImgPageNet() {
+      if (imgPageNet.active >= 2 || !imgPageNet.queue.length) return;
+      const job = imgPageNet.queue.shift();
+      imgPageNet.active++;
+      const now = Date.now();
+      const wait = Math.max(0, imgPageNet.last + 350 - now);
+      imgPageNet.last = now + wait;
+      setTimeout(() => job(() => { imgPageNet.active--; pumpImgPageNet(); }), wait);
+    }
+    function imgPageGet(url, onOk, onErr) {
+      runImgPageNet((done) => gmGetText(url, (t) => { onOk(t); done(); }, () => { onErr(); done(); }));
+    }
     function resolveImagePage(pageUrl, embedded, cb) {
       const c = imgPageCache.get(pageUrl);
       if (c !== undefined) { cb(c && c !== embedded ? c : ''); return; }
@@ -1600,7 +1620,7 @@
       let api = '';
       try { const u = new URL(pageUrl); api = u.origin + '/api/images/' + u.pathname.split('/').pop(); } catch (e) { /* keep '' */ }
       // route 2: the landing page HTML itself (og:image / img / link carriers)
-      const viaPage = () => gmGetText(pageUrl, (text) => {
+      const viaPage = () => imgPageGet(pageUrl, (text) => {
         const cands = parseImagePage(text);
         let hit = '';
         for (const u of cands) {
@@ -1609,7 +1629,7 @@
         finish(hit);
       }, () => finish(''));
       if (api) {
-        gmGetText(api, (text) => {
+        imgPageGet(api, (text) => {
           const hit = parseImageApiResponse(text);
           if (hit) finish(hit); else viaPage();
         }, viaPage);
@@ -2147,14 +2167,6 @@
         hqStage.set(url, i);
         im.src = cands[i];
       };
-      // full-quality upgrade for the VIEWER (thumbs stay on the embedded
-      // copy — one landing-page fetch per click, not per cell): when there
-      // is no static marker chain, the landing page is the only HQ source
-      if (!thumb && pageUrl && cands.length === 1) {
-        resolveImagePage(pageUrl, url, (full) => {
-          if (full && im.isConnected) im.src = full; // reveal gate covers the swap
-        });
-      }
       im.addEventListener('error', function onErr() {
         // HQ candidates first: a transient failure (rate-limit burst) gets ONE
         // delayed retry — the gate keeps a src-less/failed img invisible, so
@@ -2185,6 +2197,17 @@
         setTimeout(() => { if (v.readyState === 0) markMediaBroken(v, url); }, 6000);
       });
       setStage(ci);
+      // full-quality upgrade for CELLS and the VIEWER: the embedded copy
+      // renders instantly, then swaps to the original once the landing page
+      // resolves. The browser keeps the old pixels until the new image
+      // decodes, so the swap is seamless. Must run AFTER setStage — a cache
+      // hit fires synchronously and setStage's src write would overwrite it.
+      // Skipped when a static marker chain exists (.md/.th win, cheaper).
+      if (pageUrl && cands.length === 1) {
+        resolveImagePage(pageUrl, url, (full) => {
+          if (full && im.src !== full) im.src = full;
+        });
+      }
       // A failure cached by Chrome replays instantly with NO error event, and
       // 1×1 placeholders (svg data-URIs, hotlink-block pixels) "load" as a
       // single stretched pixel = a blank cell. nw<=1 + complete = dead either
