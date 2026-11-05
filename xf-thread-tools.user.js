@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         xf-thread-tools
 // @namespace    xf-thread-tools
-// @version      0.7.44
+// @version      0.7.45
 // @description  XenForo 2: sort thread posts by reaction count across all pages (cached) + floating media panel (images / external links).
 // @author       xf-thread-tools
 // @match        *://*/threads/*
@@ -1162,8 +1162,6 @@
     let panelCountEl = null;
     let panelCancelBtn = null;
     let panelRefreshBtn = null;
-    let vScrollRaf = 0;
-    let vResizeObserver = null;
     let noteEl = null;
     let tabFilesBtn = null;
     let tabLinksBtn = null;
@@ -1185,11 +1183,6 @@
       // would then "keep" a zero position (the list jumps to the top on
       // every broken-item rerender)
       if (panelBodyEl && vScrollKeep === null) vScrollKeep = panelBodyEl.scrollTop;
-      // also stash an ITEM anchor: a numeric scrollTop goes stale the moment
-      // a removal rebuild drops rows ABOVE the viewport — the clamp then
-      // pulls the view back (the bottom push-back). The anchor is restored
-      // to the first visible item's NEW offset after the rebuild.
-      if (panelBodyEl && vAnchorKeep === null) vAnchorKeep = captureScrollAnchor(panelBodyEl.scrollTop);
       for (const el of vrowCache.values()) el.remove();
       vrowCache.clear();
       // cleared rows MUST rebuild: with the signature intact, renderPanelBody
@@ -1198,39 +1191,6 @@
       // refetched data has the same shape)
       lastPanelSignature = '';
     }
-    // first visible media item + pixel offset inside its row (null when no
-    // grid is mounted). Used by clearVRows and the rebuild path.
-    let vAnchorKeep = null;
-    function captureScrollAnchor(st) {
-      if (!vGrid || !vGrid.topPad || !vGrid.topPad.isConnected || !vGrid.items.length || !vGrid.layout.length) return null;
-      try {
-        const topsA = layoutTops(vGrid.layout, vRowHMeasured || gridRowH());
-        let lo = 0, hi = vGrid.layout.length;
-        while (lo < hi) { const mid = (lo + hi) >> 1; if (topsA[mid + 1] > st) hi = mid; else lo = mid + 1; }
-        // the search can land on a group HEADER (no idxs) — anchor to the
-        // first media ROW at/after it, or the header's offset is measured
-        // against the wrong entry height
-        while (lo < vGrid.layout.length && !vGrid.layout[lo].idxs) lo += 1;
-        const ent = vGrid.layout[lo];
-        if (ent && ent.idxs && vGrid.items[ent.idxs[0]]) return { url: vGrid.items[ent.idxs[0]].url, off: Math.max(0, st - topsA[lo]), top: topsA[lo] };
-      } catch (e) { /* anchor is best-effort — numeric fallback stands */ }
-      return null;
-    }
-    // top offset of the entry (row) containing an item URL, or null
-    function entryTopFor(url, items, lay, pitch) {
-      const idx = items.findIndex((it) => it.url === url);
-      if (idx < 0) return null;
-      const tops = layoutTops(lay, pitch);
-      for (let k = 0; k < lay.length; k++) {
-        const en = lay[k];
-        if (!en.idxs) continue;
-        if (en.idxs[0] > idx) return null;
-        if (idx <= en.idxs[en.idxs.length - 1]) return tops[k];
-      }
-      return null;
-    }
-    let vRowHMeasured = 0;
-    let vGrid = null; // live media-grid state {topPad,vrows,bottomPad,items,identity,renderRange}
     // Smilies/stickers rehosted on image hosts carry NO url/class marker —
     // only their size gives them away (measured: forum smilies 24px, imgur
     // stickers 50–129px incl. animated gifs, real photos 320px+). Detected at
@@ -1255,15 +1215,12 @@
       if (brokenRerenderTimer) return;
       brokenRerenderTimer = setTimeout(() => {
         brokenRerenderTimer = null;
-        // a rebuild mid-wheel is what made the bottom of the list fight the
-        // user (restore yanked scrollTop while they scrolled) — hold the
-        // removal wave until the wheel stream pauses
+        // hold the removal wave while the user is mid-scroll — a swap under
+        // an active scroller is jarring even with row anchoring
         if (performance.now() - lastUserScrollAt < 300) { scheduleBrokenRerender(); return; }
-        // NO clearVRows/teardown: detaching every row collapses the content
-        // height for a frame, the clamp pulls the view back, and the swap
-        // below re-clamps again — the push-back. Sig-based rows make the
-        // teardown unnecessary: reset the signature and let renderPanelBody
-        // take the growth path (re-point items/layout, re-range in place).
+        // no teardown: reset the signature and let renderPanelBody rebuild —
+        // sig-matching rows are reused as-is (imgs never reload), removed
+        // items' rows rebuild, and the row anchor keeps the viewport steady
         lastPanelSignature = '';
         schedulePanelRender();
       }, 300);
@@ -1475,11 +1432,10 @@
     let programmaticScrollAt = 0; // last time OUR code wrote the scroll position (apply/jump/normalizer)
     function viewKey() { return panelTab === 'links' ? 'links' : panelSubTab + ':' + settings.mediaGroup; }
     function saveViewScroll() { if (panelBodyEl) scrollMemory[viewKey()] = panelBodyEl.scrollTop; }
-    // smooth for short hops, instant for long virtualized jumps (a smooth
-    // glide across 50k px of virtual padding is a blur, not an animation).
-    // The bottom target is re-asserted for a few frames: virtualized content
-    // height settles as the row pitch is measured, and the first landing can
-    // end short of the true bottom.
+    // smooth for short hops, instant for long jumps (a smooth glide across
+    // 50k px is a blur, not an animation). The bottom target re-asserts for
+    // a couple of frames: content-visibility row estimates settle as rows
+    // render, and the first landing can end short of the true bottom.
     function jumpScroll(top) {
       if (!panelBodyEl) return;
       const apply = (n, smooth) => {
@@ -1590,23 +1546,6 @@
     // pure section — the bulk-download job builder shares them.)
     const hqStage = new Map();
     const hqTriedRetry = new Set(); // URLs whose HQ candidate got its one retry
-    // full-size fetches are much heavier than the medium files the page
-    // ships — mounting a big range at once (panel open, jump to bottom)
-    // bursts the CDN and the 403s cascade into permanent .md fallbacks.
-    // Same serialized queue the poster fetches use: 3 concurrent, spaced.
-    const hqNet = { active: 0, queue: [], last: 0 };
-    const HQ_NET_MAX = 3;
-    const HQ_NET_GAP = 250;
-    function runHqNet(job) { hqNet.queue.push(job); pumpHqNet(); }
-    function pumpHqNet() {
-      if (hqNet.active >= HQ_NET_MAX || !hqNet.queue.length) return;
-      const job = hqNet.queue.shift();
-      hqNet.active++;
-      const now = Date.now();
-      const wait = Math.max(0, hqNet.last + HQ_NET_GAP - now);
-      hqNet.last = now + wait;
-      setTimeout(() => job(() => { hqNet.active--; pumpHqNet(); }), wait);
-    }
 
     // ---------- bulk download (media tab) ----------
     // Fetches every listed file (GM XHR — no CORS limits; fetch() fallback),
@@ -1991,26 +1930,19 @@
         return v;
       }
       const im = document.createElement('img');
-      // thumbs are only created in-range by the virtualizer — eager loading
-      // avoids loading=lazy deferral bugs on re-inserted cached rows
-      if (!thumb) im.loading = 'lazy';
+      // ALL images lazy + async: the grid keeps every row in the DOM, so
+      // the browser's viewport distance decides when bytes move — that IS
+      // the CDN-burst throttle the old HQ queue provided, without a queue
+      // that offscreen rows would wedge for minutes.
+      im.loading = 'lazy';
+      im.decoding = 'async';
       const cands = hqCandidates(url);
       let ci = Math.min(hqStage.get(url) || 0, cands.length - 1);
       const isHqStage = (i) => cands.length > 1 && i < cands.length - 1;
       const setStage = (i) => {
         ci = i;
         hqStage.set(url, i);
-        if (!isHqStage(i)) { im.src = cands[i]; return; } // post URL: unqueued
-        runHqNet((done) => {
-          // stage moved on while queued (cell rebuilt elsewhere) — give the slot back
-          if (ci !== i || im.src === cands[i]) { done(); return; }
-          let released = false;
-          const rel = () => { if (!released) { released = true; done(); } };
-          im.addEventListener('load', rel, { once: true });
-          im.addEventListener('error', rel, { once: true });
-          setTimeout(rel, 20000); // a hung request must not pin the slot
-          im.src = cands[i];
-        });
+        im.src = cands[i];
       };
       im.addEventListener('error', function onErr() {
         // HQ candidates first: a transient failure (rate-limit burst) gets ONE
@@ -2036,6 +1968,10 @@
         v.addEventListener('error', () => markMediaBroken(v, url));
         v.addEventListener('loadedmetadata', () => { if (im.parentNode) im.replaceWith(v); markMediaLoaded(v); });
         v.load();
+        // some 404s stall as networkState=LOADING forever (no error event,
+        // no metadata) — a stalled cell must still retire, or it shimmers
+        // for the rest of the session
+        setTimeout(() => { if (v.readyState === 0) markMediaBroken(v, url); }, 6000);
       });
       setStage(ci);
       // A failure cached by Chrome replays instantly with NO error event, and
@@ -2189,7 +2125,12 @@
           if (act) act.scrollIntoView({ inline: 'center', block: 'nearest' });
         });
       }
-      v.addEventListener('click', (e) => { if (e.target === v) closeViewer(); });
+      // close on any dead space: the backdrop AND the stage's letterbox — a
+      // contain-upscaled image fills the whole stage and leaves no backdrop
+      // to click. The image itself closes too; videos keep their native
+      // controls (click = play/pause, not close).
+      v.addEventListener('click', (e) => { if (e.target === v || e.target === stage) closeViewer(); });
+      if (it.kind === 'image') media.addEventListener('click', () => closeViewer());
       document.body.appendChild(v);
       // cached-complete images never fire load — size their slot now
       if (it.kind === 'image' && media.complete && media.naturalWidth) {
@@ -2260,14 +2201,6 @@
         }
       }
       return lay;
-    }
-    // prefix-sum entry tops — headers (24/30px + gap) are shorter than media
-    // rows, so the virtualizer can no longer assume a uniform pitch
-    function layoutTops(lay, pitch) {
-      const tops = new Array(lay.length + 1);
-      tops[0] = 0;
-      for (let i = 0; i < lay.length; i++) tops[i + 1] = tops[i] + (lay[i].idxs ? pitch : (lay[i].hdr === 'sub' ? 24 : 30) + 6);
-      return tops;
     }
 
     // shared preamble for the render pass AND bulk download: ordered records
@@ -2345,31 +2278,6 @@
       ]);
       if (sig === lastPanelSignature) { updateCountOnly(items.length); return; }
       lastPanelSignature = sig;
-      // Media tab, same kind filter, grid still mounted: the change is item
-      // GROWTH from fetch ticks or REMOVAL from a retirement wave. Keep the
-      // DOM exactly as-is — point the grid at the new list and re-range. A
-      // teardown here is what caused blank cells (lazy loads killed
-      // mid-flight) and scroll-position loss.
-      if (panelTab === 'media' && vGrid && vGrid.topPad.isConnected && vGrid.identity === panelSubTab + ':' + settings.mediaGroup) {
-        // removals above the viewport shift the content under the user —
-        // overflow-anchor is OFF for the virtualizer, so compensate manually:
-        // keep the first visible ITEM at the same pixel (native anchoring
-        // cannot survive rows detaching, which is why it is disabled)
-        const anchor = captureScrollAnchor(panelBodyEl.scrollTop);
-        vGrid.items = items;
-        vGrid.layout = buildMediaLayout(items, settings.mediaGroup);
-        vGrid.renderRange();
-        if (anchor) {
-          const newTop = entryTopFor(anchor.url, vGrid.items, vGrid.layout, vRowHMeasured || gridRowH());
-          if (newTop !== null && Math.abs(newTop - anchor.top) > 1) {
-            programmaticScrollAt = performance.now();
-            panelBodyEl.scrollTop = Math.max(0, panelBodyEl.scrollTop - (anchor.top - newTop));
-            vGrid.renderRange();
-          }
-        }
-        updateCountOnly(items.length); // growth ticks must refresh the count too
-        return;
-      }
       // clearVRows stashed the pre-collapse position — prefer it over the
       // now-clamped live scrollTop. A VIEW switch (tab/sub-tab/group) instead
       // restores the position the user left the NEW view at — each list owns
@@ -2379,164 +2287,107 @@
       const viewChanged = viewKey() !== lastRenderedView;
       lastRenderedView = viewKey();
       let scrollTarget = viewChanged ? (scrollMemory[viewKey()] || 0) : keepScroll;
-      // removal rebuilds (retirement waves) shift everything under a numeric
-      // offset — restore against the first visible ITEM instead
-      let anchor = (!viewChanged && panelTab === 'media') ? (vAnchorKeep || captureScrollAnchor(keepScroll)) : null;
-      vAnchorKeep = null;
+      // removal rebuilds (retirement waves) drop rows ABOVE the viewport and
+      // shift everything under a numeric offset — anchor the first visible
+      // ROW and restore its on-screen pixel after the swap instead.
+      let rowAnchor = null;
+      if (!viewChanged && panelTab === 'media') {
+        const br = panelBodyEl.getBoundingClientRect();
+        for (const rowEl of panelBodyEl.querySelectorAll('.xft-vrows > div')) {
+          const r = rowEl.getBoundingClientRect();
+          if (r.bottom > br.top) {
+            rowAnchor = { sig: rowEl.dataset.xftSig || '', rel: r.top - br.top };
+            break;
+          }
+        }
+      }
       panelCountEl.textContent = panelTab === 'links' && filtered.length !== items.length
         ? filtered.length + '/' + items.length + ' items'
         : items.length + ' items';
       // build the new body OFF to the side — the old content must stay
-      // mounted while building: wiping first (`textContent=''`) collapses
-      // the height to 0 for a frame, the browser clamps scrollTop, and the
-      // restore then fights the user's active scrolling (bottom-of-list
-      // stutter). replaceChildren swaps in ONE mutation and the scroll
-      // survives natively.
+      // mounted while building: wiping first (`textContent=''`) collapses the
+      // height to 0 for a frame, the browser clamps scrollTop, and the
+      // restore then fights the user's active scrolling. replaceChildren
+      // swaps in ONE mutation and the scroll survives natively.
       const frag = document.createDocumentFragment();
       if (panelTab === 'media') {
-        // virtualized grid: only visible rows (+buffer) exist in the DOM
-        const topPad = document.createElement('div');
+        // FULL render, no window virtualizer: every row lives in the DOM and
+        // loading=lazy defers the bytes. The old machinery (spacer pads,
+        // pitch math, row eviction, range re-render, content-visibility
+        // estimates) is where the bottom push-back, stale-row and
+        // vanish-on-scroll bugs all lived — content-visibility estimates
+        // drift from real row heights and re-introduce native clamp
+        // push-back, so even that is gone. Plain in-flow rows have exact
+        // heights from aspect-ratio cells; the browser skips offscreen
+        // paint on its own.
         const vrows = document.createElement('div');
         vrows.className = 'xft-vrows';
-        const bottomPad = document.createElement('div');
-        frag.append(topPad, vrows, bottomPad);
-        const gap = 6;
-        let rowH = gridRowH(); // estimate; corrected by measurement below
         const builtLayout = buildMediaLayout(items, settings.mediaGroup);
-        if (anchor) {
-          // resolve the anchor item's row in the NEW layout and retarget the
-          // restore there (numeric keepScroll may point into shifted space)
-          const newTop = entryTopFor(anchor.url, items, builtLayout, vRowHMeasured || rowH);
-          if (newTop !== null) scrollTarget = Math.max(0, newTop + anchor.off);
-          // anchor item itself retired → numeric keepScroll stands
-        }
-        const renderRange = () => {
-          const gItems = vGrid ? vGrid.items : items;
-          const lay = vGrid ? vGrid.layout : builtLayout;
-          const st = panelBodyEl.scrollTop;
-          const vh = panelBodyEl.clientHeight || 600;
-          const pitch = vRowHMeasured || rowH;
-          const tops = layoutTops(lay, pitch);
-          // first entry whose bottom passes the viewport top (headers make
-          // the pitch non-uniform — binary search over the prefix sums)
-          let lo = 0, hi = lay.length;
-          while (lo < hi) { const mid = (lo + hi) >> 1; if (tops[mid + 1] > st) hi = mid; else lo = mid + 1; }
-          const first = Math.max(0, lo - 1); // one look-back keeps a header above the fold mounted
-          lo = first; hi = lay.length;
-          while (lo < hi) { const mid = (lo + hi) >> 1; if (tops[mid] < st + vh) lo = mid + 1; else hi = mid; }
-          const last = Math.min(lay.length, lo + 1);
-          for (const idx of Array.from(vrowCache.keys())) {
-            if (idx < first || idx >= last) { vrowCache.get(idx).remove(); vrowCache.delete(idx); }
+        for (let r = 0; r < builtLayout.length; r++) {
+          const e = builtLayout[r];
+          // entry signature: a row cached while the list was SHORTER (or a
+          // header whose group moved) must rebuild — sig match = reuse the
+          // existing element (imgs never reload on rebuild)
+          const esig = e.idxs ? 'r' + e.idxs[0] + ':' + e.idxs.length : 'h' + e.hdr + ':' + e.label;
+          let rowEl = vrowCache.get(r);
+          if (rowEl && rowEl.dataset.xftSig !== esig) {
+            rowEl.remove();
+            vrowCache.delete(r);
+            rowEl = null;
           }
-          for (let r = first; r < last; r++) {
-            const e = lay[r];
-            // entry signature: a row cached while the list was SHORTER (or a
-            // header whose group moved) must rebuild — sig mismatch = rebuild
-            const esig = e.idxs ? 'r' + e.idxs[0] + ':' + e.idxs.length : 'h' + e.hdr + ':' + e.label;
-            let rowEl = vrowCache.get(r);
-            if (rowEl && rowEl.dataset.xftSig !== esig) {
-              rowEl.remove();
-              vrowCache.delete(r);
-              rowEl = null;
-            }
-            if (!rowEl) {
-              if (e.idxs) {
-                rowEl = document.createElement('div');
-                rowEl.className = 'xft-vrow';
-                // removal wave just animated cells out — rebuilt rows must not
-                // pop back in or the whole grid flashes
-                if (performance.now() < popSuppressUntil) rowEl.classList.add('xft-nopop');
-                for (const i of e.idxs) {
-                  const it = gItems[i];
-                  const cell = document.createElement('div');
-                  cell.className = 'xft-cell';
-                  cell.title = '[#' + it.pos + '] ' + (it.r.author || '?') + ' — open';
-                  const isVideo = it.kind === 'video' || it.kind === 'embed';
-                  const thumb = buildMediaEl(it.kind, it.url, true);
-                  // shimmer while the media loads (cached-complete images come
-                  // back already ok'd — no flash for them)
-                  if ((it.kind === 'image' || it.kind === 'embed')
-                    && !(thumb.tagName === 'IMG' && thumb.classList.contains('xft-ok'))) cell.classList.add('xft-loading');
-                  const label = document.createElement('span');
-                  label.className = 'xft-cell-label';
-                  label.textContent = '#' + it.pos + ' ' + (it.r.author || '?');
-                  cell.append(thumb, label);
-                  if (isVideo) {
-                    const badge = document.createElement('span');
-                    badge.className = 'xft-cell-badge';
-                    badge.textContent = '▶';
-                    cell.appendChild(badge);
-                  }
-                  cell.addEventListener('click', () => openViewerAt(i));
-                  rowEl.appendChild(cell);
+          if (!rowEl) {
+            if (e.idxs) {
+              rowEl = document.createElement('div');
+              rowEl.className = 'xft-vrow';
+              // removal wave just animated cells out — rebuilt rows must not
+              // pop back in or the whole grid flashes
+              if (performance.now() < popSuppressUntil) rowEl.classList.add('xft-nopop');
+              for (const i of e.idxs) {
+                const it = items[i];
+                const cell = document.createElement('div');
+                cell.className = 'xft-cell';
+                cell.title = '[#' + it.pos + '] ' + (it.r.author || '?') + ' — open';
+                const isVideo = it.kind === 'video' || it.kind === 'embed';
+                const thumb = buildMediaEl(it.kind, it.url, true);
+                // shimmer while the media loads (cached-complete images come
+                // back already ok'd — no flash for them)
+                if ((it.kind === 'image' || it.kind === 'embed')
+                  && !(thumb.tagName === 'IMG' && thumb.classList.contains('xft-ok'))) cell.classList.add('xft-loading');
+                const label = document.createElement('span');
+                label.className = 'xft-cell-label';
+                label.textContent = '#' + it.pos + ' ' + (it.r.author || '?');
+                cell.append(thumb, label);
+                if (isVideo) {
+                  const badge = document.createElement('span');
+                  badge.className = 'xft-cell-badge';
+                  badge.textContent = '▶';
+                  cell.appendChild(badge);
                 }
-              } else {
-                rowEl = document.createElement('div');
-                rowEl.className = 'xft-ghead' + (e.hdr === 'sub' ? ' xft-gsub' : '');
-                const lab = document.createElement('span');
-                lab.className = 'xft-glabel';
-                lab.textContent = e.label;
-                const line = document.createElement('span');
-                line.className = 'xft-gline';
-                rowEl.append(lab, line);
-                if (e.postId) {
-                  rowEl.classList.add('xft-gjump');
-                  rowEl.title = e.label + ' — jump to post';
-                  rowEl.addEventListener('click', () => jumpTo(e.postId));
-                }
+                cell.addEventListener('click', () => openViewerAt(i));
+                rowEl.appendChild(cell);
               }
-              rowEl.dataset.xftSig = esig;
-              vrowCache.set(r, rowEl);
+            } else {
+              rowEl = document.createElement('div');
+              rowEl.className = 'xft-ghead' + (e.hdr === 'sub' ? ' xft-gsub' : '');
+              const lab = document.createElement('span');
+              lab.className = 'xft-glabel';
+              lab.textContent = e.label;
+              const line = document.createElement('span');
+              line.className = 'xft-gline';
+              rowEl.append(lab, line);
+              if (e.postId) {
+                rowEl.classList.add('xft-gjump');
+                rowEl.title = e.label + ' — jump to post';
+                rowEl.addEventListener('click', () => jumpTo(e.postId));
+              }
             }
-            // reconcile in place: re-inserting a row (appendChild is remove+
-            // insert) makes Chrome re-evaluate loading=lazy visibility and
-            // can strand an image deferred forever — only touch misplaced rows
-            const slot = r - first;
-            if (vrows.children[slot] !== rowEl) {
-              vrows.insertBefore(rowEl, vrows.children[slot] || null);
-            }
+            rowEl.dataset.xftSig = esig;
+            vrowCache.set(r, rowEl);
           }
-          // cap the cache so a very long scroll does not pin the whole list
-          if (vrowCache.size > 300) {
-            const mid = (first + last) / 2;
-            for (const idx of Array.from(vrowCache.keys()).sort((a, b) => Math.abs(a - mid) - Math.abs(b - mid)).slice(200)) {
-              vrowCache.get(idx).remove();
-              vrowCache.delete(idx);
-            }
-          }
-          // measure the REAL row pitch once and keep it across rebuilds: a
-          // few px of estimate drift per row turns into thousands of px of
-          // scroll jumps on huge virtualized lists (measure a MEDIA row —
-          // group headers have fixed CSS heights of their own). Sub-50px
-          // readings are garbage (half-attached row / mid-transition width)
-          // and would poison every later pad computation — reject them.
-          const mediaRow = vrows.querySelector('.xft-vrow');
-          if (mediaRow) {
-            // integer-quantized: 1fr grid columns give rows fractional pixel
-            // heights that round differently per row — a pitch that flaps
-            // ±1px between renders is catastrophic, every pad offset is
-            // first_index × pitch, so 1px at deep scroll swings the content
-            // height by thousands of px and the clamp yanks the view back.
-            // Accept only the first reading or a REAL change (>4px, e.g. a
-            // scrollbar appearing/reserving width).
-            const real = Math.round(mediaRow.getBoundingClientRect().height + gap);
-            if (real > 50 && (!vRowHMeasured || Math.abs(real - vRowHMeasured) > 4)) vRowHMeasured = real;
-          }
-          topPad.style.height = tops[first] + 'px';
-          bottomPad.style.height = Math.max(0, tops[lay.length] - tops[last]) + 'px';
-        };
-        vGrid = { topPad: topPad, vrows: vrows, bottomPad: bottomPad, items: items, layout: builtLayout, identity: panelSubTab + ':' + settings.mediaGroup, renderRange: renderRange };
-        renderRange();
-        panelBodyEl.onscroll = () => {
-          if (vScrollRaf) return;
-          vScrollRaf = requestAnimationFrame(() => { vScrollRaf = 0; if (vGrid) vGrid.renderRange(); });
-        };
-        if (vResizeObserver) vResizeObserver.disconnect();
-        vResizeObserver = new ResizeObserver(() => { if (vGrid) vGrid.renderRange(); });
-        vResizeObserver.observe(panelBodyEl);
+          vrows.appendChild(rowEl);
+        }
+        frag.appendChild(vrows);
       } else {
-        panelBodyEl.onscroll = null;
-        if (vResizeObserver) { vResizeObserver.disconnect(); vResizeObserver = null; }
         // grouped rows: the post label ([#pos] author) renders once per post
         // in a fixed-width first column; the post's links stack beneath it
         const groups = groupLinkItems(filtered);
@@ -2583,41 +2434,27 @@
         frag.appendChild(empty);
       }
       panelBodyEl.replaceChildren(frag);
-      if (keepScroll || scrollTarget) {
-        // restore AFTER a frame: at sync time the pads may still carry a
-        // stale pitch and the content height can be briefly smaller than
-        // the target — a sync set clamps and the view lands at the top.
-        // The pre-pass re-renders with ATTACHED rows (refreshing the
-        // measured pitch and pads) before the offset is applied, and the
-        // restore only moves the list when it landed FAR from where it
-        // belongs: small drift while the user is mid-wheel must be left
-        // alone or the list pushes back against the scroll (bottom stutter).
-        const target = scrollTarget;
-        const apply = (n) => {
-          if (!panelBodyEl || !panelBodyEl.isConnected || n < 0) return;
-          if (panelTab === 'media' && vGrid) vGrid.renderRange();
-          const max = panelBodyEl.scrollHeight - panelBodyEl.clientHeight;
-          const want = Math.min(target, max);
-          const displace = Math.abs(panelBodyEl.scrollTop - want);
-          const userActive = performance.now() - lastUserScrollAt < 250;
-          // never fight an active wheel — EXCEPT the collapse signature
-          // (scrollTop clamped to the very top), where the list must be
-          // recovered even mid-scroll or the view stays lost
-          const collapsed = panelBodyEl.scrollTop < 80 && target > 80;
-          if (displace > 80 && (!userActive || collapsed)) {
-            programmaticScrollAt = performance.now();
-            panelBodyEl.scrollTop = want;
-            if (panelTab === 'media' && vGrid) vGrid.renderRange();
-            requestAnimationFrame(() => apply(n - 1)); // height keeps settling — re-assert once more
+      // restore: rows are real in-flow content now, so heights are true at
+      // swap time (aspect-ratio cells) and one direct offset set is enough.
+      // The row anchor covers removal shifts; the numeric target covers view
+      // switches and keep-scroll.
+      if (rowAnchor || scrollTarget) {
+        programmaticScrollAt = performance.now();
+        if (rowAnchor) {
+          const br = panelBodyEl.getBoundingClientRect();
+          for (const rowEl of panelBodyEl.querySelectorAll('.xft-vrows > div')) {
+            if (rowEl.dataset.xftSig === rowAnchor.sig) {
+              panelBodyEl.scrollTop += rowEl.getBoundingClientRect().top - br.top - rowAnchor.rel;
+              break;
+            }
           }
-        };
-        requestAnimationFrame(() => apply(2));
+        } else if (scrollTarget) {
+          panelBodyEl.scrollTop = Math.min(scrollTarget, panelBodyEl.scrollHeight - panelBodyEl.clientHeight);
+        }
       }
-      // media grid is window-virtualized and renders what the viewport shows —
-      // row capping (and this button) only applies to the Links tab
       // auto-load replaces the old Show-more button: a sentinel at the list
-      // end extends rowLimit when scrolled into view (media grid is
-      // window-virtualized and needs no capping)
+      // end extends rowLimit when scrolled into view (media grid renders
+      // everything up front — capping is Links-only)
       if (linksObserver) linksObserver.disconnect();
       if (panelTab === 'links' && filtered.length > rowLimit) {
         if (!linksObserver) {
@@ -2698,40 +2535,10 @@
       if (panelCountEl) panelCountEl.textContent = n + ' items';
     }
 
-    // virtualized-grid row pitch: square 4-col cells (kept in sync with .xft-vrow CSS)
-    function gridRowH() {
-      const gap = 6;
-      const cols = 4;
-      const cellW = (panelBodyEl.clientWidth - 20 - (cols - 1) * gap) / cols;
-      return cellW + 2 + gap;
-    }
-
-    // normalize wheel scrolling: one notch = one grid row, no matter how tall
-    // the virtualized content is (a flick must not fly hundreds of rows);
-    // small deltas (trackpad pixel scrolling) stay native
-    function installWheelNormalizer() {
-      let pend = 0;
-      let raf = 0;
-      panelBodyEl.addEventListener('wheel', (e) => {
-        lastUserScrollAt = performance.now();
-        if (panelTab !== 'media') return; // Links tab keeps native scrolling
-        e.preventDefault();
-        // every wheel event contributes at most one row of travel, no native
-        // path at all — free-spin/high-res wheels sending small rapid deltas
-        // cannot fling through the virtualized list
-        const rowH = gridRowH();
-        const d = e.deltaMode === 1 ? e.deltaY * (rowH / 3) : e.deltaY;
-        pend += Math.max(-rowH, Math.min(rowH, d));
-        if (raf) return;
-        raf = requestAnimationFrame(() => {
-          raf = 0;
-          programmaticScrollAt = performance.now();
-          panelBodyEl.scrollBy({ top: pend, behavior: 'auto' });
-          pend = 0;
-        });
-      }, { passive: false });
-      // scrollbar DRAGS / trackpad / keyboard scrolling never fire wheel —
-      // treat any scroll event not caused by our own writes as user activity
+    // scrollbar drags / wheel / keyboard scrolling are all USER activity —
+    // any scroll event not stamped as one of our own writes updates the
+    // timestamp (holds removal rerenders while the user is mid-scroll)
+    function installScrollWatch() {
       panelBodyEl.addEventListener('scroll', () => {
         if (performance.now() - programmaticScrollAt > 40) lastUserScrollAt = performance.now();
       }, { passive: true });
@@ -2886,7 +2693,19 @@
       progressEl.className = 'xft-progress';
       progressEl.textContent = '–';
       const cancelBtn = mkBtn('■ Stop', () => { if (hub.abortRef) hub.abortRef.aborted = true; });
-      const refreshBtn = mkBtn('↻ Refresh', () => { ensure(true); });
+      const refreshBtn = mkBtn('↻ Refresh', () => {
+        // Refresh = re-check EVERYTHING. Session failure state (broken marks,
+        // HQ stage memory, burned retries) is what made "reload the page" the
+        // only cure for a poisoned grid — a Refresh must clear it too, or
+        // items stay retired forever no matter how many times the data is
+        // re-fetched. Rows rebuild so cells get fresh load attempts.
+        brokenMediaUrls.clear();
+        tinyMediaUrls.clear();
+        hqStage.clear();
+        hqTriedRetry.clear();
+        clearVRows();
+        ensure(true);
+      });
       panelCancelBtn = cancelBtn;
       panelRefreshBtn = refreshBtn;
       const gearBtn = mkBtn('⚙', () => toggleSettings());
@@ -2977,7 +2796,7 @@
       document.body.appendChild(panel);
       setTab('media');
       buildEdgeButton();
-      installWheelNormalizer();
+      installScrollWatch();
     }
 
     // ---------- step 9: toolbar injection ----------
@@ -3063,6 +2882,7 @@
         '.xft-gsel{margin-left:auto;height:22px;font-size:11px;background:hsl(var(--xft-secondary));color:hsl(var(--xft-fg));border:1px solid hsl(var(--xft-border));border-radius:6px;padding:0 4px;cursor:pointer;outline:none}',
         '.xft-dlbtn{min-width:70px;text-align:center}',
         '.xft-dlbar{padding:8px 10px;border-bottom:1px solid hsl(var(--xft-border));background:hsl(var(--xft-muted));display:flex;flex-direction:column;gap:6px}',
+        '.xft-dlbar[hidden]{display:none}',
         '.xft-dltop{display:flex;align-items:center;gap:6px;min-width:0}',
         '.xft-dlname{flex:1;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;font-weight:600}',
         '.xft-dlprog{height:6px;border-radius:99px;background:hsl(var(--xft-border));overflow:hidden}',
@@ -3076,9 +2896,8 @@
         '.xft-dl-run{background:hsl(var(--xft-ring)/.18)!important;border-color:hsl(var(--xft-ring))!important}',
         '.xft-jumps{position:absolute;right:10px;bottom:14px;display:flex;flex-direction:column;gap:6px;z-index:5}',
         '.xft-jumpbtn{width:30px;height:30px;padding:0;font-size:14px;line-height:1;border-radius:8px;box-shadow:0 2px 8px hsl(240 10% 3.9%/.25)}',
-        // group headers: label + hairline filler; heights are FIXED (30/24px)
-        // and mirrored in layoutTops() — the virtualizer's scroll math
-        // depends on them
+        // group headers: label + hairline filler; fixed heights keep the
+        // flow layout compact — no scroll math depends on them anymore
         '.xft-ghead{display:flex;align-items:center;gap:8px;height:30px;user-select:none}',
         '.xft-ghead.xft-gjump{cursor:pointer}',
         '.xft-glabel{font-size:12px;font-weight:600;color:hsl(var(--xft-fg));white-space:nowrap;overflow:hidden;text-overflow:ellipsis;max-width:70%}',
@@ -3095,7 +2914,7 @@
         '.xft-filter-on{background:hsl(var(--xft-primary));color:hsl(var(--xft-primary-fg));font-weight:600}',
         '.xft-filter-on:hover{background:hsl(var(--xft-primary));color:hsl(var(--xft-primary-fg));opacity:.9}',
         // ---- body / grid ----
-        '.xft-body{overflow-y:auto;flex:1;padding:8px 10px;scrollbar-width:thin;scrollbar-color:hsl(var(--xft-border)) transparent;overscroll-behavior:contain;overflow-anchor:none}',
+        '.xft-body{overflow-y:auto;flex:1;padding:8px 10px;scrollbar-width:thin;scrollbar-color:hsl(var(--xft-border)) transparent;overscroll-behavior:contain}',
         '.xft-body::-webkit-scrollbar{width:8px}',
         '.xft-body::-webkit-scrollbar-thumb{background:hsl(var(--xft-muted));border-radius:4px}',
         '.xft-grid{display:grid;grid-template-columns:repeat(4,1fr);gap:6px}',
