@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         xf-thread-tools
 // @namespace    xf-thread-tools
-// @version      0.7.41
+// @version      0.7.42
 // @description  XenForo 2: sort thread posts by reaction count across all pages (cached) + floating media panel (images / external links).
 // @author       xf-thread-tools
 // @match        *://*/threads/*
@@ -1164,6 +1164,11 @@
       // would then "keep" a zero position (the list jumps to the top on
       // every broken-item rerender)
       if (panelBodyEl && vScrollKeep === null) vScrollKeep = panelBodyEl.scrollTop;
+      // also stash an ITEM anchor: a numeric scrollTop goes stale the moment
+      // a removal rebuild drops rows ABOVE the viewport — the clamp then
+      // pulls the view back (the bottom push-back). The anchor is restored
+      // to the first visible item's NEW offset after the rebuild.
+      if (panelBodyEl && vAnchorKeep === null) vAnchorKeep = captureScrollAnchor(panelBodyEl.scrollTop);
       for (const el of vrowCache.values()) el.remove();
       vrowCache.clear();
       // cleared rows MUST rebuild: with the signature intact, renderPanelBody
@@ -1171,6 +1176,37 @@
       // (broken-removal rerenders that change no counts, Refresh when the
       // refetched data has the same shape)
       lastPanelSignature = '';
+    }
+    // first visible media item + pixel offset inside its row (null when no
+    // grid is mounted). Used by clearVRows and the rebuild path.
+    let vAnchorKeep = null;
+    function captureScrollAnchor(st) {
+      if (!vGrid || !vGrid.topPad || !vGrid.topPad.isConnected || !vGrid.items.length || !vGrid.layout.length) return null;
+      try {
+        const topsA = layoutTops(vGrid.layout, vRowHMeasured || gridRowH());
+        let lo = 0, hi = vGrid.layout.length;
+        while (lo < hi) { const mid = (lo + hi) >> 1; if (topsA[mid + 1] > st) hi = mid; else lo = mid + 1; }
+        // the search can land on a group HEADER (no idxs) — anchor to the
+        // first media ROW at/after it, or the header's offset is measured
+        // against the wrong entry height
+        while (lo < vGrid.layout.length && !vGrid.layout[lo].idxs) lo += 1;
+        const ent = vGrid.layout[lo];
+        if (ent && ent.idxs && vGrid.items[ent.idxs[0]]) return { url: vGrid.items[ent.idxs[0]].url, off: Math.max(0, st - topsA[lo]), top: topsA[lo] };
+      } catch (e) { /* anchor is best-effort — numeric fallback stands */ }
+      return null;
+    }
+    // top offset of the entry (row) containing an item URL, or null
+    function entryTopFor(url, items, lay, pitch) {
+      const idx = items.findIndex((it) => it.url === url);
+      if (idx < 0) return null;
+      const tops = layoutTops(lay, pitch);
+      for (let k = 0; k < lay.length; k++) {
+        const en = lay[k];
+        if (!en.idxs) continue;
+        if (en.idxs[0] > idx) return null;
+        if (idx <= en.idxs[en.idxs.length - 1]) return tops[k];
+      }
+      return null;
     }
     let vRowHMeasured = 0;
     let vGrid = null; // live media-grid state {topPad,vrows,bottomPad,items,identity,renderRange}
@@ -1202,8 +1238,12 @@
         // user (restore yanked scrollTop while they scrolled) — hold the
         // removal wave until the wheel stream pauses
         if (performance.now() - lastUserScrollAt < 300) { scheduleBrokenRerender(); return; }
-        clearVRows();
-        vGrid = null;
+        // NO clearVRows/teardown: detaching every row collapses the content
+        // height for a frame, the clamp pulls the view back, and the swap
+        // below re-clamps again — the push-back. Sig-based rows make the
+        // teardown unnecessary: reset the signature and let renderPanelBody
+        // take the growth path (re-point items/layout, re-range in place).
+        lastPanelSignature = '';
         schedulePanelRender();
       }, 300);
     }
@@ -1410,7 +1450,8 @@
     // inherit the scroll of the list being left
     const scrollMemory = {};
     let lastRenderedView = null;
-    let lastUserScrollAt = 0; // wheel/touch activity — restores must not fight an active scroller
+    let lastUserScrollAt = 0; // ANY user scroll (wheel/drag/keys) — restores must not fight an active scroller
+    let programmaticScrollAt = 0; // last time OUR code wrote the scroll position (apply/jump/normalizer)
     function viewKey() { return panelTab === 'links' ? 'links' : panelSubTab + ':' + settings.mediaGroup; }
     function saveViewScroll() { if (panelBodyEl) scrollMemory[viewKey()] = panelBodyEl.scrollTop; }
     // smooth for short hops, instant for long virtualized jumps (a smooth
@@ -1424,6 +1465,7 @@
         if (!panelBodyEl || n < 0) return;
         const target = top ? 0 : panelBodyEl.scrollHeight - panelBodyEl.clientHeight;
         const far = Math.abs(target - panelBodyEl.scrollTop) > 4000;
+        programmaticScrollAt = performance.now();
         panelBodyEl.scrollTo({ top: target, behavior: smooth && !far ? 'smooth' : 'auto' });
         if (!top) requestAnimationFrame(() => apply(n - 1, false));
       };
@@ -2181,14 +2223,28 @@
       ]);
       if (sig === lastPanelSignature) { updateCountOnly(items.length); return; }
       lastPanelSignature = sig;
-      // Media tab, same kind filter, grid still mounted: the only change is
-      // item GROWTH from fetch ticks. Keep the DOM exactly as-is — point the
-      // grid at the longer list and re-range. A teardown here is what caused
-      // blank cells (lazy loads killed mid-flight) and scroll-position loss.
+      // Media tab, same kind filter, grid still mounted: the change is item
+      // GROWTH from fetch ticks or REMOVAL from a retirement wave. Keep the
+      // DOM exactly as-is — point the grid at the new list and re-range. A
+      // teardown here is what caused blank cells (lazy loads killed
+      // mid-flight) and scroll-position loss.
       if (panelTab === 'media' && vGrid && vGrid.topPad.isConnected && vGrid.identity === panelSubTab + ':' + settings.mediaGroup) {
+        // removals above the viewport shift the content under the user —
+        // overflow-anchor is OFF for the virtualizer, so compensate manually:
+        // keep the first visible ITEM at the same pixel (native anchoring
+        // cannot survive rows detaching, which is why it is disabled)
+        const anchor = captureScrollAnchor(panelBodyEl.scrollTop);
         vGrid.items = items;
         vGrid.layout = buildMediaLayout(items, settings.mediaGroup);
         vGrid.renderRange();
+        if (anchor) {
+          const newTop = entryTopFor(anchor.url, vGrid.items, vGrid.layout, vRowHMeasured || gridRowH());
+          if (newTop !== null && Math.abs(newTop - anchor.top) > 1) {
+            programmaticScrollAt = performance.now();
+            panelBodyEl.scrollTop = Math.max(0, panelBodyEl.scrollTop - (anchor.top - newTop));
+            vGrid.renderRange();
+          }
+        }
         updateCountOnly(items.length); // growth ticks must refresh the count too
         return;
       }
@@ -2200,7 +2256,11 @@
       vScrollKeep = null;
       const viewChanged = viewKey() !== lastRenderedView;
       lastRenderedView = viewKey();
-      const scrollTarget = viewChanged ? (scrollMemory[viewKey()] || 0) : keepScroll;
+      let scrollTarget = viewChanged ? (scrollMemory[viewKey()] || 0) : keepScroll;
+      // removal rebuilds (retirement waves) shift everything under a numeric
+      // offset — restore against the first visible ITEM instead
+      let anchor = (!viewChanged && panelTab === 'media') ? (vAnchorKeep || captureScrollAnchor(keepScroll)) : null;
+      vAnchorKeep = null;
       panelCountEl.textContent = panelTab === 'links' && filtered.length !== items.length
         ? filtered.length + '/' + items.length + ' items'
         : items.length + ' items';
@@ -2221,6 +2281,13 @@
         const gap = 6;
         let rowH = gridRowH(); // estimate; corrected by measurement below
         const builtLayout = buildMediaLayout(items, settings.mediaGroup);
+        if (anchor) {
+          // resolve the anchor item's row in the NEW layout and retarget the
+          // restore there (numeric keepScroll may point into shifted space)
+          const newTop = entryTopFor(anchor.url, items, builtLayout, vRowHMeasured || rowH);
+          if (newTop !== null) scrollTarget = Math.max(0, newTop + anchor.off);
+          // anchor item itself retired → numeric keepScroll stands
+        }
         const renderRange = () => {
           const gItems = vGrid ? vGrid.items : items;
           const lay = vGrid ? vGrid.layout : builtLayout;
@@ -2323,8 +2390,15 @@
           // and would poison every later pad computation — reject them.
           const mediaRow = vrows.querySelector('.xft-vrow');
           if (mediaRow) {
-            const real = mediaRow.getBoundingClientRect().height + gap;
-            if (real > 50) vRowHMeasured = real;
+            // integer-quantized: 1fr grid columns give rows fractional pixel
+            // heights that round differently per row — a pitch that flaps
+            // ±1px between renders is catastrophic, every pad offset is
+            // first_index × pitch, so 1px at deep scroll swings the content
+            // height by thousands of px and the clamp yanks the view back.
+            // Accept only the first reading or a REAL change (>4px, e.g. a
+            // scrollbar appearing/reserving width).
+            const real = Math.round(mediaRow.getBoundingClientRect().height + gap);
+            if (real > 50 && (!vRowHMeasured || Math.abs(real - vRowHMeasured) > 4)) vRowHMeasured = real;
           }
           topPad.style.height = tops[first] + 'px';
           bottomPad.style.height = Math.max(0, tops[lay.length] - tops[last]) + 'px';
@@ -2409,6 +2483,7 @@
           // recovered even mid-scroll or the view stays lost
           const collapsed = panelBodyEl.scrollTop < 80 && target > 80;
           if (displace > 80 && (!userActive || collapsed)) {
+            programmaticScrollAt = performance.now();
             panelBodyEl.scrollTop = want;
             if (panelTab === 'media' && vGrid) vGrid.renderRange();
             requestAnimationFrame(() => apply(n - 1)); // height keeps settling — re-assert once more
@@ -2528,10 +2603,16 @@
         if (raf) return;
         raf = requestAnimationFrame(() => {
           raf = 0;
+          programmaticScrollAt = performance.now();
           panelBodyEl.scrollBy({ top: pend, behavior: 'auto' });
           pend = 0;
         });
       }, { passive: false });
+      // scrollbar DRAGS / trackpad / keyboard scrolling never fire wheel —
+      // treat any scroll event not caused by our own writes as user activity
+      panelBodyEl.addEventListener('scroll', () => {
+        if (performance.now() - programmaticScrollAt > 40) lastUserScrollAt = performance.now();
+      }, { passive: true });
     }
 
     function setPanelOpen(open) {
