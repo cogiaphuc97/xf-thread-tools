@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         xf-thread-tools
 // @namespace    xf-thread-tools
-// @version      0.7.48
+// @version      0.7.49
 // @description  XenForo 2: sort thread posts by reaction count across all pages (cached) + floating media panel (images / external links).
 // @author       xf-thread-tools
 // @match        *://*/threads/*
@@ -226,6 +226,17 @@
     const links = h.matchAll(/<a[^>]+href=["'](https?:\/\/[^"']+)["']/gi);
     for (const m of links) push(m[1]);
     return out;
+  }
+  // JSON data endpoint answer for image landing pages: {image:{original_url}}
+  // — the SPA's own API carries the direct, UNSIGNED original.
+  function parseImageApiResponse(text) {
+    try {
+      const j = JSON.parse(String(text || ''));
+      const im = j && j.image;
+      const u = im && String(im.original_url || '');
+      if (u && /^https?:\/\//.test(u)) return u;
+    } catch (e) { /* not JSON — fall back to the page parser */ }
+    return '';
   }
   function dlBasename(url, kind, idx) {
     let b = '';
@@ -1584,7 +1595,12 @@
         imgPageInflight.delete(pageUrl);
         for (const fn of queue) fn(hit);
       };
-      gmGetText(pageUrl, (text) => {
+      // route 1: the landing host's JSON data endpoint (<origin>/api/images/
+      // <id>) — carries the direct original, no JS challenge to solve
+      let api = '';
+      try { const u = new URL(pageUrl); api = u.origin + '/api/images/' + u.pathname.split('/').pop(); } catch (e) { /* keep '' */ }
+      // route 2: the landing page HTML itself (og:image / img / link carriers)
+      const viaPage = () => gmGetText(pageUrl, (text) => {
         const cands = parseImagePage(text);
         let hit = '';
         for (const u of cands) {
@@ -1592,6 +1608,12 @@
         }
         finish(hit);
       }, () => finish(''));
+      if (api) {
+        gmGetText(api, (text) => {
+          const hit = parseImageApiResponse(text);
+          if (hit) finish(hit); else viaPage();
+        }, viaPage);
+      } else viaPage();
     }
     let settingsView = null;
     let panelTab = 'files';
@@ -3287,5 +3309,5 @@
   }
 
   // UMD export of the pure functions for node:test (no DOM / GM usage in them).
-  if (typeof module !== 'undefined' && module.exports) module.exports = { parseReactionCount, filterLinks, sortPosts, estimateSize, partitionLinks, extractDomain, groupLinkItems, applyLinkFilters, boilerplateUrls, isSmilieUrl, parseEmbedPoster, embedSignUrl, parseSignResponse, parseSignToken, parseVideoPage, isVideoPageUrl, hqCandidates, sanitizeFileSeg, siteTagFromHost, cleanThreadTitle, zipFileName, imagePageHref, parseImagePage, dlBasename, buildDlJobs, crc32, zipStoreU8 };
+  if (typeof module !== 'undefined' && module.exports) module.exports = { parseReactionCount, filterLinks, sortPosts, estimateSize, partitionLinks, extractDomain, groupLinkItems, applyLinkFilters, boilerplateUrls, isSmilieUrl, parseEmbedPoster, embedSignUrl, parseSignResponse, parseSignToken, parseVideoPage, isVideoPageUrl, hqCandidates, sanitizeFileSeg, siteTagFromHost, cleanThreadTitle, zipFileName, imagePageHref, parseImagePage, parseImageApiResponse, dlBasename, buildDlJobs, crc32, zipStoreU8 };
 })();

@@ -8,7 +8,7 @@ import path from 'node:path';
 
 const require = createRequire(import.meta.url);
 const userJsPath = path.join(path.dirname(fileURLToPath(import.meta.url)), '..', 'xf-thread-tools.user.js');
-const { parseReactionCount, filterLinks, sortPosts, estimateSize, partitionLinks, extractDomain, groupLinkItems, applyLinkFilters, boilerplateUrls, isSmilieUrl, parseEmbedPoster, embedSignUrl, parseSignResponse, parseSignToken, parseVideoPage, isVideoPageUrl, hqCandidates, imagePageHref, parseImagePage, sanitizeFileSeg, siteTagFromHost, cleanThreadTitle, zipFileName, dlBasename, buildDlJobs, crc32, zipStoreU8 } = require(userJsPath);
+const { parseReactionCount, filterLinks, sortPosts, estimateSize, partitionLinks, extractDomain, groupLinkItems, applyLinkFilters, boilerplateUrls, isSmilieUrl, parseEmbedPoster, embedSignUrl, parseSignResponse, parseSignToken, parseVideoPage, isVideoPageUrl, hqCandidates, imagePageHref, parseImagePage, parseImageApiResponse, sanitizeFileSeg, siteTagFromHost, cleanThreadTitle, zipFileName, dlBasename, buildDlJobs, crc32, zipStoreU8 } = require(userJsPath);
 
 test('UMD export exposes the four pure functions', () => {
   assert.equal(typeof parseReactionCount, 'function');
@@ -417,6 +417,15 @@ test('parseImagePage: direct-image carriers in priority order', () => {
   assert.deepEqual(parseImagePage('<img src="/relative.jpg"><a href="https://x.test/page">link</a><img src="https://cdn.test/a.jpg"><img src="https://cdn.test/a.jpg">'), ['https://cdn.test/a.jpg']);
   assert.deepEqual(parseImagePage(''), []);
   assert.deepEqual(parseImagePage('<html>no media here</html>'), []);
+});
+
+test('parseImageApiResponse: {image:{original_url}} extraction', () => {
+  assert.equal(parseImageApiResponse('{"image":{"mime":"image/jpeg","original_url":"https://cdn.test/images4/UUID.jpg","medium_url":"https://cdn.test/images4/UUID2.jpg"}}'),
+    'https://cdn.test/images4/UUID.jpg');
+  assert.equal(parseImageApiResponse('{"message":"Not found"}'), ''); // API miss (route 2 takes over)
+  assert.equal(parseImageApiResponse('<html>challenge</html>'), ''); // non-JSON
+  assert.equal(parseImageApiResponse(''), '');
+  assert.equal(parseImageApiResponse('{"image":{"original_url":"/relative.jpg"}}'), ''); // not absolute
 });
 
 test('buildDlJobs: landing page attached for chain-less images only', () => {
