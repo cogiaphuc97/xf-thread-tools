@@ -8,7 +8,7 @@ import path from 'node:path';
 
 const require = createRequire(import.meta.url);
 const userJsPath = path.join(path.dirname(fileURLToPath(import.meta.url)), '..', 'xf-thread-tools.user.js');
-const { parseReactionCount, filterLinks, sortPosts, estimateSize, partitionLinks, extractDomain, groupLinkItems, applyLinkFilters, boilerplateUrls, isSmilieUrl, parseEmbedPoster, embedSignUrl, parseSignResponse, parseSignToken, parseVideoPage, isVideoPageUrl, hqCandidates, imagePageHref, parseImagePage, parseImageApiResponse, sanitizeFileSeg, siteTagFromHost, cleanThreadTitle, zipFileName, dlBasename, buildDlJobs, crc32, zipStoreU8 } = require(userJsPath);
+const { parseReactionCount, filterLinks, sortPosts, estimateSize, partitionLinks, extractDomain, groupLinkItems, applyLinkFilters, boilerplateUrls, isSmilieUrl, parseEmbedPoster, embedSignUrl, parseSignResponse, parseSignToken, parseVideoPage, isVideoPageUrl, hqCandidates, imagePageHref, parseImagePage, parseImageApiResponse, sanitizeFileSeg, siteTagFromHost, cleanThreadTitle, zipFileName, dlBasename, buildDlJobs, crc32, zipStoreU8, layoutMetrics, windowRange } = require(userJsPath);
 
 test('UMD export exposes the four pure functions', () => {
   assert.equal(typeof parseReactionCount, 'function');
@@ -499,4 +499,61 @@ test('zipStoreU8: valid STORE archive structure (verified byte-level + by unzip 
   const z0 = zipStoreU8([]);
   assert.equal(z0.length, 22);
   assert.equal(u32.call(null, 0) !== 0x04034b50 || true, true); // no local headers
+});
+
+// ---- virtual grid math (v0.8.0) ----
+const row = (...idxs) => ({ idxs: idxs });
+const head = (label) => ({ hdr: 'main', label: label, postId: 'p1' });
+const sub = (label) => ({ hdr: 'sub', label: label, postId: 'p1' });
+const RH = 140, HH = 30, SH = 24, G = 6;
+
+test('layoutMetrics: flat rows advance by rowH+gap, total has no trailing gap', () => {
+  const m = layoutMetrics([row(0,1,2,3), row(4,5,6,7), row(8)], RH, HH, SH, G);
+  assert.equal(m.top[0], 0);
+  assert.equal(m.top[1], RH + G);
+  assert.equal(m.top[2], 2 * (RH + G));
+  assert.equal(m.h[0], RH);
+  assert.equal(m.total, 3 * RH + 2 * G);
+});
+
+test('layoutMetrics: interleaved headers use their own heights', () => {
+  const m = layoutMetrics([head('Page 1'), row(0), sub('#1'), row(1)], RH, HH, SH, G);
+  assert.equal(m.top[0], 0);
+  assert.equal(m.top[1], HH + G);
+  assert.equal(m.top[2], HH + G + RH + G);
+  assert.equal(m.top[3], HH + G + RH + G + SH + G);
+  assert.equal(m.total, HH + RH + SH + RH + 3 * G);
+});
+
+test('layoutMetrics: empty layout totals 0', () => {
+  const m = layoutMetrics([], RH, HH, SH, G);
+  assert.equal(m.total, 0);
+  assert.deepEqual(m.top, []);
+});
+
+test('windowRange: viewport over middle entries', () => {
+  const es = [row(0), row(1), row(2), row(3), row(4)];
+  const m = layoutMetrics(es, RH, HH, SH, G);
+  // view covering entry 2 exactly (top 292..432+)
+  assert.deepEqual(windowRange(m.top, m.h, 292, 432), [2, 2]);
+  // view covering entries 1..3
+  assert.deepEqual(windowRange(m.top, m.h, 146, 578), [1, 3]);
+});
+
+test('windowRange: viewTop inside the gap after entry e starts at e+1', () => {
+  const es = [row(0), row(1), row(2)];
+  const m = layoutMetrics(es, RH, HH, SH, G);
+  // bottom of entry 0 = 140; 141..145 is the gap before entry 1 (top 146)
+  assert.deepEqual(windowRange(m.top, m.h, 143, 200), [1, 1]);
+  // straddler: viewTop 100 cuts through entry 0 — it stays in
+  assert.deepEqual(windowRange(m.top, m.h, 100, 200), [0, 1]);
+});
+
+test('windowRange: clamps at both ends, empty layout, past-the-end window', () => {
+  const es = [row(0), row(1), row(2)];
+  const m = layoutMetrics(es, RH, HH, SH, G);
+  assert.deepEqual(windowRange(m.top, m.h, -500, 0), [0, 0]);
+  assert.deepEqual(windowRange(m.top, m.h, 0, 99999), [0, 2]);
+  assert.deepEqual(windowRange(m.top, m.h, m.total + 100, m.total + 200), [3, -1]);
+  assert.deepEqual(windowRange([], [], 0, 100), [0, -1]);
 });

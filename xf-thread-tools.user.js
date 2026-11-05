@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         xf-thread-tools
 // @namespace    xf-thread-tools
-// @version      0.7.52
+// @version      0.8.0
 // @description  XenForo 2: sort thread posts by reaction count across all pages (cached) + floating media panel (images / external links).
 // @author       xf-thread-tools
 // @match        *://*/threads/*
@@ -1235,29 +1235,65 @@
     // reaching it extends rowLimit, so there is no "Show more" button
     let linksSentinel = null;
     let linksObserver = null;
-    // Media grid: rows are cached by index and MOVED, never destroyed —
-    // scroll re-ranges and fetch-tick rebuilds would otherwise kill lazy
-    // image loads mid-flight and leave blank cells. Cleared whenever the
-    // item list itself changes identity (tab/sub-tab/search/filter/refresh).
-    const vrowCache = new Map();
-    // lazy cell fill: every media row mounts as a cheap SHELL (aspect-ratio
-    // placeholder cells — exact height, no media, no events) and one shared
-    // IntersectionObserver fills it the first time it approaches the viewport.
-    // Filled rows stay mounted forever; nothing is ever evicted, so no scroll
-    // math of any kind is needed. The observer holds STRONG refs to targets —
-    // anything detached from the cache must be unobserved or it leaks.
-    let rowFillObserver = null;
-    let gridItems = []; // current render's item list (fill resolves indices against it)
-    function ensureRowFillObserver() {
-      if (rowFillObserver) return rowFillObserver;
-      rowFillObserver = new IntersectionObserver((ents) => {
-        for (const en of ents) {
-          if (!en.isIntersecting) continue;
-          rowFillObserver.unobserve(en.target);
-          fillRowShell(en.target);
-        }
-      }, { root: panelBodyEl, rootMargin: '1600px 0px' });
-      return rowFillObserver;
+    // ---------- virtualized media grid (v0.8.0) ----------
+    // Windowed rendering: a spacer (.xft-vrows) of EXACT computed height
+    // carries only the entries near the viewport, absolutely positioned at
+    // their math-derived y (layoutMetrics/windowRange, pure). Window
+    // membership is derived SYNCHRONOUSLY from scrollTop in the scroll
+    // handler — there is NO IntersectionObserver on the correctness path
+    // (the pre-0.7.45 virtualizer's IO refills missed rows during flings:
+    // the missing/vanished-preview bug class). Rows recycle through a
+    // CONTENT-keyed pool: sig = first-url + len, so a pool hit IS the right
+    // content (position never implies content — the wrong-preview class),
+    // and rows re-chunked by a retirement wave recycle by URL overlap +
+    // reconcileRowCells so surviving imgs never refetch (0.7.47 fix kept).
+    const vPool = new Map();      // sig -> detached row el (insertion order = LRU)
+    const vUrlIndex = new Map();  // cell url -> pool sig (URL-overlap recycle)
+    const VPOOL_MAX = 120;        // detached rows kept: bounded DOM + decoded memory
+    const V_OVER_ABOVE = 900;     // px rendered above the viewport
+    const V_OVER_BELOW = 1400;    // px rendered below (≈ the old IO margin)
+    const V_GAP = 6;
+    let vLayout = [];             // current entries, each stamped with .sig
+    let vMetrics = null;          // layoutMetrics() of vLayout
+    let vRowsEl = null;           // the spacer element (position:relative)
+    let vAttached = [];           // [{sig, el}] — the rendered window, DOM order
+    let vRange = { first: -1, last: -1, version: -1 };
+    let vVersion = 0;             // bumped on every relayout
+    let vRowH = 140;              // measured per mount (uniform for all rows)
+    let vHeadH = 30, vSubH = 24;  // probed per mount (CSS-fixed)
+    let gridItems = [];           // current render's item list
+    let sliceQueued = false;
+    function queueRenderSlice() {
+      if (sliceQueued) return;
+      sliceQueued = true;
+      requestAnimationFrame(() => { sliceQueued = false; renderSlice(); });
+    }
+    function poolCleanUrls(sig, el) {
+      if (!el.classList || !el.classList.contains('xft-vrow')) return;
+      for (const c of el.children) {
+        if (c.dataset && c.dataset.xftUrl && vUrlIndex.get(c.dataset.xftUrl) === sig) vUrlIndex.delete(c.dataset.xftUrl);
+      }
+    }
+    function poolTake(sig) {
+      const el = vPool.get(sig);
+      if (!el) return null;
+      vPool.delete(sig);
+      poolCleanUrls(sig, el);
+      return el;
+    }
+    function poolPut(sig, el) {
+      vPool.delete(sig);
+      vPool.set(sig, el); // (re)insert at the LRU end
+      if (el.classList.contains('xft-vrow')) {
+        for (const c of el.children) if (c.dataset && c.dataset.xftUrl) vUrlIndex.set(c.dataset.xftUrl, sig);
+      }
+      while (vPool.size > VPOOL_MAX) { // evict oldest
+        const old = vPool.keys().next().value;
+        const oldEl = vPool.get(old);
+        poolCleanUrls(old, oldEl);
+        oldEl.remove();
+        vPool.delete(old);
+      }
     }
     // one grid cell (media el + label + badge + click-to-view). Used by both
     // the lazy fill and the removal reconciler.
@@ -1291,25 +1327,35 @@
       });
       return cell;
     }
-    // build a row's real cells the first time it nears the viewport. The
-    // entry is recovered from data-xft-idxs and resolved against the CURRENT
-    // gridItems — the render loop re-points those indexes on every rebuild.
-    function fillRowShell(rowEl) {
-      if (rowEl.dataset.xftFilled) return;
-      const m = (rowEl.dataset.xftIdxs || '').split(',');
-      if (m.length !== 2) return;
-      rowEl.dataset.xftFilled = '1';
-      const first = +m[0];
-      rowEl.textContent = '';
-      for (let k = 0; k < +m[1]; k++) {
-        const it = gridItems[first + k];
-        if (it) rowEl.appendChild(buildMediaCell(it));
+    // build a fresh entry element (pool miss + no URL-overlap recycle):
+    // a media row with its real cells (uniform height via aspect-ratio
+    // cells — no shells), or a group header.
+    function buildRowElement(en) {
+      if (en.idxs) {
+        const rowEl = document.createElement('div');
+        rowEl.className = 'xft-vrow';
+        for (const i of en.idxs) {
+          const it = gridItems[i];
+          if (it) rowEl.appendChild(buildMediaCell(it));
+        }
+        // a removal wave just animated cells out — fresh rows must not pop
+        if (performance.now() < popSuppressUntil) rowEl.classList.add('xft-nopop');
+        return rowEl;
       }
-      // feed the measured height back as the intrinsic fallback for rows
-      // that have never been laid out (--xft-rowh) — content-visibility then
-      // estimates scroll height with real pixels, not a guess
-      const h = Math.round(rowEl.getBoundingClientRect().height);
-      if (h > 50 && panelBodyEl) panelBodyEl.style.setProperty('--xft-rowh', h + 'px');
+      const hEl = document.createElement('div');
+      hEl.className = 'xft-ghead' + (en.hdr === 'sub' ? ' xft-gsub' : '');
+      const lab = document.createElement('span');
+      lab.className = 'xft-glabel';
+      lab.textContent = en.label;
+      const line = document.createElement('span');
+      line.className = 'xft-gline';
+      hEl.append(lab, line);
+      if (en.postId) {
+        hEl.classList.add('xft-gjump');
+        hEl.title = en.label + ' — jump to post';
+        hEl.addEventListener('click', () => jumpTo(en.postId));
+      }
+      return hEl;
     }
     // removal waves re-chunk rows (items re-flow into new 4-packs), so a
     // row's identity cannot survive by index OR by first-url. Instead:
@@ -1332,22 +1378,136 @@
       rowEl.textContent = '';
       for (const c of kids) { delete c.dataset.xftReused; rowEl.appendChild(c); }
     }
-    // clearing the MAP alone leaves the row ELEMENTS in the DOM as orphans —
-    // after a Refresh they keep showing pre-refresh cells (short/blank rows
-    // mid-grid). Always detach on clear.
+    // THE window render: derive [first,last] from scrollTop, attach the
+    // wanted entries (reuse → pool → URL-recycle → build), pool the rest.
+    // Runs rAF-coalesced on scroll and synchronously after programmatic
+    // scroll writes — a viewport row cannot be unrendered while visible.
+    function renderSlice() {
+      if (!vRowsEl || !vMetrics || !panelBodyEl || panelTab !== 'media') return;
+      const vh = panelBodyEl.clientHeight;
+      if (vh <= 0) return; // hidden panel: nothing to render (ensure() re-runs on open)
+      const st = panelBodyEl.scrollTop;
+      const wr = windowRange(vMetrics.top, vMetrics.h, st - V_OVER_ABOVE, st + vh + V_OVER_BELOW);
+      const first = wr[0], last = wr[1];
+      // no-op scroll: window unchanged on this layout version
+      if (first === vRange.first && last === vRange.last && vRange.version === vVersion) return;
+      vRange = { first: first, last: last, version: vVersion };
+      const have = new Map();
+      for (const a of vAttached) have.set(a.sig, a.el);
+      const next = [];
+      const want = new Set();
+      for (let e = first; e <= last; e++) {
+        const en = vLayout[e];
+        if (!en) continue;
+        want.add(en.sig);
+        let el = have.get(en.sig) || poolTake(en.sig);
+        if (!el && en.idxs) {
+          // retirement re-chunk shifted membership: recycle any pool row
+          // sharing a URL and reconcile cell-by-cell — survivors keep imgs
+          for (const i of en.idxs) {
+            const it = gridItems[i];
+            const s2 = it && vUrlIndex.get(it.url);
+            if (s2) { const cand = poolTake(s2); if (cand) { el = cand; break; } }
+          }
+          if (el) reconcileRowCells(el, en.idxs.map((i) => gridItems[i]).filter(Boolean));
+        }
+        if (!el) el = buildRowElement(en);
+        next.push({ sig: en.sig, el: el });
+      }
+      for (const a of vAttached) if (!want.has(a.sig)) { poolPut(a.sig, a.el); a.el.remove(); }
+      // incremental DOM sync: touch ONLY new/moved elements. Transforms are
+      // ABSOLUTE offsets, so a sliding window leaves unchanged rows' CSS
+      // untouched — re-parenting the whole window every frame would restyle
+      // ~60 imgs per scroll tick (the tail-cost trap)
+      let ref = null;
+      for (let i = next.length - 1; i >= 0; i--) {
+        const el = next[i].el;
+        if (ref === null) {
+          if (el.parentNode !== vRowsEl || el.nextSibling) vRowsEl.appendChild(el);
+        } else if (el.parentNode !== vRowsEl || el.nextSibling !== ref) {
+          vRowsEl.insertBefore(el, ref);
+        }
+        const y = 'translateY(' + vMetrics.top[first + i] + 'px)';
+        if (el.style.transform !== y) el.style.transform = y;
+        ref = el;
+      }
+      vAttached = next;
+    }
+    // (re)mount the grid: stamp entry sigs, probe the uniform heights in
+    // place, compute metrics, set the EXACT spacer height, restore the
+    // anchor/target scroll, render the first slice. One synchronous pass —
+    // nothing paints mid-way.
+    function mountVirtualGrid(vrows, entries, anchorInfo, scrollTarget) {
+      vRowsEl = vrows;
+      vLayout = entries;
+      for (const en of entries) {
+        en.sig = en.idxs ? 'r:' + ((gridItems[en.idxs[0]] || {}).url || '') + ':' + en.idxs.length
+          : 'h:' + en.hdr + ':' + en.label + ':' + (en.postId || '');
+      }
+      // probe: one real row (4 aspect-1:1 cells) + one header of each kind,
+      // appended, measured, removed in the same tick — heights must match
+      // the CSS truth (borders, rounding), never a formula guess.
+      // A fresh spacer has no height → the body drops its vertical scrollbar
+      // → the probe row measures ~8px too wide → every offset drifts ~2.5px
+      // and the scroll range overshoots the real content bottom by hundreds
+      // of px. Force the scrollbar FIRST, then measure.
+      vrows.style.height = (panelBodyEl.clientHeight + 1) + 'px';
+      const probe = document.createElement('div');
+      probe.className = 'xft-vrow';
+      for (let k = 0; k < 4; k++) {
+        const c = document.createElement('div');
+        c.className = 'xft-cell';
+        probe.appendChild(c);
+      }
+      const ph = document.createElement('div');
+      ph.className = 'xft-ghead';
+      const ps = document.createElement('div');
+      ps.className = 'xft-ghead xft-gsub';
+      vrows.append(probe, ph, ps);
+      vRowH = probe.getBoundingClientRect().height || 140;
+      vHeadH = ph.getBoundingClientRect().height || 30;
+      vSubH = ps.getBoundingClientRect().height || 24;
+      probe.remove(); ph.remove(); ps.remove();
+      vMetrics = layoutMetrics(entries, vRowH, vHeadH, vSubH, V_GAP);
+      vVersion++;
+      vrows.style.height = vMetrics.total + 'px';
+      vrows.dataset.xftRows = String(entries.length); // probe breadcrumb
+      // scroll restore: content anchor (survives re-chunk + pooling) > view
+      // switch target (scrollMemory / vScrollKeep) > proportional fallback
+      let target = null;
+      if (anchorInfo) {
+        let eIdx = -1;
+        for (let e = 0; e < entries.length; e++) {
+          const en = entries[e];
+          if (anchorInfo.url) {
+            if (en.idxs && en.idxs.some((i) => gridItems[i] && gridItems[i].url === anchorInfo.url)) { eIdx = e; break; }
+          } else if (en.sig === anchorInfo.headSig) { eIdx = e; break; }
+        }
+        if (eIdx >= 0) target = vMetrics.top[eIdx] + anchorInfo.rel;
+        else if (anchorInfo.prevTotal > 0) target = anchorInfo.st * vMetrics.total / anchorInfo.prevTotal;
+      }
+      if (target === null) target = scrollTarget;
+      if (target !== null && isFinite(target)) {
+        programmaticScrollAt = performance.now();
+        panelBodyEl.scrollTop = Math.max(0, Math.min(target, panelBodyEl.scrollHeight - panelBodyEl.clientHeight));
+      }
+      renderSlice();
+    }
+    // full grid reset (Refresh / poison clear): pooled contents are stale by
+    // definition — detach + drop everything, reset the window state, blank
+    // the signature so the next render cannot early-return empty
     function clearVRows() {
-      // stash the scroll BEFORE detaching rows: removing them collapses the
-      // content height, the browser clamps scrollTop to 0, and the rebuild
-      // would then "keep" a zero position (the list jumps to the top on
-      // every broken-item rerender)
+      // stash the scroll BEFORE tearing down: collapsing content clamps
+      // scrollTop to 0 and the rebuild would "keep" the zero position
       if (panelBodyEl && vScrollKeep === null) vScrollKeep = panelBodyEl.scrollTop;
-      if (rowFillObserver) for (const el of vrowCache.values()) rowFillObserver.unobserve(el);
-      for (const el of vrowCache.values()) el.remove();
-      vrowCache.clear();
-      // cleared rows MUST rebuild: with the signature intact, renderPanelBody
-      // early-returns on its sig guard and the grid stays empty forever
-      // (broken-removal rerenders that change no counts, Refresh when the
-      // refetched data has the same shape)
+      vAttached = [];
+      for (const el of vPool.values()) el.remove();
+      vPool.clear();
+      vUrlIndex.clear();
+      vRange = { first: -1, last: -1, version: -1 };
+      vRowsEl = null;
+      vLayout = [];
+      vMetrics = null;
       lastPanelSignature = '';
     }
     // Smilies/stickers rehosted on image hosts carry NO url/class marker —
@@ -1649,8 +1809,8 @@
     function saveViewScroll() { if (panelBodyEl) scrollMemory[viewKey()] = panelBodyEl.scrollTop; }
     // smooth for short hops, instant for long jumps (a smooth glide across
     // 50k px is a blur, not an animation). The bottom target re-asserts for
-    // a couple of frames: content-visibility row estimates settle as rows
-    // render, and the first landing can end short of the true bottom.
+    // a couple of frames; renderSlice fires synchronously so a windowed
+    // grid lands on RENDERED rows, never a blank frame.
     function jumpScroll(top) {
       if (!panelBodyEl) return;
       const apply = (n, smooth) => {
@@ -1659,6 +1819,7 @@
         const far = Math.abs(target - panelBodyEl.scrollTop) > 4000;
         programmaticScrollAt = performance.now();
         panelBodyEl.scrollTo({ top: target, behavior: smooth && !far ? 'smooth' : 'auto' });
+        renderSlice();
         if (!top) requestAnimationFrame(() => apply(n - 1, false));
       };
       apply(3, true);
@@ -2062,9 +2223,9 @@
           const tile = document.createElement('div');
           tile.className = 'xft-vtile';
           const fill = (poster) => {
-            // no isConnected gate: the row may be scrolled out of range (kept
-            // in vrowCache, detached) when the poster arrives — filling a
-            // detached tile is fine, the image loads and shows on re-insert
+            // no isConnected gate: the row may be scrolled out of the window
+            // (pooled, detached) when the poster arrives — filling a detached
+            // tile is fine, the image loads and shows on re-insert
             const cell = tile.closest('.xft-cell');
             if (!poster) { if (cell) cell.classList.remove('xft-loading'); return; }
             if (tile.querySelector('img')) return;
@@ -2565,18 +2726,24 @@
       const viewChanged = viewKey() !== lastRenderedView;
       lastRenderedView = viewKey();
       let scrollTarget = viewChanged ? (scrollMemory[viewKey()] || 0) : keepScroll;
-      // removal rebuilds (retirement waves) drop rows ABOVE the viewport and
-      // shift everything under a numeric offset — anchor the first visible
-      // ROW and restore its on-screen pixel after the swap instead.
-      let rowAnchor = null;
-      if (!viewChanged && panelTab === 'media') {
-        const br = panelBodyEl.getBoundingClientRect();
-        for (const rowEl of panelBodyEl.querySelectorAll('.xft-vrows > div')) {
-          const r = rowEl.getBoundingClientRect();
-          if (r.bottom > br.top) {
-            // anchor the ELEMENT itself — rows survive rebuilds via the cache
-            rowAnchor = { el: rowEl, rel: r.top - br.top };
-            break;
+      // removal rebuilds (retirement waves) drop entries above the viewport
+      // and re-chunk everything under them — anchor the first VISIBLE entry
+      // by CONTENT (row: first cell URL; header: sig) plus its pixel offset
+      // from the viewport top. Content survives re-chunking and pooling;
+      // elements do not.
+      let anchorInfo = null;
+      let pendingMount = null;
+      if (!viewChanged && panelTab === 'media' && vMetrics && vLayout.length) {
+        const st0 = panelBodyEl.scrollTop;
+        const f0 = windowRange(vMetrics.top, vMetrics.h, st0, st0 + (panelBodyEl.clientHeight || 1))[0];
+        const en0 = vLayout[f0];
+        if (en0) {
+          const rel = st0 - vMetrics.top[f0];
+          if (en0.idxs) {
+            const it0 = gridItems[en0.idxs[0]];
+            anchorInfo = { url: it0 && it0.url, rel: rel, prevTotal: vMetrics.total, st: st0 };
+          } else {
+            anchorInfo = { headSig: en0.sig, rel: rel, prevTotal: vMetrics.total, st: st0 };
           }
         }
       }
@@ -2589,81 +2756,22 @@
       // restore then fights the user's active scrolling. replaceChildren
       // swaps in ONE mutation and the scroll survives natively.
       const frag = document.createDocumentFragment();
+      // stash the live media window into the pool BEFORE any body swap —
+      // replaceChildren discards (and GCs) the attached rows and their
+      // decoded imgs; pooled, the next mount re-attaches them as-is
+      if (vAttached.length) {
+        for (const a of vAttached) poolPut(a.sig, a.el);
+        vAttached = [];
+        vRange = { first: -1, last: -1, version: -1 };
+      }
       if (panelTab === 'media') {
-        // Shell grid: every row mounts NOW as a cheap placeholder (exact
-        // height via aspect-ratio shell cells), cells fill on viewport
-        // approach (IntersectionObserver), filled rows are never evicted and
-        // reused by signature on rebuilds. No spacer pads, no range windows,
-        // no pitch math — heights are exact, so nothing fights the scroll.
-        // content-visibility skips offscreen layout/paint; its intrinsic
-        // fallback is the MEASURED row height (--xft-rowh), not a guess.
+        gridItems = items;
         const vrows = document.createElement('div');
         vrows.className = 'xft-vrows';
-        const builtLayout = buildMediaLayout(items, settings.mediaGroup);
-        gridItems = items;
-        const fillObs = ensureRowFillObserver();
-        for (let r = 0; r < builtLayout.length; r++) {
-          const e = builtLayout[r];
-          // entry signature: a row cached while the list was SHORTER (or a
-          // header whose group moved) must rebuild — sig match = reuse the
-          // existing element (filled rows keep their imgs, shells stay
-          // observed; nothing ever reloads on rebuild)
-          let rowEl = vrowCache.get(r);
-          if (e.idxs) {
-            const want = e.idxs.map((i) => items[i]).filter(Boolean);
-            if (rowEl && rowEl.classList.contains('xft-vrow') && rowEl.dataset.xftFilled === '1') {
-              reconcileRowCells(rowEl, want); // survivors keep their imgs
-              if (performance.now() < popSuppressUntil) rowEl.classList.add('xft-nopop');
-              else rowEl.classList.remove('xft-nopop');
-            } else if (rowEl && rowEl.classList.contains('xft-vrow')) {
-              // still a shell: keep it lazy, just re-point the indexes (the
-              // chunk it will eventually build has moved under it)
-              rowEl.dataset.xftIdxs = e.idxs[0] + ',' + want.length;
-            } else {
-              rowEl = document.createElement('div');
-              rowEl.className = 'xft-vrow';
-              rowEl.dataset.xftIdxs = e.idxs[0] + ',' + want.length;
-              // removal wave just animated cells out — rebuilt rows must not
-              // pop back in or the whole grid flashes
-              if (performance.now() < popSuppressUntil) rowEl.classList.add('xft-nopop');
-              for (let k = 0; k < want.length; k++) {
-                const sh = document.createElement('div');
-                sh.className = 'xft-cell xft-cellshell';
-                rowEl.appendChild(sh);
-              }
-              fillObs.observe(rowEl);
-            }
-            vrowCache.set(r, rowEl);
-          } else {
-            // group headers are cheap — rebuild every time (never cached)
-            if (rowEl && rowFillObserver) rowFillObserver.unobserve(rowEl);
-            rowEl = document.createElement('div');
-            rowEl.className = 'xft-ghead' + (e.hdr === 'sub' ? ' xft-gsub' : '');
-            const lab = document.createElement('span');
-            lab.className = 'xft-glabel';
-            lab.textContent = e.label;
-            const line = document.createElement('span');
-            line.className = 'xft-gline';
-            rowEl.append(lab, line);
-            if (e.postId) {
-              rowEl.classList.add('xft-gjump');
-              rowEl.title = e.label + ' — jump to post';
-              rowEl.addEventListener('click', () => jumpTo(e.postId));
-            }
-            vrowCache.set(r, rowEl);
-          }
-          vrows.appendChild(rowEl);
-        }
-        // entries past the layout end (list shrank / view changed) must go:
-        // unobserve first — the observer holds strong refs
-        for (const k of Array.from(vrowCache.keys())) {
-          if (k >= builtLayout.length) {
-            if (rowFillObserver) rowFillObserver.unobserve(vrowCache.get(k));
-            vrowCache.get(k).remove();
-            vrowCache.delete(k);
-          }
-        }
         frag.appendChild(vrows);
+        // the mount runs AFTER replaceChildren — the spacer must be in the
+        // live DOM to probe real row/header heights (one synchronous pass)
+        if (items.length) pendingMount = { vrows: vrows, layout: buildMediaLayout(items, settings.mediaGroup) };
       } else {
         // grouped rows: the post label ([#pos] author) renders once per post
         // in a fixed-width first column; the post's links stack beneath it
@@ -2711,16 +2819,15 @@
         frag.appendChild(empty);
       }
       panelBodyEl.replaceChildren(frag);
-      // restore: rows are real in-flow content now, so heights are true at
-      // swap time (aspect-ratio cells) and one direct offset set is enough.
-      // The row anchor covers removal shifts; the numeric target covers view
-      // switches and keep-scroll.
-      if (rowAnchor || scrollTarget) {
-        programmaticScrollAt = performance.now();
-        if (rowAnchor && rowAnchor.el.isConnected) {
-          const br = panelBodyEl.getBoundingClientRect();
-          panelBodyEl.scrollTop += rowAnchor.el.getBoundingClientRect().top - br.top - rowAnchor.rel;
-        } else if (scrollTarget) {
+      if (pendingMount) {
+        // spacer height is EXACT (computed from probed uniform heights), so
+        // one direct scrollTop set restores the anchor / view target — no
+        // estimate settling, no clamp fights
+        mountVirtualGrid(pendingMount.vrows, pendingMount.layout, anchorInfo, scrollTarget);
+      } else {
+        vRowsEl = null;
+        if (panelTab !== 'media' && scrollTarget) {
+          programmaticScrollAt = performance.now();
           panelBodyEl.scrollTop = Math.min(scrollTarget, panelBodyEl.scrollHeight - panelBodyEl.clientHeight);
         }
       }
@@ -2809,11 +2916,33 @@
 
     // scrollbar drags / wheel / keyboard scrolling are all USER activity —
     // any scroll event not stamped as one of our own writes updates the
-    // timestamp (holds removal rerenders while the user is mid-scroll)
+    // timestamp (holds removal rerenders while the user is mid-scroll).
+    // The same listener drives the windowed grid (rAF-coalesced).
     function installScrollWatch() {
       panelBodyEl.addEventListener('scroll', () => {
         if (performance.now() - programmaticScrollAt > 40) lastUserScrollAt = performance.now();
+        queueRenderSlice();
       }, { passive: true });
+    }
+    // drawer/window resizes change the row width → the uniform row height
+    // changes → every offset changes. Debounced re-mount of the metrics
+    // with a proportional scroll restore (rows resize under the viewport
+    // anyway — sub-row precision is lost by design on resize).
+    function installGridResizeWatch() {
+      if (typeof ResizeObserver === 'undefined' || !panelBodyEl) return;
+      let lastW = panelBodyEl.clientWidth;
+      let t = 0;
+      new ResizeObserver((ents) => {
+        const w = Math.round(ents[0].contentRect.width);
+        if (Math.abs(w - lastW) < 2) return; // our spacer writes never change the BODY width
+        lastW = w;
+        clearTimeout(t);
+        t = setTimeout(() => {
+          if (panelTab !== 'media' || !vRowsEl || !vRowsEl.isConnected || !vMetrics) return;
+          const st = panelBodyEl.scrollTop;
+          mountVirtualGrid(vRowsEl, vLayout, { prevTotal: vMetrics.total, st: st }, null);
+        }, 150);
+      }).observe(panelBodyEl);
     }
 
     function setPanelOpen(open) {
@@ -3069,6 +3198,7 @@
       setTab('media');
       buildEdgeButton();
       installScrollWatch();
+      installGridResizeWatch();
     }
 
     // ---------- step 9: toolbar injection ----------
@@ -3168,8 +3298,9 @@
         '.xft-dl-run{background:hsl(var(--xft-ring)/.18)!important;border-color:hsl(var(--xft-ring))!important}',
         '.xft-jumps{position:absolute;right:10px;bottom:14px;display:flex;flex-direction:column;gap:6px;z-index:5}',
         '.xft-jumpbtn{width:30px;height:30px;padding:0;font-size:14px;line-height:1;border-radius:8px;box-shadow:0 2px 8px hsl(240 10% 3.9%/.25)}',
-        // group headers: label + hairline filler; fixed heights keep the
-        // flow layout compact — no scroll math depends on them anymore
+        // group headers: label + hairline filler; the fixed heights (30/24)
+        // are the virtual grid's headH/subH inputs — keep CSS and
+        // layoutMetrics in sync if these change
         '.xft-ghead{display:flex;align-items:center;gap:8px;height:30px;user-select:none}',
         '.xft-ghead.xft-gjump{cursor:pointer}',
         '.xft-glabel{font-size:12px;font-weight:600;color:hsl(var(--xft-fg));white-space:nowrap;overflow:hidden;text-overflow:ellipsis;max-width:70%}',
@@ -3190,12 +3321,15 @@
         '.xft-body::-webkit-scrollbar{width:8px}',
         '.xft-body::-webkit-scrollbar-thumb{background:hsl(var(--xft-muted));border-radius:4px}',
         '.xft-grid{display:grid;grid-template-columns:repeat(4,1fr);gap:6px}',
-        '.xft-vrows{display:flex;flex-direction:column;gap:6px}',
-        '.xft-vrow{display:grid;grid-template-columns:repeat(4,1fr);gap:6px;content-visibility:auto;contain-intrinsic-size:auto var(--xft-rowh,140px)}',
+        // windowed grid: the spacer holds the EXACT total height; only
+        // windowed entries are in the DOM, positioned by transform at their
+        // computed offsets (layoutMetrics)
+        '.xft-vrows{position:relative}',
+        '.xft-vrows>*{position:absolute;left:0;right:0;top:0}',
+        '.xft-vrow{display:grid;grid-template-columns:repeat(4,1fr);gap:6px}',
         '.xft-hq-top{position:absolute;inset:0;width:100%;height:100%;object-fit:contain;opacity:0;transition:opacity .35s ease;z-index:2;pointer-events:none}',
         '.xft-cell .xft-hq-top{object-fit:cover}',
         '.xft-hq-top.xft-hq-on{opacity:1}',
-        '.xft-cellshell{aspect-ratio:1;border:1px solid hsl(var(--xft-border));border-radius:calc(var(--xft-radius) - 2px);background:hsl(var(--xft-muted))}',
         '.xft-cell{position:relative;aspect-ratio:1;overflow:hidden;border:1px solid hsl(var(--xft-border));border-radius:calc(var(--xft-radius) - 2px);cursor:zoom-in;background:hsl(var(--xft-muted));padding:0;transition:box-shadow .15s}',
         '.xft-cell:hover{box-shadow:0 0 0 2px hsl(var(--xft-ring)/.35)}',
         '.xft-cell img,.xft-cell video{width:100%;height:100%;object-fit:cover;display:block}',
@@ -3348,6 +3482,52 @@
     })();
   }
 
+  // ---------- virtual grid math (pure — unit-tested, no DOM) ----------
+  // Windowed rendering needs EXACT heights or the spacer drifts and the
+  // scroll clamp eats the difference as push-back (the pre-0.7.45 bug).
+  // Height sources: media row = rowH, uniform by construction (4 aspect-1:1
+  // cells in the row's own 4-col grid — the row is as tall as one cell,
+  // measured from a probe row at mount: borders/rounding included, never a
+  // guess); group headers = headH/subH (CSS-fixed 30/24px, probed too).
+  // Every entry advances h + gap; total omits the trailing gap.
+  function layoutMetrics(entries, rowH, headH, subH, gap) {
+    const n = entries.length;
+    const top = new Array(n);
+    const h = new Array(n);
+    let y = 0;
+    for (let e = 0; e < n; e++) {
+      const en = entries[e];
+      const eh = en.idxs ? rowH : (en.hdr === 'sub' ? subH : headH);
+      top[e] = y;
+      h[e] = eh;
+      y += eh + gap;
+    }
+    return { top: top, h: h, total: n ? y - gap : 0 };
+  }
+  // visible window [first, last] over computed tops: first = earliest entry
+  // whose BOTTOM is below viewTop (an entry straddling viewTop stays in),
+  // last = last entry whose top is at/below viewBot. bottom(e) = top(e+1)
+  // − gap, so both bounds are monotonic → two binary searches. Returns
+  // [first, -1] for an empty layout or a window past the end.
+  function windowRange(top, h, viewTop, viewBot) {
+    const n = top.length;
+    if (!n) return [0, -1];
+    let lo = 0, hi = n - 1, first = n;
+    while (lo <= hi) {
+      const mid = (lo + hi) >> 1;
+      if (top[mid] + h[mid] > viewTop) { first = mid; hi = mid - 1; } else lo = mid + 1;
+    }
+    if (first >= n) return [n, -1];
+    lo = 0; hi = n - 1;
+    let beyond = -1;
+    while (lo <= hi) {
+      const mid = (lo + hi) >> 1;
+      if (top[mid] > viewBot) { beyond = mid; hi = mid - 1; } else lo = mid + 1;
+    }
+    const last = beyond === -1 ? n - 1 : beyond - 1;
+    return last < first ? [first, -1] : [first, last];
+  }
+
   // UMD export of the pure functions for node:test (no DOM / GM usage in them).
-  if (typeof module !== 'undefined' && module.exports) module.exports = { parseReactionCount, filterLinks, sortPosts, estimateSize, partitionLinks, extractDomain, groupLinkItems, applyLinkFilters, boilerplateUrls, isSmilieUrl, parseEmbedPoster, embedSignUrl, parseSignResponse, parseSignToken, parseVideoPage, isVideoPageUrl, hqCandidates, sanitizeFileSeg, siteTagFromHost, cleanThreadTitle, zipFileName, imagePageHref, parseImagePage, parseImageApiResponse, dlBasename, buildDlJobs, crc32, zipStoreU8 };
+  if (typeof module !== 'undefined' && module.exports) module.exports = { parseReactionCount, filterLinks, sortPosts, estimateSize, partitionLinks, extractDomain, groupLinkItems, applyLinkFilters, boilerplateUrls, isSmilieUrl, parseEmbedPoster, embedSignUrl, parseSignResponse, parseSignToken, parseVideoPage, isVideoPageUrl, hqCandidates, sanitizeFileSeg, siteTagFromHost, cleanThreadTitle, zipFileName, imagePageHref, parseImagePage, parseImageApiResponse, dlBasename, buildDlJobs, crc32, zipStoreU8, layoutMetrics, windowRange };
 })();
