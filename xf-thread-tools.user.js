@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         xf-thread-tools
 // @namespace    xf-thread-tools
-// @version      0.7.46
+// @version      0.7.47
 // @description  XenForo 2: sort thread posts by reaction count across all pages (cached) + floating media panel (images / external links).
 // @author       xf-thread-tools
 // @match        *://*/threads/*
@@ -1193,48 +1193,78 @@
       }, { root: panelBodyEl, rootMargin: '1600px 0px' });
       return rowFillObserver;
     }
+    // one grid cell (media el + label + badge + click-to-view). Used by both
+    // the lazy fill and the removal reconciler.
+    function buildMediaCell(it) {
+      const cell = document.createElement('div');
+      cell.className = 'xft-cell';
+      cell.dataset.xftUrl = it.url;
+      cell.title = '[#' + it.pos + '] ' + (it.r.author || '?') + ' — open';
+      const isVideo = it.kind === 'video' || it.kind === 'embed';
+      const thumb = buildMediaEl(it.kind, it.url, true);
+      // shimmer while the media loads (cached-complete images come back
+      // already ok'd — no flash for them)
+      if ((it.kind === 'image' || it.kind === 'embed')
+        && !(thumb.tagName === 'IMG' && thumb.classList.contains('xft-ok'))) cell.classList.add('xft-loading');
+      const label = document.createElement('span');
+      label.className = 'xft-cell-label';
+      label.textContent = '#' + it.pos + ' ' + (it.r.author || '?');
+      cell.append(thumb, label);
+      if (isVideo) {
+        const badge = document.createElement('span');
+        badge.className = 'xft-cell-badge';
+        badge.textContent = '▶';
+        cell.appendChild(badge);
+      }
+      // resolve the index AT CLICK TIME: retirement waves shift indexes,
+      // a fill-time closure would open the wrong item after a removal
+      const url0 = it.url;
+      cell.addEventListener('click', () => {
+        const idx = viewerItems.findIndex((x) => x.url === url0);
+        if (idx >= 0) openViewerAt(idx);
+      });
+      return cell;
+    }
     // build a row's real cells the first time it nears the viewport. The
-    // entry is recovered from the row's own signature (r<first>:<len>) and
-    // resolved against the CURRENT gridItems — sig match guarantees the
-    // indices point at the same items the row was built for.
+    // entry is recovered from data-xft-idxs and resolved against the CURRENT
+    // gridItems — the render loop re-points those indexes on every rebuild.
     function fillRowShell(rowEl) {
       if (rowEl.dataset.xftFilled) return;
-      const m = (rowEl.dataset.xftSig || '').match(/^r(\d+):(\d+)$/);
-      if (!m) return;
+      const m = (rowEl.dataset.xftIdxs || '').split(',');
+      if (m.length !== 2) return;
       rowEl.dataset.xftFilled = '1';
-      const first = +m[1];
+      const first = +m[0];
       rowEl.textContent = '';
-      for (let k = 0; k < +m[2]; k++) {
-        const i = first + k;
-        const it = gridItems[i];
-        if (!it) continue;
-        const cell = document.createElement('div');
-        cell.className = 'xft-cell';
-        cell.title = '[#' + it.pos + '] ' + (it.r.author || '?') + ' — open';
-        const isVideo = it.kind === 'video' || it.kind === 'embed';
-        const thumb = buildMediaEl(it.kind, it.url, true);
-        // shimmer while the media loads (cached-complete images come back
-        // already ok'd — no flash for them)
-        if ((it.kind === 'image' || it.kind === 'embed')
-          && !(thumb.tagName === 'IMG' && thumb.classList.contains('xft-ok'))) cell.classList.add('xft-loading');
-        const label = document.createElement('span');
-        label.className = 'xft-cell-label';
-        label.textContent = '#' + it.pos + ' ' + (it.r.author || '?');
-        cell.append(thumb, label);
-        if (isVideo) {
-          const badge = document.createElement('span');
-          badge.className = 'xft-cell-badge';
-          badge.textContent = '▶';
-          cell.appendChild(badge);
-        }
-        cell.addEventListener('click', () => openViewerAt(i));
-        rowEl.appendChild(cell);
+      for (let k = 0; k < +m[1]; k++) {
+        const it = gridItems[first + k];
+        if (it) rowEl.appendChild(buildMediaCell(it));
       }
       // feed the measured height back as the intrinsic fallback for rows
       // that have never been laid out (--xft-rowh) — content-visibility then
       // estimates scroll height with real pixels, not a guess
       const h = Math.round(rowEl.getBoundingClientRect().height);
       if (h > 50 && panelBodyEl) panelBodyEl.style.setProperty('--xft-rowh', h + 'px');
+    }
+    // removal waves re-chunk rows (items re-flow into new 4-packs), so a
+    // row's identity cannot survive by index OR by first-url. Instead:
+    // reconcile CELL-BY-CELL by URL — surviving cells keep their img
+    // elements (never re-created, never re-fetched), removed cells drop,
+    // newcomers are built on the spot. A retirement wave then costs a few
+    // string compares per row instead of discarding the whole grid.
+    function reconcileRowCells(rowEl, want) {
+      const byUrl = new Map();
+      for (const c of Array.from(rowEl.children)) {
+        if (c.dataset && c.dataset.xftUrl && !c.dataset.xftReused) byUrl.set(c.dataset.xftUrl, c);
+      }
+      const kids = [];
+      const taken = new Set();
+      for (const it of want) {
+        const c = byUrl.get(it.url);
+        if (c && !taken.has(it.url)) { taken.add(it.url); c.dataset.xftReused = '1'; kids.push(c); }
+        else kids.push(buildMediaCell(it));
+      }
+      rowEl.textContent = '';
+      for (const c of kids) { delete c.dataset.xftReused; rowEl.appendChild(c); }
     }
     // clearing the MAP alone leaves the row ELEMENTS in the DOM as orphans —
     // after a Refresh they keep showing pre-refresh cells (short/blank rows
@@ -2234,9 +2264,22 @@
     // (All/Image/Video) keep the grouping but drop empty groups.
     function buildMediaLayout(items, mode) {
       const lay = [];
-      const chunk = (list) => { for (let j = 0; j < list.length; j += 4) lay.push({ idxs: list.slice(j, j + 4) }); };
+      // rows are bucketed by each item's STABLE ordinal (its index in the
+      // pre-filter stream): a retirement leaves a SHORT row (a hole at the
+      // end), and every other row keeps its exact identity — items never
+      // re-flow into different rows. The bucket id is the row's cache key.
+      const bucket = (idxs, prefix) => {
+        const bySlot = new Map();
+        for (const i of idxs) {
+          const slot = Math.floor(items[i].ord / 4);
+          let row = bySlot.get(slot);
+          if (!row) { row = []; bySlot.set(slot, row); }
+          row.push(i);
+        }
+        for (const row of bySlot.values()) lay.push({ idxs: row, key: prefix + ':s' + Math.floor(items[row[0]].ord / 4) });
+      };
       if (mode !== 'post' && mode !== 'page' && mode !== 'user') {
-        chunk(items.map((_, i) => i));
+        bucket(items.map((_, i) => i), 'k');
         return lay;
       }
       const groups = new Map(); // insertion order = first-appearance order
@@ -2260,7 +2303,7 @@
           // user groups already name the author in their main header — the
           // post sub-header shows the number only
           if (mode !== 'post') lay.push({ hdr: 'sub', label: mode === 'user' ? '#' + s.pos : '#' + s.pos + ' - ' + s.author, postId: s.postId });
-          chunk(s.list);
+          bucket(s.list, 'g' + gkey + ':' + s.postId);
         }
       }
       return lay;
@@ -2290,14 +2333,29 @@
     function collectMediaItems(d) {
       const all = [];
       // stale caches (pre-0.7.9) hold 1×1 data-URI placeholders alongside
-      // their real URLs (attachment-scan twins) — drop the placeholders so
-      // already-cached threads heal without a Refresh; smilies and
-      // signature/footer boilerplate are filtered the same way
-      const real = (list) => (list || []).filter((u) => !/^(data|blob):/i.test(u || '') && !isSmilieUrl(u) && !d.boiler.has(String(u || '')) && !tinyMediaUrls.has(String(u || '')) && !brokenMediaUrls.has(String(u || '')));
+      // their real URLs — dropped here so cached threads heal without a
+      // Refresh; smilies and signature/footer boilerplate are filtered the
+      // same way (all inside keep()).
+      // ord = position in the RAW stream (unfiltered). It must NOT be the
+      // index of the surviving list — a retirement would renumber everything
+      // after it and destroy the stable row keys. Raw gaps are fine: keys
+      // stay put while the retired items simply vanish from their buckets.
+      let raw = 0;
+      const keep = (u) => {
+        const s2 = String(u || '');
+        return !!s2 && !/^(data|blob):/i.test(s2) && !isSmilieUrl(s2) && !d.boiler.has(s2)
+          && !tinyMediaUrls.has(s2) && !brokenMediaUrls.has(s2);
+      };
       for (const r of d.orderedShown) {
-        for (const url of real(r.images)) all.push({ r: r, url: url, pos: d.posMap.get(r.postId) || 0, kind: 'image' });
-        for (const url of real(r.videos)) all.push({ r: r, url: url, pos: d.posMap.get(r.postId) || 0, kind: 'video' });
-        for (const url of real(r.embeds)) all.push({ r: r, url: url, pos: d.posMap.get(r.postId) || 0, kind: 'embed' });
+        const push = (list, kind) => {
+          for (const url of (list || [])) {
+            if (keep(url)) all.push({ r: r, url: String(url || ''), pos: d.posMap.get(r.postId) || 0, kind: kind, ord: raw });
+            raw++;
+          }
+        };
+        push(r.images, 'image');
+        push(r.videos, 'video');
+        push(r.embeds, 'embed');
       }
       // embeds are videos hosted elsewhere — they count under the Video tab
       const mediaCounts = { all: all.length, image: 0, video: 0 };
@@ -2359,7 +2417,8 @@
         for (const rowEl of panelBodyEl.querySelectorAll('.xft-vrows > div')) {
           const r = rowEl.getBoundingClientRect();
           if (r.bottom > br.top) {
-            rowAnchor = { sig: rowEl.dataset.xftSig || '', rel: r.top - br.top };
+            // anchor the ELEMENT itself — rows survive rebuilds via the cache
+            rowAnchor = { el: rowEl, rel: r.top - br.top };
             break;
           }
         }
@@ -2385,6 +2444,7 @@
         vrows.className = 'xft-vrows';
         const builtLayout = buildMediaLayout(items, settings.mediaGroup);
         gridItems = items;
+        const usedRowKeys = new Set();
         const fillObs = ensureRowFillObserver();
         for (let r = 0; r < builtLayout.length; r++) {
           const e = builtLayout[r];
@@ -2392,46 +2452,61 @@
           // header whose group moved) must rebuild — sig match = reuse the
           // existing element (filled rows keep their imgs, shells stay
           // observed; nothing ever reloads on rebuild)
-          const esig = e.idxs ? 'r' + e.idxs[0] + ':' + e.idxs.length : 'h' + e.hdr + ':' + e.label;
-          let rowEl = vrowCache.get(r);
-          if (rowEl && rowEl.dataset.xftSig !== esig) {
-            if (rowFillObserver) rowFillObserver.unobserve(rowEl);
-            rowEl.remove();
-            vrowCache.delete(r);
-            rowEl = null;
-          }
-          if (!rowEl) {
-            if (e.idxs) {
+          let rowEl = e.key !== undefined ? vrowCache.get(e.key) : null;
+          if (e.key !== undefined) usedRowKeys.add(e.key);
+          if (e.idxs) {
+            const want = e.idxs.map((i) => items[i]).filter(Boolean);
+            if (rowEl && rowEl.classList.contains('xft-vrow') && rowEl.dataset.xftFilled === '1') {
+              reconcileRowCells(rowEl, want); // survivors keep their imgs
+              if (performance.now() < popSuppressUntil) rowEl.classList.add('xft-nopop');
+              else rowEl.classList.remove('xft-nopop');
+            } else if (rowEl && rowEl.classList.contains('xft-vrow')) {
+              // still a shell: keep it lazy, just re-point the indexes (the
+              // chunk it will eventually build has moved under it)
+              rowEl.dataset.xftIdxs = e.idxs[0] + ',' + want.length;
+            } else {
               rowEl = document.createElement('div');
               rowEl.className = 'xft-vrow';
+              rowEl.dataset.xftIdxs = e.idxs[0] + ',' + want.length;
               // removal wave just animated cells out — rebuilt rows must not
               // pop back in or the whole grid flashes
               if (performance.now() < popSuppressUntil) rowEl.classList.add('xft-nopop');
-              for (let k = 0; k < e.idxs.length; k++) {
+              for (let k = 0; k < want.length; k++) {
                 const sh = document.createElement('div');
                 sh.className = 'xft-cell xft-cellshell';
                 rowEl.appendChild(sh);
               }
               fillObs.observe(rowEl);
-            } else {
-              rowEl = document.createElement('div');
-              rowEl.className = 'xft-ghead' + (e.hdr === 'sub' ? ' xft-gsub' : '');
-              const lab = document.createElement('span');
-              lab.className = 'xft-glabel';
-              lab.textContent = e.label;
-              const line = document.createElement('span');
-              line.className = 'xft-gline';
-              rowEl.append(lab, line);
-              if (e.postId) {
-                rowEl.classList.add('xft-gjump');
-                rowEl.title = e.label + ' — jump to post';
-                rowEl.addEventListener('click', () => jumpTo(e.postId));
-              }
             }
-            rowEl.dataset.xftSig = esig;
-            vrowCache.set(r, rowEl);
+            vrowCache.set(e.key, rowEl);
+          } else {
+            // group headers are cheap — rebuild every time (never cached)
+            if (rowEl && rowFillObserver) rowFillObserver.unobserve(rowEl);
+            rowEl = document.createElement('div');
+            rowEl.className = 'xft-ghead' + (e.hdr === 'sub' ? ' xft-gsub' : '');
+            const lab = document.createElement('span');
+            lab.className = 'xft-glabel';
+            lab.textContent = e.label;
+            const line = document.createElement('span');
+            line.className = 'xft-gline';
+            rowEl.append(lab, line);
+            if (e.postId) {
+              rowEl.classList.add('xft-gjump');
+              rowEl.title = e.label + ' — jump to post';
+              rowEl.addEventListener('click', () => jumpTo(e.postId));
+            }
+            vrowCache.set('h' + r, rowEl);
           }
           vrows.appendChild(rowEl);
+        }
+        // rows whose key vanished this render (filtered out / different
+        // view) must go: unobserve first — the observer holds strong refs
+        for (const [k, el] of Array.from(vrowCache)) {
+          if (!usedRowKeys.has(k) && k.charAt(0) !== 'h') {
+            if (rowFillObserver) rowFillObserver.unobserve(el);
+            el.remove();
+            vrowCache.delete(k);
+          }
         }
         frag.appendChild(vrows);
       } else {
@@ -2487,14 +2562,9 @@
       // switches and keep-scroll.
       if (rowAnchor || scrollTarget) {
         programmaticScrollAt = performance.now();
-        if (rowAnchor) {
+        if (rowAnchor && rowAnchor.el.isConnected) {
           const br = panelBodyEl.getBoundingClientRect();
-          for (const rowEl of panelBodyEl.querySelectorAll('.xft-vrows > div')) {
-            if (rowEl.dataset.xftSig === rowAnchor.sig) {
-              panelBodyEl.scrollTop += rowEl.getBoundingClientRect().top - br.top - rowAnchor.rel;
-              break;
-            }
-          }
+          panelBodyEl.scrollTop += rowAnchor.el.getBoundingClientRect().top - br.top - rowAnchor.rel;
         } else if (scrollTarget) {
           panelBodyEl.scrollTop = Math.min(scrollTarget, panelBodyEl.scrollHeight - panelBodyEl.clientHeight);
         }
