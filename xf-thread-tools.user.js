@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         xf-thread-tools
 // @namespace    xf-thread-tools
-// @version      0.7.50
+// @version      0.7.51
 // @description  XenForo 2: sort thread posts by reaction count across all pages (cached) + floating media panel (images / external links).
 // @author       xf-thread-tools
 // @match        *://*/threads/*
@@ -2205,7 +2205,33 @@
       // Skipped when a static marker chain exists (.md/.th win, cheaper).
       if (pageUrl && cands.length === 1) {
         resolveImagePage(pageUrl, url, (full) => {
-          if (full && im.src !== full) im.src = full;
+          if (!full || im.src === full) return;
+          // decode the original OFFSCREEN first: swapping src on the live img
+          // paints the progressive stream part-by-part. Preload + decode()
+          // means the swap shows a complete frame, then a short crossfade
+          // (old frame on the bottom layer) makes the replace smooth.
+          const pre = new Image();
+          pre.decoding = 'async';
+          pre.referrerPolicy = 'no-referrer'; // CDNs in this family 403 foreign referers
+          pre.src = full;
+          const show = () => {
+            const host = im.parentNode;
+            if (!host || im.src === full) return;
+            const top = document.createElement('img');
+            top.src = full;
+            top.alt = '';
+            top.referrerPolicy = 'no-referrer';
+            top.className = 'xft-hq-top';
+            top.addEventListener('load', () => {
+              top.classList.add('xft-ok'); // reveal gate: cell imgs are blur-gated until ok
+              requestAnimationFrame(() => top.classList.add('xft-hq-on'));
+              setTimeout(() => { im.src = full; top.remove(); }, 450); // swap beneath, then drop the layer
+            }, { once: true });
+            host.appendChild(top);
+            if (top.complete && top.naturalWidth) top.dispatchEvent(new Event('load'));
+          };
+          if (pre.decode) pre.decode().then(show, show);
+          else pre.addEventListener('load', show, { once: true });
         });
       }
       // A failure cached by Chrome replays instantly with NO error event, and
@@ -3178,6 +3204,9 @@
         '.xft-grid{display:grid;grid-template-columns:repeat(4,1fr);gap:6px}',
         '.xft-vrows{display:flex;flex-direction:column;gap:6px}',
         '.xft-vrow{display:grid;grid-template-columns:repeat(4,1fr);gap:6px;content-visibility:auto;contain-intrinsic-size:auto var(--xft-rowh,140px)}',
+        '.xft-hq-top{position:absolute;inset:0;width:100%;height:100%;object-fit:contain;opacity:0;transition:opacity .35s ease;z-index:2;pointer-events:none}',
+        '.xft-cell .xft-hq-top{object-fit:cover}',
+        '.xft-hq-top.xft-hq-on{opacity:1}',
         '.xft-cellshell{aspect-ratio:1;border:1px solid hsl(var(--xft-border));border-radius:calc(var(--xft-radius) - 2px);background:hsl(var(--xft-muted))}',
         '.xft-cell{position:relative;aspect-ratio:1;overflow:hidden;border:1px solid hsl(var(--xft-border));border-radius:calc(var(--xft-radius) - 2px);cursor:zoom-in;background:hsl(var(--xft-muted));padding:0;transition:box-shadow .15s}',
         '.xft-cell:hover{box-shadow:0 0 0 2px hsl(var(--xft-ring)/.35)}',
@@ -3278,7 +3307,7 @@
         '.xft-pulse{outline:3px solid transparent;animation:xftpulse 1.6s ease-out 2}',
         '@keyframes xftpulse{0%{outline-color:hsl(38 92% 50%)}100%{outline-color:transparent}}',
         '#xft-sort-btn{margin-left:4px;cursor:pointer}',
-        '@media (prefers-reduced-motion:reduce){html:not(.xft-anim-force) #xft-panel,html:not(.xft-anim-force) .xft-btn,html:not(.xft-anim-force) #xft-edge-btn,html:not(.xft-anim-force) .xft-cell{transition:none}html:not(.xft-anim-force) .xft-pulse{animation:none}html:not(.xft-anim-force) .xft-dlzip .xft-dlprog>i{animation:none;background:hsl(var(--xft-ring))}html:not(.xft-anim-force) .xft-dlprog>i{transition:none}}'
+        '@media (prefers-reduced-motion:reduce){html:not(.xft-anim-force) #xft-panel,html:not(.xft-anim-force) .xft-btn,html:not(.xft-anim-force) #xft-edge-btn,html:not(.xft-anim-force) .xft-cell{transition:none}html:not(.xft-anim-force) .xft-pulse{animation:none}html:not(.xft-anim-force) .xft-hq-top{transition:none}html:not(.xft-anim-force) .xft-dlzip .xft-dlprog>i{animation:none;background:hsl(var(--xft-ring))}html:not(.xft-anim-force) .xft-dlprog>i{transition:none}}'
       ].join('');
       document.head.appendChild(st);
     }
