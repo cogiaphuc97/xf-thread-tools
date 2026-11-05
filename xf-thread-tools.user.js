@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         xf-thread-tools
 // @namespace    xf-thread-tools
-// @version      0.7.42
+// @version      0.7.43
 // @description  XenForo 2: sort thread posts by reaction count across all pages (cached) + floating media panel (images / external links).
 // @author       xf-thread-tools
 // @match        *://*/threads/*
@@ -166,6 +166,27 @@
   // sanitized (no traversal, no control chars) and capped at 120 chars.
   function sanitizeFileSeg(s) {
     return String(s || '').replace(/[^a-zA-Z0-9._-]+/g, '_').replace(/^[._-]+/, '').replace(/\.{2,}/g, '.').slice(0, 120);
+  }
+  // Outer zip FILE name — deliberately unlike sanitizeFileSeg: the anchor
+  // download attribute takes Unicode + spaces, so the Vietnamese title stays
+  // readable. Only filesystem-illegal characters die. (Zip ENTRY names keep
+  // using sanitizeFileSeg — those live inside the zip we write by hand.)
+  function siteTagFromHost(host) {
+    const parts = String(host || '').toLowerCase().replace(/^www\./, '').split(':')[0].split('.').filter(Boolean);
+    const core = parts.length >= 2 ? parts[parts.length - 2] : (parts[0] || 'site');
+    return core.charAt(0).toUpperCase() + core.slice(1);
+  }
+  function cleanThreadTitle(raw) {
+    let t = String(raw || '').replace(/[\x00-\x1f]+/g, ' ').trim();
+    t = t.replace(/^(?:\s*\[[^\]]{0,40}\]\s*)+/, ''); // leading [tag] groups
+    const bar = t.indexOf(' | ');
+    if (bar > 0) t = t.slice(0, bar); // trailing " | Forum" suffix
+    return t.replace(/[\\/:*?"<>|]/g, '').replace(/\s+/g, ' ').trim();
+  }
+  function zipFileName(tag, title) {
+    const t = cleanThreadTitle(title);
+    if (!t) return (tag || 'thread') + '.zip';
+    return '[' + (tag || 'Site') + '] ' + t + '.zip';
   }
   function dlBasename(url, kind, idx) {
     let b = '';
@@ -1594,28 +1615,94 @@
     // download prompts. Embed player tiles have no direct media file and are
     // skipped + reported. Fetches are serialized 2-at-a-time for the same
     // CDN-burst reason as the HQ queue; a second click cancels the run.
-    const dlRun = { running: false, cancel: false, total: 0, done: 0, fail: 0, skip: 0, bytes: 0, lastErr: '' };
+    const dlRun = { running: false, cancel: false, phase: 'idle', total: 0, done: 0, fail: 0, skip: 0, bytes: 0, lastErr: '' };
     const dlNet = { active: 0, queue: [], last: 0 };
     const DL_NET_MAX = 2;
     const DL_NET_GAP = 400;
     const DL_BYTE_CAP = 3500 * 1024 * 1024; // zip offsets are 32-bit — stop well under 4 GB
     let dlJobs = [];
     let dlBtnEl = null;
-    function threadTitle() {
+    let dlBarEl = null, dlNameEl = null, dlFillEl = null, dlStatsEl = null, dlCancelEl = null, dlCloseEl = null;
+    let dlSpeedWin = []; // [{t, b}] byte deltas — rolling 3s window for the speed readout
+    let dlDashAt = 0;    // dash repaint throttle stamp
+    function threadTitleRaw() {
       const h = document.querySelector('h1.p-title-value');
-      let t = (h ? h.textContent : '') || document.title || '';
-      t = t.split('|')[0].trim();
-      return sanitizeFileSeg(t) || 'thread';
+      let t = '';
+      if (h) {
+        // thread prefixes/tags ride INSIDE the h1 (XF renders them as label
+        // links) — clone and drop them so the tag is not part of the name
+        const c = h.cloneNode(true);
+        c.querySelectorAll('a,[class*="label"],[class*="prefix"]').forEach((n) => n.remove());
+        t = c.textContent || '';
+      }
+      if (!t.trim()) t = document.title || '';
+      return t;
     }
-    function updateDlBtn(text, running) {
+    function zipName() {
+      return zipFileName(siteTagFromHost(location.hostname), threadTitleRaw());
+    }
+    function updateDlBtn() {
       if (!dlBtnEl) return;
-      dlBtnEl.textContent = text || 'Download';
-      dlBtnEl.classList.toggle('xft-dl-run', !!running);
+      dlBtnEl.textContent = dlRun.running ? 'Stop' : 'Download';
+      dlBtnEl.classList.toggle('xft-dl-run', !!dlRun.running);
       dlBtnEl.title = dlRun.running
-        ? 'Building zip — click to stop. ' + dlRun.done + ' ok, ' + dlRun.fail + ' failed, '
-          + (dlRun.bytes / 1048576).toFixed(1) + ' MB' + (dlRun.lastErr ? ', ' + dlRun.lastErr : '')
+        ? 'Stop the bulk download'
         : 'Download the ' + panelSubTab + ' list as one zip (Pics/ + Videos/, named after the thread). '
-          + 'Embed player tiles are skipped (no direct file). Click again while running to stop.';
+          + 'Embed player tiles are skipped (no direct file).';
+    }
+    function dlSpeed() {
+      const now = performance.now();
+      dlSpeedWin = dlSpeedWin.filter((e) => now - e.t < 3000);
+      let s = 0;
+      for (const e of dlSpeedWin) s += e.b;
+      return s / 3;
+    }
+    function fmtSpeed(bps) {
+      if (bps >= 1048576) return (bps / 1048576).toFixed(1) + ' MB/s';
+      if (bps >= 1024) return (bps / 1024).toFixed(0) + ' KB/s';
+      return Math.round(bps) + ' B/s';
+    }
+    function setStat(el, text) { if (el.textContent !== text) el.textContent = text; }
+    // status dashboard: % bar, downloading/downloaded/failed counts, speed, cancel
+    function updateDlDash() {
+      if (!dlBarEl) return;
+      const fetching = dlRun.phase === 'fetch';
+      dlBarEl.classList.toggle('xft-dlzip', dlRun.phase === 'zip');
+      const finished = dlRun.total ? dlRun.done + dlRun.fail : 0;
+      if (fetching) {
+        dlFillEl.style.width = (dlRun.total ? Math.floor((finished / dlRun.total) * 100) : 0) + '%';
+        while (dlStatsEl.children.length < 5) dlStatsEl.appendChild(document.createElement('span'));
+        const c = dlStatsEl.children;
+        setStat(c[0], (dlRun.total ? Math.floor((finished / dlRun.total) * 100) : 0) + '%');
+        setStat(c[1], '↓ ' + dlNet.active);
+        c[1].className = dlNet.active ? 'xft-dl-on' : '';
+        setStat(c[2], '✓ ' + dlRun.done);
+        c[2].className = 'xft-dl-ok';
+        setStat(c[3], '✗ ' + dlRun.fail);
+        c[3].className = dlRun.fail ? 'xft-dl-bad' : '';
+        setStat(c[4], fmtSpeed(dlSpeed()));
+      } else if (dlRun.phase === 'zip') {
+        dlFillEl.style.width = '100%';
+        dlStatsEl.textContent = 'Zipping ' + dlRun.done + ' files · ' + (dlRun.bytes / 1048576).toFixed(1) + ' MB';
+      } else if (dlRun.phase === 'done' || dlRun.phase === 'error') {
+        dlFillEl.style.width = dlRun.phase === 'done' ? '100%' : '0%';
+        dlStatsEl.textContent = dlRun.phase === 'error'
+          ? (dlRun.lastErr || 'zip error')
+          : (dlRun.cancel ? 'Stopped — ' : '✓ Saved ')
+            + dlRun.done + '/' + dlRun.total + ' files'
+            + (dlRun.fail ? ' · ' + dlRun.fail + ' failed' : '')
+            + (dlRun.skip ? ' · ' + dlRun.skip + ' embeds skipped' : '')
+            + ' · ' + (dlRun.bytes / 1048576).toFixed(1) + ' MB';
+      }
+      dlCancelEl.hidden = !fetching;
+      dlCloseEl.hidden = fetching || dlRun.phase === 'zip';
+    }
+    function dlDashTick() {
+      if (dlRun.phase !== 'fetch') return;
+      const now = performance.now();
+      if (now - dlDashAt < 150) return;
+      dlDashAt = now;
+      updateDlDash();
     }
     function dlPump() {
       if (!dlRun.running) return;
@@ -1632,8 +1719,12 @@
       }, wait);
     }
     function dlAfter(release) {
-      if (dlRun.running) updateDlBtn((dlRun.done + dlRun.fail) + '/' + dlRun.total, true);
+      updateDlDash();
       release();
+    }
+    function dlByte(b) {
+      dlSpeedWin.push({ t: performance.now(), b: b });
+      dlDashTick();
     }
     function dlTry(job, ci, release) {
       dlFetch(job.cands[ci], (blob) => {
@@ -1652,14 +1743,16 @@
         if (dlRun.running && ci + 1 < job.cands.length) { dlTry(job, ci + 1, release); return; }
         dlRun.fail++;
         dlAfter(release);
-      });
+      }, dlByte);
     }
-    function dlFetch(url, cb) {
+    function dlFetch(url, cb, onProg) {
       let settled = false;
       const done = (blob) => { if (!settled) { settled = true; cb(blob); } };
       if (typeof GM_xmlhttpRequest === 'function') {
+        let last = 0;
         GM_xmlhttpRequest({
           method: 'GET', url: url, responseType: 'blob', timeout: 180000,
+          onprogress: (r) => { if (onProg && r && r.loaded > last) { onProg(r.loaded - last); last = r.loaded; } },
           onload: (r) => done(r && (r.status === 200 || r.status === 0) && r.response ? r.response : null),
           onerror: () => done(null),
           ontimeout: () => done(null)
@@ -1676,6 +1769,7 @@
             const st = await reader.read();
             if (st.done) break;
             chunks.push(st.value);
+            if (onProg) onProg(st.value.length);
           }
           done(new Blob(chunks));
         })
@@ -1703,7 +1797,7 @@
       const u = URL.createObjectURL(zip);
       const a = document.createElement('a');
       a.href = u;
-      a.download = threadTitle() + '.zip';
+      a.download = zipName();
       document.body.appendChild(a);
       a.click();
       a.remove();
@@ -1711,25 +1805,25 @@
     }
     function dlFinish() {
       dlRun.running = false;
-      const label = dlRun.cancel
-        ? 'stopped ' + dlRun.done + '/' + dlRun.total
-        : '✓ ' + dlRun.done + '/' + dlRun.total
-          + (dlRun.fail ? ' (' + dlRun.fail + ' fail)' : '')
-          + (dlRun.skip ? ' · ' + dlRun.skip + ' embeds' : '');
-      updateDlBtn(label, true);
-      setTimeout(() => { if (!dlRun.running) updateDlBtn('', false); }, 4000);
-      if (dlRun.cancel || !dlRun.done) return;
+      updateDlBtn();
+      if (dlRun.cancel || !dlRun.done) {
+        dlRun.phase = 'done';
+        updateDlDash();
+        return;
+      }
       // zip assembly needs the main thread free for arrayBuffer reads — defer
-      // a tick so the final label paints first
+      // a tick so the final stats paint first
+      dlRun.phase = 'zip';
+      updateDlDash();
       setTimeout(() => {
         buildZipBlob(dlJobs.filter((j) => j.blob).map((j) => ({
           name: (j.kind === 'video' ? 'Videos/' : 'Pics/') + j.name, blob: j.blob
         })))
-          .then(dlSaveZip)
+          .then((z) => { dlSaveZip(z); dlRun.phase = 'done'; updateDlDash(); })
           .catch((e) => {
             dlRun.lastErr = 'zip failed: ' + (e && e.message ? e.message : e);
-            updateDlBtn('zip error', true);
-            setTimeout(() => { if (!dlRun.running) updateDlBtn('', false); }, 4000);
+            dlRun.phase = 'error';
+            updateDlDash();
           });
       }, 30);
     }
@@ -1752,14 +1846,31 @@
       dlRun.skip = res.skip;
       dlRun.bytes = 0;
       dlRun.lastErr = '';
+      dlSpeedWin = [];
       if (!dlJobs.length) {
         dlRun.running = false;
-        updateDlBtn(res.skip ? 'embeds only' : 'empty', true);
-        setTimeout(() => { if (!dlRun.running) updateDlBtn('', false); }, 2000);
+        dlRun.phase = 'idle';
+        updateDlBtn();
+        if (dlBarEl) {
+          dlBarEl.hidden = false;
+          dlBarEl.classList.remove('xft-dlzip');
+          dlFillEl.style.width = '0%';
+          dlCancelEl.hidden = true;
+          dlCloseEl.hidden = false;
+          dlStatsEl.textContent = res.skip ? 'Only embed tiles — no direct files to download.' : 'Nothing to download on this tab.';
+          setTimeout(() => { if (dlRun.phase === 'idle') dlBarEl.hidden = true; }, 2500);
+        }
         return;
       }
       dlNet.queue = dlJobs.slice();
-      updateDlBtn('0/' + dlJobs.length, true);
+      dlRun.phase = 'fetch';
+      if (dlBarEl) {
+        dlNameEl.textContent = zipName();
+        dlNameEl.title = zipName();
+        dlBarEl.hidden = false;
+      }
+      updateDlBtn();
+      updateDlDash();
       dlPump();
     }
 
@@ -2811,8 +2922,28 @@
       // bulk download: zips the current list (Pics/ + Videos/) as one file
       const dlBtn = mkBtn('Download', startBulkDownload, 'xft-btn xft-subtab xft-dlbtn');
       dlBtnEl = dlBtn;
-      updateDlBtn('', false);
+      updateDlBtn();
       subtabsEl.append(subTabBtns.all, subTabBtns.image, subTabBtns.video, groupSel, dlBtn);
+
+      // bulk download status dashboard: file name, % bar, counts, speed, cancel
+      dlBarEl = document.createElement('div');
+      dlBarEl.className = 'xft-dlbar';
+      dlBarEl.hidden = true;
+      dlNameEl = document.createElement('span');
+      dlNameEl.className = 'xft-dlname';
+      dlCancelEl = mkBtn('Cancel', () => { if (dlRun.running) startBulkDownload(); }, 'xft-btn xft-dlcancel');
+      dlCloseEl = mkBtn('✕', () => { dlBarEl.hidden = true; }, 'xft-btn xft-dlclose');
+      dlCloseEl.hidden = true;
+      const dlTop = document.createElement('div');
+      dlTop.className = 'xft-dltop';
+      dlTop.append(dlNameEl, dlCancelEl, dlCloseEl);
+      const dlProg = document.createElement('div');
+      dlProg.className = 'xft-dlprog';
+      dlFillEl = document.createElement('i');
+      dlProg.appendChild(dlFillEl);
+      dlStatsEl = document.createElement('div');
+      dlStatsEl.className = 'xft-dlstats';
+      dlBarEl.append(dlTop, dlProg, dlStatsEl);
 
       linksBarEl = buildLinksBar();
 
@@ -2831,7 +2962,7 @@
       noteEl.className = 'xft-note';
       noteEl.hidden = true;
 
-      panel.append(head, tabs, subtabsEl, linksBarEl, settingsView, panelBodyEl, jumps, noteEl);
+      panel.append(head, tabs, subtabsEl, dlBarEl, linksBarEl, settingsView, panelBodyEl, jumps, noteEl);
       document.body.appendChild(panel);
       setTab('media');
       buildEdgeButton();
@@ -2920,6 +3051,17 @@
         '.xft-subtab.xft-tab-active,.xft-subtab.xft-tab-active:hover{background:hsl(var(--xft-secondary));color:hsl(var(--xft-fg));font-weight:600}',
         '.xft-gsel{margin-left:auto;height:22px;font-size:11px;background:hsl(var(--xft-secondary));color:hsl(var(--xft-fg));border:1px solid hsl(var(--xft-border));border-radius:6px;padding:0 4px;cursor:pointer;outline:none}',
         '.xft-dlbtn{min-width:70px;text-align:center}',
+        '.xft-dlbar{padding:8px 10px;border-bottom:1px solid hsl(var(--xft-border));background:hsl(var(--xft-muted));display:flex;flex-direction:column;gap:6px}',
+        '.xft-dltop{display:flex;align-items:center;gap:6px;min-width:0}',
+        '.xft-dlname{flex:1;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;font-weight:600}',
+        '.xft-dlprog{height:6px;border-radius:99px;background:hsl(var(--xft-border));overflow:hidden}',
+        '.xft-dlprog>i{display:block;height:100%;width:0;background:hsl(var(--xft-ring));border-radius:99px;transition:width .25s}',
+        '.xft-dlstats{display:flex;gap:12px;color:hsl(var(--xft-muted-fg));font-variant-numeric:tabular-nums;font-size:11px;white-space:nowrap;overflow:hidden}',
+        '.xft-dl-ok{color:hsl(142 60% 45%)}',
+        '.xft-dl-bad{color:hsl(var(--xft-destructive))}',
+        '.xft-dl-on{color:hsl(var(--xft-fg))}',
+        '.xft-dlzip .xft-dlprog>i{width:100%;background:linear-gradient(90deg,transparent,hsl(var(--xft-ring)),transparent);background-size:200% 100%;animation:xft-dlslide 1.1s linear infinite}',
+        '@keyframes xft-dlslide{from{background-position:200% 0}to{background-position:-200% 0}}',
         '.xft-dl-run{background:hsl(var(--xft-ring)/.18)!important;border-color:hsl(var(--xft-ring))!important}',
         '.xft-jumps{position:absolute;right:10px;bottom:14px;display:flex;flex-direction:column;gap:6px;z-index:5}',
         '.xft-jumpbtn{width:30px;height:30px;padding:0;font-size:14px;line-height:1;border-radius:8px;box-shadow:0 2px 8px hsl(240 10% 3.9%/.25)}',
@@ -3047,7 +3189,7 @@
         '.xft-pulse{outline:3px solid transparent;animation:xftpulse 1.6s ease-out 2}',
         '@keyframes xftpulse{0%{outline-color:hsl(38 92% 50%)}100%{outline-color:transparent}}',
         '#xft-sort-btn{margin-left:4px;cursor:pointer}',
-        '@media (prefers-reduced-motion:reduce){html:not(.xft-anim-force) #xft-panel,html:not(.xft-anim-force) .xft-btn,html:not(.xft-anim-force) #xft-edge-btn,html:not(.xft-anim-force) .xft-cell{transition:none}html:not(.xft-anim-force) .xft-pulse{animation:none}}'
+        '@media (prefers-reduced-motion:reduce){html:not(.xft-anim-force) #xft-panel,html:not(.xft-anim-force) .xft-btn,html:not(.xft-anim-force) #xft-edge-btn,html:not(.xft-anim-force) .xft-cell{transition:none}html:not(.xft-anim-force) .xft-pulse{animation:none}html:not(.xft-anim-force) .xft-dlzip .xft-dlprog>i{animation:none;background:hsl(var(--xft-ring))}html:not(.xft-anim-force) .xft-dlprog>i{transition:none}}'
       ].join('');
       document.head.appendChild(st);
     }
@@ -3101,5 +3243,5 @@
   }
 
   // UMD export of the pure functions for node:test (no DOM / GM usage in them).
-  if (typeof module !== 'undefined' && module.exports) module.exports = { parseReactionCount, filterLinks, sortPosts, estimateSize, partitionLinks, extractDomain, groupLinkItems, applyLinkFilters, boilerplateUrls, isSmilieUrl, parseEmbedPoster, embedSignUrl, parseSignResponse, parseSignToken, parseVideoPage, isVideoPageUrl, hqCandidates, sanitizeFileSeg, dlBasename, buildDlJobs, crc32, zipStoreU8 };
+  if (typeof module !== 'undefined' && module.exports) module.exports = { parseReactionCount, filterLinks, sortPosts, estimateSize, partitionLinks, extractDomain, groupLinkItems, applyLinkFilters, boilerplateUrls, isSmilieUrl, parseEmbedPoster, embedSignUrl, parseSignResponse, parseSignToken, parseVideoPage, isVideoPageUrl, hqCandidates, sanitizeFileSeg, siteTagFromHost, cleanThreadTitle, zipFileName, dlBasename, buildDlJobs, crc32, zipStoreU8 };
 })();

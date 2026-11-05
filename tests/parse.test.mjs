@@ -8,7 +8,7 @@ import path from 'node:path';
 
 const require = createRequire(import.meta.url);
 const userJsPath = path.join(path.dirname(fileURLToPath(import.meta.url)), '..', 'xf-thread-tools.user.js');
-const { parseReactionCount, filterLinks, sortPosts, estimateSize, partitionLinks, extractDomain, groupLinkItems, applyLinkFilters, boilerplateUrls, isSmilieUrl, parseEmbedPoster, embedSignUrl, parseSignResponse, parseSignToken, parseVideoPage, isVideoPageUrl, hqCandidates, sanitizeFileSeg, dlBasename, buildDlJobs, crc32, zipStoreU8 } = require(userJsPath);
+const { parseReactionCount, filterLinks, sortPosts, estimateSize, partitionLinks, extractDomain, groupLinkItems, applyLinkFilters, boilerplateUrls, isSmilieUrl, parseEmbedPoster, embedSignUrl, parseSignResponse, parseSignToken, parseVideoPage, isVideoPageUrl, hqCandidates, sanitizeFileSeg, siteTagFromHost, cleanThreadTitle, zipFileName, dlBasename, buildDlJobs, crc32, zipStoreU8 } = require(userJsPath);
 
 test('UMD export exposes the four pure functions', () => {
   assert.equal(typeof parseReactionCount, 'function');
@@ -371,6 +371,26 @@ test('sanitizeFileSeg + dlBasename: hostile names defused, empties fall back', (
   assert.equal(dlBasename('https://h.test/attachments/img-jpg.12345/', 'image', 0), 'img-jpg.12345.jpg'); // no real ext → forced
   assert.equal(dlBasename('https://h.test/p/', 'video', 6), 'p.mp4'); // segment without ext → forced by kind
   assert.equal(dlBasename('https://h.test/', 'image', 0), 'image-1.jpg');
+});
+
+test('siteTagFromHost: site core label from a hostname', () => {
+  assert.equal(siteTagFromHost('xamvn.my'), 'Xamvn');
+  assert.equal(siteTagFromHost('www.voz.vn'), 'Voz');
+  assert.equal(siteTagFromHost('beta.simpcity.su'), 'Simpcity'); // subdomain skipped
+  assert.equal(siteTagFromHost('example.com'), 'Example');
+  assert.equal(siteTagFromHost('localhost:8080'), 'Localhost'); // bare host, port dropped
+  assert.equal(siteTagFromHost(''), 'Site');
+});
+
+test('zipFileName: Vietnamese + spaces kept, [tag] groups and forum suffix stripped', () => {
+  assert.equal(cleanThreadTitle('RAM DDR5 bus 6000 MT/s CL30 — kit tối ưu cho AMD'), 'RAM DDR5 bus 6000 MTs CL30 — kit tối ưu cho AMD'); // '/' is a path separator — stripped
+  assert.equal(cleanThreadTitle('[Ảnh] [Hot] Bộ sưu tập ảnh đẹp'), 'Bộ sưu tập ảnh đẹp'); // leading [tag] groups
+  assert.equal(cleanThreadTitle('Tiêu đề tiếng Việt | Diễn đàn XYZ'), 'Tiêu đề tiếng Việt'); // trailing forum suffix
+  assert.equal(cleanThreadTitle('A/B:C*D?E"F<G>|G'), 'ABCDEFGG'); // filesystem-illegal chars die
+  assert.equal(cleanThreadTitle('   '), '');
+  assert.equal(zipFileName('Xamvn', 'Kit RAM DDR5 6000 tối ưu'), '[Xamvn] Kit RAM DDR5 6000 tối ưu.zip');
+  assert.equal(zipFileName('Voz', '[Ảnh]TITLE | VOZ Forums'), '[Voz] TITLE.zip');
+  assert.equal(zipFileName('', ''), 'thread.zip');
 });
 
 test('buildDlJobs: HQ chain wiring, dedupe, embed skip, hash strip, seq names', () => {
