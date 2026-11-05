@@ -393,22 +393,25 @@ test('zipFileName: Vietnamese + spaces kept, [tag] groups and forum suffix strip
   assert.equal(zipFileName('', ''), 'thread.zip');
 });
 
-test('buildDlJobs: HQ chain wiring, dedupe, embed skip, hash strip, seq names', () => {
+test('buildDlJobs: HQ chain wiring, dedupe, embed jobs, hash strip, seq names', () => {
   const items = [
     { kind: 'image', url: 'https://h.test/uuid.md.jpg' },
     { kind: 'image', url: 'https://h.test/uuid.md.jpg' },              // dupe → dropped
     { kind: 'image', url: 'https://h.test/300x400_a.md.jpg' },         // name from cands[0]
     { kind: 'video', url: 'https://h.test/v/clip.mp4#t=0.1' },         // hash stripped
-    { kind: 'embed', url: 'https://h.test/embed/x' }                   // no file → skip
+    { kind: 'embed', url: 'https://h.test/embed/x' }                   // resolved at fetch time → job
   ];
   const { jobs, skip } = buildDlJobs(items);
-  assert.equal(skip, 1);
-  assert.equal(jobs.length, 3);
+  assert.equal(skip, 0);
+  assert.equal(jobs.length, 4);
   assert.deepEqual(jobs[0].cands, ['https://h.test/uuid.jpg', 'https://h.test/uuid.md.jpg']);
   assert.equal(jobs[0].name, '001_uuid.jpg');
   assert.equal(jobs[1].name, '002_a.jpg');
   assert.deepEqual(jobs[2].cands, ['https://h.test/v/clip.mp4']);
   assert.equal(jobs[2].name, '003_clip.mp4');
+  assert.equal(jobs[3].kind, 'embed');
+  assert.deepEqual(jobs[3].cands, ['https://h.test/embed/x']);
+  assert.equal(jobs[3].name, '004_x.mp4'); // forced video ext
   // empty / non-list inputs
   assert.deepEqual(buildDlJobs([]), { jobs: [], skip: 0 });
   assert.deepEqual(buildDlJobs(null), { jobs: [], skip: 0 });

@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         xf-thread-tools
 // @namespace    xf-thread-tools
-// @version      0.7.43
+// @version      0.7.44
 // @description  XenForo 2: sort thread posts by reaction count across all pages (cached) + floating media panel (images / external links).
 // @author       xf-thread-tools
 // @match        *://*/threads/*
@@ -220,26 +220,26 @@
   // Turn the current media list into download jobs. Images walk the same HQ
   // candidate chain as the grid (full-size first, marker variant fallback) so
   // a download run grabs never-rendered cells at full size too; embed player
-  // tiles have no direct media file and are counted as skips. Duplicate URLs
-  // are dropped. Names are seq-prefixed so two posts sharing a basename
-  // cannot clobber each other inside the zip.
+  // tiles are JOBS like any other — resolved to a direct stream at fetch time
+  // (sign endpoint / file-page parse; failures count as failed, not skipped).
+  // Duplicate URLs are dropped. Names are seq-prefixed so two posts sharing a
+  // basename cannot clobber each other inside the zip.
   function buildDlJobs(items) {
     const seen = new Set();
     const jobs = [];
-    let skip = 0;
     for (const it of (Array.isArray(items) ? items : [])) {
-      if (it.kind === 'embed') { skip++; continue; }
-      const base = it.kind === 'video' ? String(it.url || '').replace(/#.*$/, '') : String(it.url || '');
+      const isVid = it.kind === 'video' || it.kind === 'embed';
+      const base = isVid ? String(it.url || '').replace(/#.*$/, '') : String(it.url || '');
       if (!base || seen.has(base)) continue;
       seen.add(base);
       const cands = it.kind === 'image' ? hqCandidates(base) : [base];
       jobs.push({
         cands: cands,
         kind: it.kind,
-        name: String(jobs.length + 1).padStart(3, '0') + '_' + dlBasename(cands[0], it.kind, jobs.length)
+        name: String(jobs.length + 1).padStart(3, '0') + '_' + dlBasename(cands[0], isVid ? 'video' : it.kind, jobs.length)
       });
     }
-    return { jobs: jobs, skip: skip };
+    return { jobs: jobs, skip: 0 };
   }
 
   // Minimal zip (method 0 / STORE) writer — no dependencies. Layout per
@@ -1612,10 +1612,11 @@
     // Fetches every listed file (GM XHR — no CORS limits; fetch() fallback),
     // zips them STORE into ONE <thread title>.zip (Pics/ + Videos/ inside)
     // and saves it via a blob anchor — no GM_download needed, no per-file
-    // download prompts. Embed player tiles have no direct media file and are
-    // skipped + reported. Fetches are serialized 2-at-a-time for the same
-    // CDN-burst reason as the HQ queue; a second click cancels the run.
-    const dlRun = { running: false, cancel: false, phase: 'idle', total: 0, done: 0, fail: 0, skip: 0, bytes: 0, lastErr: '' };
+    // download prompts. Embed player tiles are resolved to their direct
+    // stream (sign endpoint / file page) and land in Videos/. Fetches are
+    // serialized 2-at-a-time for the same CDN-burst reason as the HQ queue;
+    // a second click cancels the run.
+    const dlRun = { running: false, cancel: false, phase: 'idle', total: 0, done: 0, fail: 0, bytes: 0, lastErr: '' };
     const dlNet = { active: 0, queue: [], last: 0 };
     const DL_NET_MAX = 2;
     const DL_NET_GAP = 400;
@@ -1648,7 +1649,7 @@
       dlBtnEl.title = dlRun.running
         ? 'Stop the bulk download'
         : 'Download the ' + panelSubTab + ' list as one zip (Pics/ + Videos/, named after the thread). '
-          + 'Embed player tiles are skipped (no direct file).';
+          + 'Player embeds are resolved to their direct stream and included.';
     }
     function dlSpeed() {
       const now = performance.now();
@@ -1691,7 +1692,6 @@
           : (dlRun.cancel ? 'Stopped — ' : '✓ Saved ')
             + dlRun.done + '/' + dlRun.total + ' files'
             + (dlRun.fail ? ' · ' + dlRun.fail + ' failed' : '')
-            + (dlRun.skip ? ' · ' + dlRun.skip + ' embeds skipped' : '')
             + ' · ' + (dlRun.bytes / 1048576).toFixed(1) + ' MB';
       }
       dlCancelEl.hidden = !fetching;
@@ -1727,7 +1727,7 @@
       dlDashTick();
     }
     function dlTry(job, ci, release) {
-      dlFetch(job.cands[ci], (blob) => {
+      const settle = (blob) => {
         if (dlRun.cancel) { release(); return; }
         if (blob) {
           dlRun.done++;
@@ -1743,7 +1743,19 @@
         if (dlRun.running && ci + 1 < job.cands.length) { dlTry(job, ci + 1, release); return; }
         dlRun.fail++;
         dlAfter(release);
-      }, dlByte);
+      };
+      if (job.kind === 'embed') {
+        // player tiles: resolve to the direct stream (sign endpoint or
+        // file-page carrier), then fetch the bytes. Resolution shares the
+        // same net slot so the 2-concurrent cap also throttles sign hits.
+        resolveEmbedStream(job.cands[ci], (src) => {
+          if (dlRun.cancel) { release(); return; }
+          if (!src) { dlRun.fail++; dlRun.lastErr = 'embed stream unresolved'; dlAfter(release); return; }
+          dlFetch(src, settle, dlByte);
+        });
+        return;
+      }
+      dlFetch(job.cands[ci], settle, dlByte);
     }
     function dlFetch(url, cb, onProg) {
       let settled = false;
@@ -1817,7 +1829,7 @@
       updateDlDash();
       setTimeout(() => {
         buildZipBlob(dlJobs.filter((j) => j.blob).map((j) => ({
-          name: (j.kind === 'video' ? 'Videos/' : 'Pics/') + j.name, blob: j.blob
+          name: (j.kind === 'video' || j.kind === 'embed' ? 'Videos/' : 'Pics/') + j.name, blob: j.blob
         })))
           .then((z) => { dlSaveZip(z); dlRun.phase = 'done'; updateDlDash(); })
           .catch((e) => {
@@ -1843,7 +1855,6 @@
       dlRun.total = dlJobs.length;
       dlRun.done = 0;
       dlRun.fail = 0;
-      dlRun.skip = res.skip;
       dlRun.bytes = 0;
       dlRun.lastErr = '';
       dlSpeedWin = [];
@@ -1857,7 +1868,7 @@
           dlFillEl.style.width = '0%';
           dlCancelEl.hidden = true;
           dlCloseEl.hidden = false;
-          dlStatsEl.textContent = res.skip ? 'Only embed tiles — no direct files to download.' : 'Nothing to download on this tab.';
+          dlStatsEl.textContent = 'Nothing to download on this tab.';
           setTimeout(() => { if (dlRun.phase === 'idle') dlBarEl.hidden = true; }, 2500);
         }
         return;
