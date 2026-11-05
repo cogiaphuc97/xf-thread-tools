@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         xf-thread-tools
 // @namespace    xf-thread-tools
-// @version      0.7.51
+// @version      0.7.52
 // @description  XenForo 2: sort thread posts by reaction count across all pages (cached) + floating media panel (images / external links).
 // @author       xf-thread-tools
 // @match        *://*/threads/*
@@ -2431,22 +2431,14 @@
     // (All/Image/Video) keep the grouping but drop empty groups.
     function buildMediaLayout(items, mode) {
       const lay = [];
-      // rows are bucketed by each item's STABLE ordinal (its index in the
-      // pre-filter stream): a retirement leaves a SHORT row (a hole at the
-      // end), and every other row keeps its exact identity — items never
-      // re-flow into different rows. The bucket id is the row's cache key.
-      const bucket = (idxs, prefix) => {
-        const bySlot = new Map();
-        for (const i of idxs) {
-          const slot = Math.floor(items[i].ord / 4);
-          let row = bySlot.get(slot);
-          if (!row) { row = []; bySlot.set(slot, row); }
-          row.push(i);
-        }
-        for (const row of bySlot.values()) lay.push({ idxs: row, key: prefix + ':s' + Math.floor(items[row[0]].ord / 4) });
-      };
+      // sequential 4-packs — NO holes (user-facing rule: the grid is always
+      // densely packed in every mode). Re-chunking after a retirement is
+      // safe now: rows reconcile cell-by-cell by URL, so surviving imgs keep
+      // their elements (and their decoded frames) even when they slide into
+      // a different row.
+      const chunk = (list) => { for (let j = 0; j < list.length; j += 4) lay.push({ idxs: list.slice(j, j + 4) }); };
       if (mode !== 'post' && mode !== 'page' && mode !== 'user') {
-        bucket(items.map((_, i) => i), 'k');
+        chunk(items.map((_, i) => i));
         return lay;
       }
       const groups = new Map(); // insertion order = first-appearance order
@@ -2470,7 +2462,7 @@
           // user groups already name the author in their main header — the
           // post sub-header shows the number only
           if (mode !== 'post') lay.push({ hdr: 'sub', label: mode === 'user' ? '#' + s.pos : '#' + s.pos + ' - ' + s.author, postId: s.postId });
-          bucket(s.list, 'g' + gkey + ':' + s.postId);
+          chunk(s.list);
         }
       }
       return lay;
@@ -2503,10 +2495,8 @@
       // their real URLs — dropped here so cached threads heal without a
       // Refresh; smilies and signature/footer boilerplate are filtered the
       // same way (all inside keep()).
-      // ord = position in the RAW stream (unfiltered). It must NOT be the
-      // index of the surviving list — a retirement would renumber everything
-      // after it and destroy the stable row keys. Raw gaps are fine: keys
-      // stay put while the retired items simply vanish from their buckets.
+      // ord = position in the RAW unfiltered stream (kept for diagnostics;
+      // rows pack sequentially and reconcile by URL, so nothing keys on it).
       let raw = 0;
       const keep = (u) => {
         const s2 = String(u || '');
@@ -2611,7 +2601,6 @@
         vrows.className = 'xft-vrows';
         const builtLayout = buildMediaLayout(items, settings.mediaGroup);
         gridItems = items;
-        const usedRowKeys = new Set();
         const fillObs = ensureRowFillObserver();
         for (let r = 0; r < builtLayout.length; r++) {
           const e = builtLayout[r];
@@ -2619,8 +2608,7 @@
           // header whose group moved) must rebuild — sig match = reuse the
           // existing element (filled rows keep their imgs, shells stay
           // observed; nothing ever reloads on rebuild)
-          let rowEl = e.key !== undefined ? vrowCache.get(e.key) : null;
-          if (e.key !== undefined) usedRowKeys.add(e.key);
+          let rowEl = vrowCache.get(r);
           if (e.idxs) {
             const want = e.idxs.map((i) => items[i]).filter(Boolean);
             if (rowEl && rowEl.classList.contains('xft-vrow') && rowEl.dataset.xftFilled === '1') {
@@ -2645,7 +2633,7 @@
               }
               fillObs.observe(rowEl);
             }
-            vrowCache.set(e.key, rowEl);
+            vrowCache.set(r, rowEl);
           } else {
             // group headers are cheap — rebuild every time (never cached)
             if (rowEl && rowFillObserver) rowFillObserver.unobserve(rowEl);
@@ -2662,16 +2650,16 @@
               rowEl.title = e.label + ' — jump to post';
               rowEl.addEventListener('click', () => jumpTo(e.postId));
             }
-            vrowCache.set('h' + r, rowEl);
+            vrowCache.set(r, rowEl);
           }
           vrows.appendChild(rowEl);
         }
-        // rows whose key vanished this render (filtered out / different
-        // view) must go: unobserve first — the observer holds strong refs
-        for (const [k, el] of Array.from(vrowCache)) {
-          if (!usedRowKeys.has(k) && k.charAt(0) !== 'h') {
-            if (rowFillObserver) rowFillObserver.unobserve(el);
-            el.remove();
+        // entries past the layout end (list shrank / view changed) must go:
+        // unobserve first — the observer holds strong refs
+        for (const k of Array.from(vrowCache.keys())) {
+          if (k >= builtLayout.length) {
+            if (rowFillObserver) rowFillObserver.unobserve(vrowCache.get(k));
+            vrowCache.get(k).remove();
             vrowCache.delete(k);
           }
         }
