@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         xf-thread-tools
 // @namespace    xf-thread-tools
-// @version      0.11.0
+// @version      0.11.1
 // @description  XenForo 2: sort thread posts by reaction count across all pages (cached) + floating media panel (images / external links).
 // @author       xf-thread-tools
 // @match        *://*/threads/*
@@ -3565,19 +3565,45 @@
       };
       if (typeof GM_xmlhttpRequest === 'function') {
         let seen = 0;
+        let streamLive = false; // reader path produced chunks -> the single MV3 onprogress event is redundant
+        let streamed = '';
+        let reader = null;
         try {
           const rq = GM_xmlhttpRequest({
             method: method, url: url, headers: headers, timeout: 120000,
             data: bodyObj ? JSON.stringify(bodyObj) : undefined,
+            responseType: onChunk ? 'stream' : undefined,
+            // Tampermonkey MV3 fires ONLY ONE progress event per request
+            // (changelog 5.3.6222): with responseType 'stream' the stream
+            // object arrives at onloadstart and must be read via a reader.
+            onloadstart: (r) => {
+              const st = r && r.response;
+              if (!onChunk || !st || typeof st.getReader !== 'function') return;
+              reader = st.getReader();
+              const dec = new TextDecoder();
+              (async () => {
+                try {
+                  for (;;) {
+                    const st2 = await reader.read();
+                    if (st2.done) break;
+                    const piece = dec.decode(st2.value, { stream: true });
+                    if (piece) { streamed += piece; streamLive = true; onChunk(piece); }
+                  }
+                } catch (e) { /* stream teardown; onload/onerror settles the request */ }
+              })();
+            },
             onprogress: (r) => {
-              if (!onChunk || !r || typeof r.responseText !== 'string') return;
+              if (!onChunk || streamLive || !r || typeof r.responseText !== 'string') return;
               if (r.responseText.length > seen) { onChunk(r.responseText.slice(seen)); seen = r.responseText.length; }
             },
-            onload: (r) => onJson(r ? r.status | 0 : 0, r ? String(r.responseText || '') : ''),
+            onload: (r) => {
+              const text = streamLive ? streamed : (r ? String(r.responseText || '') : '');
+              onJson(r ? r.status | 0 : 0, text);
+            },
             onerror: () => finish({ error: 'network' }),
             ontimeout: () => finish({ error: 'timeout' })
           });
-          return { abort: () => { try { if (rq && rq.abort) rq.abort(); } catch (e) {} finish({ error: 'stopped' }); } };
+          return { abort: () => { try { if (reader && reader.cancel) reader.cancel(); } catch (e) {} try { if (rq && rq.abort) rq.abort(); } catch (e) {} finish({ error: 'stopped' }); } };
         } catch (e) { /* fall through to fetch */ }
       }
       const ctl = (typeof AbortController !== 'undefined') ? new AbortController() : null;
