@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         xf-thread-tools
 // @namespace    xf-thread-tools
-// @version      0.10.2
+// @version      0.10.3
 // @description  XenForo 2: sort thread posts by reaction count across all pages (cached) + floating media panel (images / external links).
 // @author       xf-thread-tools
 // @match        *://*/threads/*
@@ -1299,6 +1299,7 @@
     let panel = null;
     let progressEl = null;
     let panelBodyEl = null;
+    let panelJumpsEl = null;
     let panelCountEl = null;
     let panelCancelBtn = null;
     let panelRefreshBtn = null;
@@ -3114,6 +3115,7 @@
       if (tabLinksBtn) tabLinksBtn.classList.toggle('xft-tab-active', t === 'links');
       if (tabAiBtn) tabAiBtn.classList.toggle('xft-tab-active', t === 'ai');
       if (subtabsEl) subtabsEl.hidden = t !== 'media';
+      if (panelJumpsEl) panelJumpsEl.hidden = t === 'ai'; // AI chat keeps its own scroll
       if (linksBarEl) linksBarEl.hidden = t !== 'links';
       renderPanelBody();
     }
@@ -4079,6 +4081,7 @@
       jumpTop.title = 'Go to top';
       jumpBottom.title = 'Go to bottom';
       jumps.append(jumpTop, jumpBottom);
+      panelJumpsEl = jumps;
       noteEl = document.createElement('div');
       noteEl.className = 'xft-note';
       noteEl.hidden = true;
