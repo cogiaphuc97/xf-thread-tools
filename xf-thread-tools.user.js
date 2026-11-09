@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         xf-thread-tools
 // @namespace    xf-thread-tools
-// @version      0.9.1
+// @version      0.10.0
 // @description  XenForo 2: sort thread posts by reaction count across all pages (cached) + floating media panel (images / external links).
 // @author       xf-thread-tools
 // @match        *://*/threads/*
@@ -40,7 +40,11 @@
     basePath: '',                // '' = forum at site root; '/forum' for subpath installs
     forceAnimations: 0,          // 1 = run UI animations even under prefers-reduced-motion
     mediaGroup: 'flat',          // media grid grouping: flat | post | page | user
-    selectors: {}                // per-site selector overrides, merged over BASE_SEL
+    selectors: {},               // per-site selector overrides, merged over BASE_SEL
+    aiProvider: 'openai',        // AI tab provider preset: openai | ollama | custom
+    aiKey: '',                   // provider API key (stored locally in GM storage only)
+    aiBase: '',                  // '' = provider preset base URL
+    aiModel: ''                  // selected chat model id
   };
   const BASE_SEL = {
     post: 'article.message--post[data-content^="post-"]',
@@ -1280,6 +1284,7 @@
     let noteEl = null;
     let tabFilesBtn = null;
     let tabLinksBtn = null;
+    let tabAiBtn = null;
     // Links-tab auto-load: sentinel div observed at the end of the list —
     // reaching it extends rowLimit, so there is no "Show more" button
     let linksSentinel = null;
@@ -1884,7 +1889,7 @@
     let lastRenderedView = null;
     let lastUserScrollAt = 0; // ANY user scroll (wheel/drag/keys) — restores must not fight an active scroller
     let programmaticScrollAt = 0; // last time OUR code wrote the scroll position (apply/jump/normalizer)
-    function viewKey() { return panelTab === 'links' ? 'links' : panelSubTab + ':' + settings.mediaGroup; }
+    function viewKey() { return panelTab === 'links' ? 'links' : panelTab === 'ai' ? 'ai' : panelSubTab + ':' + settings.mediaGroup; }
     function saveViewScroll() { if (panelBodyEl) scrollMemory[viewKey()] = panelBodyEl.scrollTop; }
     // smooth for short hops, instant for long jumps (a smooth glide across
     // 50k px is a blur, not an animation). The bottom target re-asserts for
@@ -3086,6 +3091,7 @@
       clearVRows(); // row indices no longer map to the same items
       if (tabFilesBtn) tabFilesBtn.classList.toggle('xft-tab-active', t === 'media');
       if (tabLinksBtn) tabLinksBtn.classList.toggle('xft-tab-active', t === 'links');
+      if (tabAiBtn) tabAiBtn.classList.toggle('xft-tab-active', t === 'ai');
       if (subtabsEl) subtabsEl.hidden = t !== 'media';
       if (linksBarEl) linksBarEl.hidden = t !== 'links';
       renderPanelBody();
@@ -3278,6 +3284,7 @@
 
     function renderPanelBody() {
       if (!panelIsOpen() || !panelBodyEl) return;
+      if (panelTab === 'ai') { renderAiTab(); return; }
       const pd = panelData();
       const boiler = pd.boiler;
       let items = [];
@@ -3491,6 +3498,262 @@
       wrap.appendChild(save);
       wrap.hidden = true;
       return wrap;
+    }
+
+    // ---------- AI chat tab (v0.10.0) ----------
+    // Chat about the cached thread posts. Providers speak OpenAI
+    // chat-completions (Ollama ships that layer at <origin>/v1); transcript
+    // is rebuilt from the post cache on every send, so context grows as the
+    // crawl fills pages. History is session-only; config lives in settings.
+    let aiViewEl = null;
+    let aiLogEl = null;
+    let aiCtxEl = null;
+    let aiInputEl = null;
+    let aiSeq = 0; // bump = rebuild the AI view (fetch ticks must not wipe drafts)
+    const aiChat = { msgs: [], pending: false, abort: null, models: [], modelsLoading: false, cfgOpen: false };
+
+    function aiCfgReady() {
+      return !!settings.aiModel && !(settings.aiProvider === 'openai' && !settings.aiKey);
+    }
+    function aiCtxText() {
+      const recs = orderedRecords();
+      let chars = 0;
+      for (const r of recs) chars += String(r.bodyHtml || '').length;
+      const m = settings.aiModel || 'no model';
+      return recs.length
+        ? 'context: ' + recs.length + ' posts · ~' + (Math.round(chars / 100) / 10) + 'k chars · ' + m
+        : 'no posts cached yet · ' + m;
+    }
+    // one request shape for chat + model list; GM XHR (CORS-free — required
+    // for api.openai.com and cross-origin Ollama) with a fetch fallback.
+    // 120s timeout: local models are slow before the first token.
+    function aiRequest(method, url, bodyObj, cb) {
+      let fin = cb;
+      const finish = (v) => { if (fin) { const f = fin; fin = null; f(v); } };
+      const headers = { 'Content-Type': 'application/json' };
+      if (settings.aiKey) headers.Authorization = 'Bearer ' + settings.aiKey;
+      const onJson = (status, text) => {
+        let v = null;
+        try { v = JSON.parse(text); } catch (e) { /* non-JSON body */ }
+        if (status >= 200 && status < 300) finish({ ok: true, json: v, text: String(text || '') });
+        else finish({ error: (v && v.error && typeof v.error.message === 'string') ? v.error.message : 'HTTP ' + status });
+      };
+      if (typeof GM_xmlhttpRequest === 'function') {
+        try {
+          const rq = GM_xmlhttpRequest({
+            method: method, url: url, headers: headers, timeout: 120000,
+            data: bodyObj ? JSON.stringify(bodyObj) : undefined,
+            onload: (r) => onJson(r ? r.status | 0 : 0, r ? String(r.responseText || '') : ''),
+            onerror: () => finish({ error: 'network' }),
+            ontimeout: () => finish({ error: 'timeout' })
+          });
+          return { abort: () => { try { if (rq && rq.abort) rq.abort(); } catch (e) {} finish({ error: 'stopped' }); } };
+        } catch (e) { /* fall through to fetch */ }
+      }
+      const ctl = (typeof AbortController !== 'undefined') ? new AbortController() : null;
+      if (ctl) setTimeout(() => { try { ctl.abort(); } catch (e) {} }, 120000);
+      fetch(url, {
+        method: method, headers: headers, credentials: 'omit',
+        signal: ctl ? ctl.signal : undefined,
+        body: bodyObj ? JSON.stringify(bodyObj) : undefined
+      })
+        .then(async (r) => onJson(r.status, await r.text()))
+        .catch(() => finish({ error: 'network' }));
+      return { abort: () => { try { if (ctl) ctl.abort(); } catch (e) {} } };
+    }
+    function aiSend(q) {
+      const question = String(q || '').trim();
+      if (!question || aiChat.pending) return;
+      if (!aiCfgReady()) { aiChat.cfgOpen = true; aiSeq++; renderAiTab(true); return; }
+      aiChat.msgs.push({ role: 'user', content: question });
+      aiChat.pending = true;
+      aiSeq++;
+      renderAiTab(true);
+      const ep = aiEndpoint(settings);
+      const posts = orderedRecords().map((r) => ({ author: r.author, pageN: r.pageN, reactionCount: r.reactionCount, text: htmlToText(r.bodyHtml) }));
+      const body = { model: settings.aiModel, messages: aiMessages(buildAiTranscript(posts), question, aiChat.msgs.slice(0, -1)) };
+      aiChat.abort = aiRequest('POST', ep.chat, body, (res) => {
+        aiChat.pending = false;
+        aiChat.abort = null;
+        const p = res && res.ok ? parseAiReply(res.json !== null && res.json !== undefined ? res.json : res.text) : null;
+        aiChat.msgs.push(p && p.text
+          ? { role: 'assistant', content: p.text }
+          : { role: 'error', content: 'AI: ' + ((p && p.error) || (res && res.error) || 'failed') });
+        aiSeq++;
+        renderAiTab(true);
+      });
+    }
+    function aiLoadModels() {
+      if (aiChat.modelsLoading) return;
+      aiChat.modelsLoading = true;
+      aiSeq++;
+      renderAiTab(true);
+      aiRequest('GET', aiEndpoint(settings).models, null, (res) => {
+        aiChat.modelsLoading = false;
+        if (res && res.ok) {
+          aiChat.models = parseAiModels(res.json !== null && res.json !== undefined ? res.json : res.text);
+          if (aiChat.models.length && aiChat.models.indexOf(settings.aiModel) < 0) settings.aiModel = aiChat.models[0];
+        } else {
+          aiChat.msgs.push({ role: 'error', content: 'AI: models: ' + ((res && res.error) || 'failed') });
+        }
+        aiSeq++;
+        renderAiTab(true);
+      });
+    }
+    function renderAiTab(force) {
+      if (!panelBodyEl) return;
+      if (panelCountEl) panelCountEl.textContent = 'AI';
+      const seqKey = aiSeq + ':' + settings.aiProvider + ':' + settings.aiModel + ':' + settings.aiBase + ':' + settings.aiKey + ':' + (aiChat.cfgOpen ? 'c' : '-');
+      if (!force && aiViewEl && aiViewEl.isConnected && aiViewEl.dataset.seq === seqKey) {
+        if (aiCtxEl) aiCtxEl.textContent = aiCtxText(); // post count grows while crawling
+        return;
+      }
+      // stash the live media window BEFORE the swap (same contract as the
+      // media/links body swap — replaceChildren would GC the rows + imgs)
+      if (vAttached.length) {
+        for (const a of vAttached) poolPut(a.sig, a.el);
+        vAttached = [];
+        vRange = { first: -1, last: -1, version: -1 };
+      }
+      vRowsEl = null;
+      const wrap = document.createElement('div');
+      wrap.className = 'xft-ai';
+      wrap.dataset.seq = seqKey;
+
+      // config strip (collapsible)
+      const cfg = document.createElement('div');
+      cfg.className = 'xft-ai-cfg';
+      cfg.hidden = !aiChat.cfgOpen;
+      const mkRow = (labelText) => {
+        const row = document.createElement('label');
+        row.className = 'xft-set-row';
+        const t = document.createElement('span');
+        t.textContent = labelText;
+        row.appendChild(t);
+        cfg.appendChild(row);
+        return row;
+      };
+      const provRow = mkRow('provider');
+      const provSel = document.createElement('select');
+      provSel.className = 'xft-gsel';
+      for (const p of [['openai', 'OpenAI'], ['ollama', 'Ollama (local)'], ['custom', 'Custom (OpenAI-compatible)']]) {
+        const o = document.createElement('option');
+        o.value = p[0];
+        o.textContent = p[1];
+        provSel.appendChild(o);
+      }
+      provSel.value = settings.aiProvider;
+      provRow.appendChild(provSel);
+      const keyRow = mkRow('API key');
+      const keyInp = document.createElement('input');
+      keyInp.type = 'password';
+      keyInp.autocomplete = 'off';
+      keyInp.value = settings.aiKey;
+      keyInp.placeholder = 'sk-… (not needed for Ollama)';
+      keyRow.appendChild(keyInp);
+      const baseRow = mkRow('base URL');
+      const baseInp = document.createElement('input');
+      baseInp.type = 'text';
+      baseInp.value = settings.aiBase;
+      baseInp.placeholder = aiEndpoint({ provider: provSel.value }).base;
+      baseRow.appendChild(baseInp);
+      provSel.addEventListener('change', () => { baseInp.placeholder = aiEndpoint({ provider: provSel.value }).base; });
+      const modelRow = mkRow('model');
+      const modelSel = document.createElement('select');
+      modelSel.className = 'xft-gsel';
+      modelSel.style.flex = '1';
+      const list = aiChat.models.length ? aiChat.models : (settings.aiModel ? [settings.aiModel] : []);
+      for (const id of list) {
+        const o = document.createElement('option');
+        o.value = id;
+        o.textContent = id;
+        modelSel.appendChild(o);
+      }
+      if (!list.length) {
+        const o = document.createElement('option');
+        o.value = '';
+        o.textContent = '(load models ↻)';
+        modelSel.appendChild(o);
+      }
+      modelSel.value = settings.aiModel || list[0] || '';
+      const loadBtn = mkBtn(aiChat.modelsLoading ? '…' : '↻ models', () => aiLoadModels(), 'xft-btn');
+      modelRow.append(modelSel, loadBtn);
+      const hint = document.createElement('div');
+      hint.className = 'xft-ai-hint';
+      hint.textContent = 'Key + settings stay in this browser (script storage). Post texts are sent to the configured provider.';
+      cfg.appendChild(hint);
+      cfg.appendChild(mkBtn('Save', () => {
+        settings.aiProvider = provSel.value;
+        settings.aiKey = keyInp.value.trim();
+        settings.aiBase = baseInp.value.trim();
+        settings.aiModel = modelSel.value || '';
+        writeStore(SETTINGS_KEY, settings);
+        aiChat.cfgOpen = false;
+        aiSeq++;
+        renderAiTab(true);
+      }));
+
+      // context status + config toggle
+      const ctxRow = document.createElement('div');
+      ctxRow.className = 'xft-ai-ctxrow';
+      aiCtxEl = document.createElement('span');
+      aiCtxEl.className = 'xft-ai-ctx';
+      aiCtxEl.textContent = aiCtxText();
+      ctxRow.append(aiCtxEl, mkBtn('⚙ AI settings', () => { aiChat.cfgOpen = !aiChat.cfgOpen; aiSeq++; renderAiTab(true); }, 'xft-btn'));
+
+      // message log (session history; roles user/assistant/error)
+      aiLogEl = document.createElement('div');
+      aiLogEl.className = 'xft-ai-log';
+      if (!aiChat.msgs.length && !aiChat.pending) {
+        const e0 = document.createElement('div');
+        e0.className = 'xft-ai-empty';
+        e0.textContent = aiCfgReady()
+          ? 'Ask anything about this thread — it summarizes, finds posts, explains comments.'
+          : 'Configure a provider first (⚙ AI settings): OpenAI API key, or Ollama for local models.';
+        aiLogEl.appendChild(e0);
+      }
+      for (const m of aiChat.msgs) {
+        const d = document.createElement('div');
+        d.className = 'xft-ai-m ' + (m.role === 'user' ? 'xft-ai-user' : m.role === 'assistant' ? 'xft-ai-asst' : 'xft-ai-err');
+        d.textContent = m.content;
+        aiLogEl.appendChild(d);
+      }
+      if (aiChat.pending) {
+        const d = document.createElement('div');
+        d.className = 'xft-ai-m xft-ai-asst xft-ai-pend';
+        d.textContent = '…';
+        aiLogEl.appendChild(d);
+      }
+
+      // quick prompts + input bar
+      const quick = document.createElement('div');
+      quick.className = 'xft-ai-quick';
+      quick.append(
+        mkBtn('Summarize', () => aiSend('Summarize this thread so far: main topics, notable posts, overall sentiment.'), 'xft-btn'),
+        mkBtn('Top posts', () => aiSend('Which posts are most important or interesting, and why? Reference them by #number and author.'), 'xft-btn')
+      );
+      const bar = document.createElement('div');
+      bar.className = 'xft-ai-bar';
+      aiInputEl = document.createElement('textarea');
+      aiInputEl.className = 'xft-ai-input';
+      aiInputEl.rows = 2;
+      aiInputEl.placeholder = 'Ask about this thread… (Enter = send, Shift+Enter = newline)';
+      const act = () => {
+        if (aiChat.pending) { if (aiChat.abort) aiChat.abort(); return; }
+        const v = aiInputEl.value;
+        aiInputEl.value = '';
+        aiSend(v);
+      };
+      aiInputEl.addEventListener('keydown', (e) => {
+        if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); act(); }
+      });
+      bar.append(aiInputEl, mkBtn(aiChat.pending ? 'Stop' : 'Send', act, 'xft-btn'));
+
+      wrap.append(cfg, ctxRow, aiLogEl, quick, bar);
+      panelBodyEl.replaceChildren(wrap);
+      aiViewEl = wrap;
+      aiLogEl.scrollTop = aiLogEl.scrollHeight;
+      panelBodyEl.scrollTop = scrollMemory[viewKey()] || 0;
     }
 
     // prefers-reduced-motion kills every animation + the drawer transition.
@@ -3712,10 +3975,11 @@
       tabs.className = 'xft-tabs';
       tabFilesBtn = mkBtn('Media', () => setTab('media'), 'xft-btn xft-tab');
       tabLinksBtn = mkBtn('Links', () => setTab('links'), 'xft-btn xft-tab');
+      tabAiBtn = mkBtn('AI', () => setTab('ai'), 'xft-btn xft-tab');
       panelCountEl = document.createElement('span');
       panelCountEl.className = 'xft-count';
       panelCountEl.textContent = '0 items';
-      tabs.append(tabFilesBtn, tabLinksBtn, panelCountEl);
+      tabs.append(tabFilesBtn, tabLinksBtn, tabAiBtn, panelCountEl);
 
       // media sub-tabs (All / Image / Video), below the main tab row
       subtabsEl = document.createElement('div');
@@ -3991,6 +4255,23 @@
         '.xft-settings{padding:8px;border-bottom:1px solid hsl(var(--xft-border))}',
         '.xft-settings[hidden]{display:none}',
         '.xft-set-row{display:flex;align-items:center;gap:8px;margin:4px 0;font-size:11px;color:hsl(var(--xft-fg))}',
+        // ---- AI chat tab ----
+        '.xft-ai{display:flex;flex-direction:column;gap:8px;min-height:100%}',
+        '.xft-ai-cfg{display:flex;flex-direction:column;gap:2px;padding:8px;border:1px solid hsl(var(--xft-border));border-radius:var(--xft-radius);background:hsl(var(--xft-muted))}',
+        '.xft-ai-cfg[hidden]{display:none}',
+        '.xft-ai-hint{font-size:10px;color:hsl(var(--xft-muted-fg));margin:6px 0 2px}',
+        '.xft-ai-ctxrow{display:flex;align-items:center;gap:8px;justify-content:space-between;font-size:11px;color:hsl(var(--xft-muted-fg))}',
+        '.xft-ai-log{display:flex;flex-direction:column;gap:6px;overflow-y:auto;max-height:46vh;min-height:120px;padding:8px;border:1px solid hsl(var(--xft-border));border-radius:var(--xft-radius);background:hsl(var(--xft-bg))}',
+        '.xft-ai-empty{color:hsl(var(--xft-muted-fg));font-size:12px;padding:8px}',
+        '.xft-ai-m{max-width:88%;padding:6px 10px;border-radius:calc(var(--xft-radius) - 2px);font-size:12px;line-height:1.45;white-space:pre-wrap;word-break:break-word}',
+        '.xft-ai-user{align-self:flex-end;background:hsl(var(--xft-primary)/.15);border:1px solid hsl(var(--xft-primary)/.35)}',
+        '.xft-ai-asst{align-self:flex-start;background:hsl(var(--xft-muted))}',
+        '.xft-ai-err{align-self:flex-start;background:hsl(0 62% 45%/.12);border:1px solid hsl(0 62% 45%/.4);color:hsl(0 70% 75%)}',
+        '.xft-ai-pend{opacity:.6}',
+        '.xft-ai-quick{display:flex;gap:6px;flex-wrap:wrap}',
+        '.xft-ai-bar{display:flex;gap:6px;align-items:flex-end}',
+        '.xft-ai-input{flex:1;min-width:0;resize:vertical;font:inherit;font-size:12px;line-height:1.4;padding:6px 8px;color:hsl(var(--xft-fg));background:hsl(var(--xft-bg));border:1px solid hsl(var(--xft-input));border-radius:calc(var(--xft-radius) - 2px)}',
+        '.xft-ai-input:focus-visible{outline:2px solid transparent;border-color:hsl(var(--xft-ring));box-shadow:0 0 0 2px hsl(var(--xft-ring)/.25)}',
         '.xft-set-row span{flex:0 0 150px;color:hsl(var(--xft-muted-fg))}',
         '.xft-set-row input{flex:1;height:24px;border:1px solid hsl(var(--xft-input));border-radius:calc(var(--xft-radius) - 4px);padding:0 6px;font-size:11px;background:transparent;color:hsl(var(--xft-fg))}',
         '.xft-set-row input:focus-visible{outline:2px solid transparent;border-color:hsl(var(--xft-ring));box-shadow:0 0 0 2px hsl(var(--xft-ring)/.25)}',
@@ -4219,6 +4500,101 @@
     return lay;
   }
 
+  // ---------- AI chat tab (pure — unit-tested, no DOM) ----------
+  // Cached post bodies -> clean text for the LLM transcript.
+  function htmlToText(html) {
+    let s = String(html || '');
+    s = s.replace(/<(script|style)\b[^>]*>[\s\S]*?<\/\1\s*>/gi, ' ');
+    s = s.replace(/<(?:br|\/p|\/div|\/li|\/blockquote|\/pre|\/h[1-6]|\/tr)\s*\/?>/gi, '\n');
+    s = s.replace(/<[^>]*>/g, ' ');
+    s = s.replace(/&nbsp;|&#160;/gi, ' ');
+    s = s.replace(/&lt;/gi, '<').replace(/&gt;/gi, '>').replace(/&quot;/gi, '"').replace(/&apos;/gi, "'");
+    s = s.replace(/&#x([0-9a-f]+);/gi, (_, h) => { const c = parseInt(h, 16); return c > 0 && c < 0x110000 ? String.fromCodePoint(c) : ' '; });
+    s = s.replace(/&#(\d+);/g, (_, d) => { const c = parseInt(d, 10); return c > 0 && c < 0x110000 ? String.fromCodePoint(c) : ' '; });
+    s = s.replace(/&amp;/gi, '&'); // LAST: single-pass decode (&amp;lt; stays "&lt;")
+    s = s.replace(/&[a-z][a-z0-9]*;/gi, ' '); // any remaining named entity
+    const lines = s.split('\n').map((l) => l.replace(/\s+/g, ' ').trim());
+    return lines.join('\n').replace(/\n{3,}/g, '\n\n').trim();
+  }
+  // Thread transcript for the model: one line per cached post, ordered
+  // page/seq, #N = position (same numbers the sorted view shows).
+  function buildAiTranscript(posts, opts) {
+    const o = opts || {};
+    const perPost = o.perPost > 0 ? o.perPost | 0 : 700;
+    const budget = o.budget > 0 ? o.budget | 0 : 24000;
+    if (!Array.isArray(posts) || !posts.length) return '';
+    const lines = [];
+    for (let i = 0; i < posts.length; i++) {
+      const p = posts[i] || {};
+      let t = String(p.text || '').replace(/\s+/g, ' ').trim();
+      if (t.length > perPost) t = t.slice(0, perPost) + '…';
+      if (!t) t = '(no text)';
+      const rc = p.reactionCount > 0 ? ', ♥' + p.reactionCount : '';
+      lines.push('[#' + (i + 1) + '] ' + (p.author || '?') + ' (p' + (p.pageN || 1) + rc + '): ' + t);
+    }
+    const all = lines.join('\n');
+    if (all.length <= budget) return all;
+    // over budget: keep head + tail (60/40), count the omitted middle posts
+    const head = Math.floor(budget * 0.6);
+    const tail = Math.max(0, budget - head);
+    let acc = 0, hi = 0;
+    while (hi < lines.length && acc + lines[hi].length + 1 <= head) { acc += lines[hi].length + 1; hi++; }
+    let acc2 = 0, lo = lines.length;
+    while (lo > hi && acc2 + lines[lo - 1].length + 1 <= tail) { lo--; acc2 += lines[lo].length + 1; }
+    return lines.slice(0, hi).join('\n') + '\n… [middle truncated, ' + (lo - hi) + ' posts omitted] …\n' + lines.slice(lo).join('\n');
+  }
+  const AI_SYS_PROMPT = 'You are a helpful assistant inside a forum-thread tool panel. '
+    + 'The user is browsing a forum thread; below is a text transcript of the cached posts '
+    + '(media and links stripped, #N = post position shown in the tool). '
+    + 'Answer questions about the thread, summarize it, or discuss specific posts. '
+    + 'Reference posts by their #number and author. Be concise. '
+    + 'If the transcript does not contain the answer, say so instead of guessing.';
+  function aiMessages(transcript, question, history) {
+    const sys = AI_SYS_PROMPT + (transcript
+      ? '\n\nTHREAD TRANSCRIPT (grows as more pages are fetched):\n' + transcript
+      : '\n\n(No posts cached yet — ask after the fetch starts, or answer generally.)');
+    const out = [{ role: 'system', content: sys }];
+    if (Array.isArray(history)) {
+      for (const m of history) {
+        if (m && (m.role === 'user' || m.role === 'assistant') && typeof m.content === 'string' && m.content) {
+          out.push({ role: m.role, content: m.content });
+        }
+      }
+    }
+    out.push({ role: 'user', content: String(question || '') });
+    return out;
+  }
+  // One wire shape for every provider: OpenAI chat-completions. Ollama ships
+  // the same layer at <origin>/v1; "custom" covers any compatible endpoint.
+  const AI_BASES = { openai: 'https://api.openai.com/v1', ollama: 'http://localhost:11434/v1' };
+  function aiEndpoint(cfg) {
+    const c = cfg || {};
+    const base = String(c.base || c.aiBase || '').trim().replace(/\/+$/, '') || AI_BASES[c.provider || c.aiProvider] || AI_BASES.openai;
+    return { base: base, chat: base + '/chat/completions', models: base + '/models' };
+  }
+  // Model lists: OpenAI {data:[{id}]} and Ollama-native {models:[{name}]} both accepted.
+  function parseAiModels(json) {
+    let v = json;
+    if (typeof json === 'string') { try { v = JSON.parse(json); } catch (e) { return []; } }
+    if (!v || typeof v !== 'object') return [];
+    const arr = Array.isArray(v.data) ? v.data : Array.isArray(v.models) ? v.models : [];
+    const out = [];
+    for (const m of arr) {
+      const id = m ? (m.id || m.name) : '';
+      if (typeof id === 'string' && id && out.indexOf(id) < 0) out.push(id);
+    }
+    return out.sort();
+  }
+  function parseAiReply(json) {
+    let v = json;
+    if (typeof json === 'string') { try { v = JSON.parse(json); } catch (e) { return { error: 'invalid JSON' }; } }
+    if (!v || typeof v !== 'object') return { error: 'empty response' };
+    if (v.error) return { error: (v.error && typeof v.error.message === 'string') ? v.error.message : String(v.error) };
+    const ch = Array.isArray(v.choices) ? v.choices[0] : null;
+    const text = ch && ch.message && typeof ch.message.content === 'string' ? ch.message.content.trim() : '';
+    return text ? { text: text } : { error: 'empty response' };
+  }
+
   // UMD export of the pure functions for node:test (no DOM / GM usage in them).
-  if (typeof module !== 'undefined' && module.exports) module.exports = { parseReactionCount, filterLinks, sortPosts, estimateSize, partitionLinks, extractDomain, groupLinkItems, applyLinkFilters, boilerplateUrls, isSmilieUrl, parseEmbedPoster, embedSignUrl, parseSignResponse, parseSignToken, parseVideoPage, isVideoPageUrl, hqCandidates, sanitizeFileSeg, siteTagFromHost, cleanThreadTitle, zipKindTag, zipFileName, imagePageHref, parseImagePage, parseImageApiResponse, dlBasename, buildDlJobs, dlChunkPlan, dlFailClass, crc32, zipStoreU8, layoutMetrics, windowRange, originBurstingFromHist, hostKey, dosDateTime, fmtSpeed, fmtEta, buildMediaLayout };
+  if (typeof module !== 'undefined' && module.exports) module.exports = { parseReactionCount, filterLinks, sortPosts, estimateSize, partitionLinks, extractDomain, groupLinkItems, applyLinkFilters, boilerplateUrls, isSmilieUrl, parseEmbedPoster, embedSignUrl, parseSignResponse, parseSignToken, parseVideoPage, isVideoPageUrl, hqCandidates, sanitizeFileSeg, siteTagFromHost, cleanThreadTitle, zipKindTag, zipFileName, imagePageHref, parseImagePage, parseImageApiResponse, dlBasename, buildDlJobs, dlChunkPlan, dlFailClass, crc32, zipStoreU8, layoutMetrics, windowRange, originBurstingFromHist, hostKey, dosDateTime, fmtSpeed, fmtEta, buildMediaLayout, htmlToText, buildAiTranscript, aiMessages, aiEndpoint, parseAiModels, parseAiReply };
 })();
