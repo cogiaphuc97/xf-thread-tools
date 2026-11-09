@@ -8,7 +8,7 @@ import path from 'node:path';
 
 const require = createRequire(import.meta.url);
 const userJsPath = path.join(path.dirname(fileURLToPath(import.meta.url)), '..', 'xf-thread-tools.user.js');
-const { parseReactionCount, filterLinks, sortPosts, estimateSize, partitionLinks, extractDomain, groupLinkItems, applyLinkFilters, boilerplateUrls, isSmilieUrl, parseEmbedPoster, embedSignUrl, parseSignResponse, parseSignToken, parseVideoPage, isVideoPageUrl, hqCandidates, imagePageHref, parseImagePage, parseImageApiResponse, sanitizeFileSeg, siteTagFromHost, cleanThreadTitle, zipFileName, dlBasename, buildDlJobs, crc32, zipStoreU8, layoutMetrics, windowRange } = require(userJsPath);
+const { parseReactionCount, filterLinks, sortPosts, estimateSize, partitionLinks, extractDomain, groupLinkItems, applyLinkFilters, boilerplateUrls, isSmilieUrl, parseEmbedPoster, embedSignUrl, parseSignResponse, parseSignToken, parseVideoPage, isVideoPageUrl, hqCandidates, imagePageHref, parseImagePage, parseImageApiResponse, sanitizeFileSeg, siteTagFromHost, cleanThreadTitle, zipFileName, dlBasename, buildDlJobs, crc32, zipStoreU8, layoutMetrics, windowRange, originBurstingFromHist } = require(userJsPath);
 
 test('UMD export exposes the four pure functions', () => {
   assert.equal(typeof parseReactionCount, 'function');
@@ -556,4 +556,24 @@ test('windowRange: clamps at both ends, empty layout, past-the-end window', () =
   assert.deepEqual(windowRange(m.top, m.h, 0, 99999), [0, 2]);
   assert.deepEqual(windowRange(m.top, m.h, m.total + 100, m.total + 200), [3, -1]);
   assert.deepEqual(windowRange([], [], 0, 100), [0, -1]);
+});
+
+// ---- failure policy (v0.8.1) ----
+test('originBurstingFromHist: needs >=3 samples', () => {
+  assert.equal(originBurstingFromHist([]), false);
+  assert.equal(originBurstingFromHist([false, false]), false);
+});
+
+test('originBurstingFromHist: majority-fail recent window = burst', () => {
+  assert.equal(originBurstingFromHist([true, true, true, true, false, false, false, false]), true); // 4/8 recent bad
+  assert.equal(originBurstingFromHist([false, false, false]), true); // all bad
+});
+
+test('originBurstingFromHist: isolated failure on healthy origin = not burst', () => {
+  assert.equal(originBurstingFromHist([true, true, true, true, true, false]), false); // 1/6 bad
+  assert.equal(originBurstingFromHist([false, true, true, true]), false); // 1/4 bad
+});
+
+test('originBurstingFromHist: judges the LAST 8 only (old failures age out)', () => {
+  assert.equal(originBurstingFromHist([false, false, false, false, true, true, true, true, true, true, true]), false); // 0/8 recent bad
 });

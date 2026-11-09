@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         xf-thread-tools
 // @namespace    xf-thread-tools
-// @version      0.8.0
+// @version      0.8.1
 // @description  XenForo 2: sort thread posts by reaction count across all pages (cached) + floating media panel (images / external links).
 // @author       xf-thread-tools
 // @match        *://*/threads/*
@@ -1308,6 +1308,13 @@
       // already ok'd — no flash for them)
       if ((it.kind === 'image' || it.kind === 'embed')
         && !(thumb.tagName === 'IMG' && thumb.classList.contains('xft-ok'))) cell.classList.add('xft-loading');
+      // a URL under stall-recheck starts life stalled: no src (a fresh fetch
+      // would just error again), the ladder probe owns its recovery
+      if (it.kind === 'image' && stallState.has(it.url)) {
+        cell.classList.remove('xft-loading');
+        cell.classList.add('xft-stalled');
+        if (thumb.tagName === 'IMG') thumb.removeAttribute('src');
+      }
       const label = document.createElement('span');
       label.className = 'xft-cell-label';
       label.textContent = '#' + it.pos + ' ' + (it.r.author || '?');
@@ -1441,7 +1448,12 @@
       vRowsEl = vrows;
       vLayout = entries;
       for (const en of entries) {
-        en.sig = en.idxs ? 'r:' + ((gridItems[en.idxs[0]] || {}).url || '') + ':' + en.idxs.length
+        // FULL membership in the sig: 'first-url:len' collides after a
+        // retirement re-chunk (row keeps its first survivor + length while
+        // membership changed) and a pooled row rides along stale cells —
+        // the wrong-content bug class, caught by the hole probe
+        en.sig = en.idxs
+          ? 'r:' + en.idxs.map((i) => (gridItems[i] || {}).url || '').join('|')
           : 'h:' + en.hdr + ':' + en.label + ':' + (en.postId || '');
       }
       // probe: one real row (4 aspect-1:1 cells) + one header of each kind,
@@ -1534,15 +1546,16 @@
       if (brokenRerenderTimer) return;
       brokenRerenderTimer = setTimeout(() => {
         brokenRerenderTimer = null;
-        // hold the removal wave while the user is mid-scroll — a swap under
-        // an active scroller is jarring even with row anchoring
-        if (performance.now() - lastUserScrollAt < 300) { scheduleBrokenRerender(); return; }
+        // hold the removal wave only a beat while the user is mid-scroll —
+        // the 0.8.0 relayout is windowed + content-anchored (cheap, steady),
+        // so holes close fast instead of lingering through a scroll session
+        if (performance.now() - lastUserScrollAt < 80) { scheduleBrokenRerender(); return; }
         // no teardown: reset the signature and let renderPanelBody rebuild —
         // sig-matching rows are reused as-is (imgs never reload), removed
         // items' rows rebuild, and the row anchor keeps the viewport steady
         lastPanelSignature = '';
         schedulePanelRender();
-      }, 300);
+      }, 180);
     }
     // Embed posters: thumbnail URL per embed URL, parsed from the embed page's
     // og:image/data-poster. GM_xmlhttpRequest is required for hosts that send
@@ -1848,6 +1861,7 @@
     // dead media URL: mark the containing cell/thumb (CSS shows the ⚠
     // placeholder), not just the <img> that may be replaced by the video retry
     function markMediaBroken(el, url) {
+      if (url) noteOriginResult(url, false);
       const host = el.closest('.xft-cell, .xft-vthumb, .xft-vslot');
       (host || el).classList.add('xft-broken');
       if (url) {
@@ -1855,6 +1869,86 @@
         animateOutCells(url);
         scheduleBrokenRerender();
       }
+    }
+    // ---------- failure policy (v0.8.1) ----------
+    // A hole costs a glance; a wrongly-killed item costs a Refresh. An
+    // isolated failure on an origin whose other images load = the FILE is
+    // gone → retire fast; the fill is cheap (windowed grid: only ~16 rows
+    // re-render, survivors keep their imgs). An origin whose recent results
+    // are mostly failures = CDN challenge/rate-limit → those RECOVER: hold
+    // the slot (stalled visual, item stays in the list, ZERO reflow) and
+    // recheck in the background; success rebuilds the SAME cell in place
+    // (the probe warmed the browser cache). Ladder 4s/15s/40s, then retire.
+    const originStats = new Map(); // origin -> [bool…] rolling (last 24)
+    function originOf(u) { try { return new URL(u).origin; } catch (e) { return u; } }
+    function noteOriginResult(u, ok) {
+      const o = originOf(u);
+      let h = originStats.get(o);
+      if (!h) { h = []; originStats.set(o, h); }
+      h.push(ok);
+      if (h.length > 24) h.shift();
+    }
+    function originBursting(u) { return originBurstingFromHist(originStats.get(originOf(u)) || []); }
+    const stallState = new Map(); // url -> {tries, timer}
+    const STALL_LADDER = [4000, 15000, 40000];
+    const STALL_PER_ORIGIN_MAX = 12; // wall-of-stalled guard: beyond this the origin is treated as dead
+    function stalledCountFor(o) { let n = 0; for (const u of stallState.keys()) if (originOf(u) === o) n++; return n; }
+    function enterStall(el, url) {
+      const host = el.closest ? el.closest('.xft-cell, .xft-vthumb') : null;
+      if (host) { host.classList.remove('xft-loading'); host.classList.add('xft-stalled'); }
+      // strip the failed src: the 800ms cached-failure probe (checkDead)
+      // would otherwise reap the stalled img as dead while the ladder runs
+      if (el.tagName === 'IMG' && el.getAttribute('src')) el.removeAttribute('src');
+      if (stallState.has(url)) return; // ladder already armed (rebuilt cell)
+      if (stalledCountFor(originOf(url)) >= STALL_PER_ORIGIN_MAX) { retireUrl(url); return; }
+      const st = { tries: 0, timer: 0 };
+      stallState.set(url, st);
+      const step = () => {
+        st.tries++;
+        const probe = new Image();
+        probe.referrerPolicy = 'no-referrer';
+        probe.onload = () => {
+          noteOriginResult(url, true);
+          stallState.delete(url);
+          recoverInPlace(url);
+        };
+        probe.onerror = () => {
+          noteOriginResult(url, false);
+          if (st.tries >= STALL_LADDER.length) { stallState.delete(url); retireUrl(url); }
+          else st.timer = setTimeout(step, STALL_LADDER[st.tries]);
+        };
+        probe.src = url;
+      };
+      st.timer = setTimeout(step, STALL_LADDER[0]);
+    }
+    // recovery with NO layout change: the item never left the list — rebuild
+    // only its attached cells (windowed: a handful at most)
+    let recoverTimer = 0;
+    const recoverQueue = new Set();
+    function recoverInPlace(url) {
+      recoverQueue.add(url);
+      clearTimeout(recoverTimer);
+      recoverTimer = setTimeout(() => {
+        const urls = Array.from(recoverQueue);
+        recoverQueue.clear();
+        for (const u of urls) {
+          const sel = '.xft-cell[data-xft-url="' + (window.CSS && CSS.escape ? CSS.escape(u) : u) + '"]';
+          for (const c of Array.from(document.querySelectorAll(sel))) {
+            const it = gridItems.find((x) => x.url === u);
+            if (it && c.isConnected) c.replaceWith(buildMediaCell(it));
+            else c.classList.remove('xft-stalled');
+          }
+        }
+      }, 250);
+    }
+    function retireUrl(url) {
+      brokenMediaUrls.add(url);
+      animateOutCells(url);
+      scheduleBrokenRerender();
+    }
+    function clearStalls() {
+      for (const st of stallState.values()) clearTimeout(st.timer);
+      stallState.clear();
     }
     // fade every visible cell showing this URL out BEFORE the batched
     // removal re-render, so dead items shrink away instead of popping out
@@ -1872,6 +1966,7 @@
     }
     // loaded media: fade the element in and stop the cell/slot shimmer
     function markMediaLoaded(el) {
+      if (el.tagName === 'IMG') noteOriginResult(el.src, true);
       el.classList.add('xft-ok');
       const host = el.closest('.xft-cell, .xft-vslot, .xft-embed-host');
       if (host) {
@@ -2329,13 +2424,15 @@
         im.src = cands[i];
       };
       im.addEventListener('error', function onErr() {
-        // HQ candidates first: a transient failure (rate-limit burst) gets ONE
-        // delayed retry — the gate keeps a src-less/failed img invisible, so
-        // the retry happens inside the shimmer with no broken-icon flicker.
-        // A second failure falls to the next candidate; only the post URL
-        // itself failing starts the video retry.
+        noteOriginResult(cands[ci], false);
+        // HQ candidates first. The one delayed retry is for RATE-LIMIT
+        // BURSTS (bursting origin): the gate keeps a src-less/failed img
+        // invisible, so the retry hides inside the shimmer. On a HEALTHY
+        // origin an isolated failure is a dead file — skip the wait and
+        // walk straight down the chain. Only the post URL itself failing
+        // starts the video retry.
         if (isHqStage(ci)) {
-          if (ci === 0 && !hqTriedRetry.has(url)) {
+          if (ci === 0 && !hqTriedRetry.has(url) && originBursting(cands[ci])) {
             hqTriedRetry.add(url);
             im.removeAttribute('src');
             setTimeout(() => { if (ci === 0) setStage(0); }, 1500);
@@ -2345,6 +2442,9 @@
           return;
         }
         im.removeEventListener('error', onErr);
+        // burst-failing origin: the file may be fine, the CDN is choking —
+        // HOLD the slot and recheck in the background (no hole, no reflow)
+        if (originBursting(url)) { enterStall(im, url); return; }
         const v = document.createElement('video');
         v.preload = 'metadata';
         v.muted = true;
@@ -2401,7 +2501,7 @@
       // way — probe for both, or the cell renders blank forever. A src-LESS
       // img (waiting in the HQ queue, or mid-retry) is complete with nw=0
       // but NOT dead — probing it retired whole ranges of healthy cells.
-      const checkDead = () => { if (im.getAttribute('src') && im.complete && im.naturalWidth <= 1) markMediaBroken(im, url); };
+      const checkDead = () => { if (im.getAttribute('src') && im.complete && im.naturalWidth <= 1 && !stallState.has(url)) markMediaBroken(im, url); };
       const checkTiny = () => {
         // 2..140px square-ish = smilie/sticker (no URL marker exists) —
         // retire the item. Animate the cell out first, then the debounced
@@ -3104,6 +3204,7 @@
         tinyMediaUrls.clear();
         hqStage.clear();
         hqTriedRetry.clear();
+        clearStalls();
         clearVRows();
         ensure(true);
       });
@@ -3340,6 +3441,11 @@
         // shadcn Badge (secondary) for the ▶ marker
         '.xft-cell-badge{position:absolute;top:4px;right:4px;background:hsl(240 10% 3.9%/.72);color:hsl(0 0% 98%);border-radius:9999px;font-size:10px;font-weight:500;padding:1px 7px;pointer-events:none}',
         '.xft-broken{opacity:.15;filter:grayscale(1)}',
+        // stalled: origin is burst-failing — the slot is HELD while a
+        // background ladder rechecks; visually distinct from shimmer
+        // (loading) and ⚠ (gone): muted, breathing, retry hint
+        '.xft-cell.xft-stalled{opacity:.45;animation:xft-skel-pulse 1.6s ease-in-out infinite}',
+        '.xft-cell.xft-stalled::after{content:"↻ retrying";position:absolute;inset:0;display:flex;align-items:center;justify-content:center;font-size:11px;font-weight:500;color:hsl(var(--xft-muted-fg));pointer-events:none}',
         // a dead link renders as an explicit placeholder, never a black void
         '.xft-cell.xft-broken,.xft-vthumb.xft-broken{background:hsl(var(--xft-muted))}',
         '.xft-cell.xft-broken::after{content:"⚠ broken link";position:absolute;inset:0;display:flex;align-items:center;justify-content:center;font-size:11px;font-weight:500;color:hsl(var(--xft-muted-fg));pointer-events:none}',
@@ -3404,7 +3510,7 @@
         // source order wins)
         '.xft-cell.xft-out{animation:xft-out .22s ease-in both;pointer-events:none}',
         '@keyframes xft-out{to{opacity:0;transform:scale(.9)}}',
-        '@media (prefers-reduced-motion: reduce){html:not(.xft-anim-force) .xft-cell.xft-loading::after,html:not(.xft-anim-force) .xft-vslot.xft-loading::after,html:not(.xft-anim-force) .xft-embed-host.xft-loading::after{animation:none}html:not(.xft-anim-force) .xft-cell.xft-loading,html:not(.xft-anim-force) .xft-vslot.xft-loading,html:not(.xft-anim-force) .xft-embed-host.xft-loading{animation:none}html:not(.xft-anim-force) .xft-cell img,html:not(.xft-anim-force) .xft-cell video,html:not(.xft-anim-force) .xft-cell .xft-vtile{animation:none;transition:none}html:not(.xft-anim-force) .xft-vthumb img,html:not(.xft-anim-force) .xft-vslot img{transition:none}html:not(.xft-anim-force) .xft-spinner,html:not(.xft-anim-force) #xft-viewer,html:not(.xft-anim-force) .xft-settings,html:not(.xft-anim-force) .xft-cell.xft-out{animation:none}}',
+        '@media (prefers-reduced-motion: reduce){html:not(.xft-anim-force) .xft-cell.xft-loading::after,html:not(.xft-anim-force) .xft-vslot.xft-loading::after,html:not(.xft-anim-force) .xft-embed-host.xft-loading::after{animation:none}html:not(.xft-anim-force) .xft-cell.xft-stalled{animation:none}html:not(.xft-anim-force) .xft-cell.xft-loading,html:not(.xft-anim-force) .xft-vslot.xft-loading,html:not(.xft-anim-force) .xft-embed-host.xft-loading{animation:none}html:not(.xft-anim-force) .xft-cell img,html:not(.xft-anim-force) .xft-cell video,html:not(.xft-anim-force) .xft-cell .xft-vtile{animation:none;transition:none}html:not(.xft-anim-force) .xft-vthumb img,html:not(.xft-anim-force) .xft-vslot img{transition:none}html:not(.xft-anim-force) .xft-spinner,html:not(.xft-anim-force) #xft-viewer,html:not(.xft-anim-force) .xft-settings,html:not(.xft-anim-force) .xft-cell.xft-out{animation:none}}',
         // embed viewer box is sized BEFORE the video arrives (sign round-trip
         // + metadata load would otherwise grow the box from zero and pop)
         '.xft-embed-host{position:relative;display:flex;align-items:center;justify-content:center;width:min(92vw,1120px);aspect-ratio:16/9;max-height:80vh;border-radius:calc(var(--xft-radius) - 2px);background:#000;overflow:hidden}',
@@ -3528,6 +3634,19 @@
     return last < first ? [first, -1] : [first, last];
   }
 
+  // Burst verdict for the failure policy: an origin whose recent results
+  // (last 8, min 3 samples) are ≥50% failures is treated as CDN-choked —
+  // those RECOVER, so its items hold their slots and recheck in the
+  // background. An isolated failure on a healthy origin is a dead FILE —
+  // retire it fast and let the grid fill.
+  function originBurstingFromHist(hist) {
+    if (!hist || hist.length < 3) return false;
+    let bad = 0;
+    const n = Math.min(hist.length, 8);
+    for (let i = hist.length - n; i < hist.length; i++) if (!hist[i]) bad++;
+    return bad / n >= 0.5;
+  }
+
   // UMD export of the pure functions for node:test (no DOM / GM usage in them).
-  if (typeof module !== 'undefined' && module.exports) module.exports = { parseReactionCount, filterLinks, sortPosts, estimateSize, partitionLinks, extractDomain, groupLinkItems, applyLinkFilters, boilerplateUrls, isSmilieUrl, parseEmbedPoster, embedSignUrl, parseSignResponse, parseSignToken, parseVideoPage, isVideoPageUrl, hqCandidates, sanitizeFileSeg, siteTagFromHost, cleanThreadTitle, zipFileName, imagePageHref, parseImagePage, parseImageApiResponse, dlBasename, buildDlJobs, crc32, zipStoreU8, layoutMetrics, windowRange };
+  if (typeof module !== 'undefined' && module.exports) module.exports = { parseReactionCount, filterLinks, sortPosts, estimateSize, partitionLinks, extractDomain, groupLinkItems, applyLinkFilters, boilerplateUrls, isSmilieUrl, parseEmbedPoster, embedSignUrl, parseSignResponse, parseSignToken, parseVideoPage, isVideoPageUrl, hqCandidates, sanitizeFileSeg, siteTagFromHost, cleanThreadTitle, zipFileName, imagePageHref, parseImagePage, parseImageApiResponse, dlBasename, buildDlJobs, crc32, zipStoreU8, layoutMetrics, windowRange, originBurstingFromHist };
 })();
