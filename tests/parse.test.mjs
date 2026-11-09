@@ -8,7 +8,7 @@ import path from 'node:path';
 
 const require = createRequire(import.meta.url);
 const userJsPath = path.join(path.dirname(fileURLToPath(import.meta.url)), '..', 'xf-thread-tools.user.js');
-const { parseReactionCount, filterLinks, sortPosts, estimateSize, partitionLinks, extractDomain, groupLinkItems, applyLinkFilters, boilerplateUrls, isSmilieUrl, parseEmbedPoster, embedSignUrl, parseSignResponse, parseSignToken, parseVideoPage, isVideoPageUrl, hqCandidates, imagePageHref, parseImagePage, parseImageApiResponse, sanitizeFileSeg, siteTagFromHost, cleanThreadTitle, zipFileName, dlBasename, buildDlJobs, crc32, zipStoreU8, layoutMetrics, windowRange, originBurstingFromHist } = require(userJsPath);
+const { parseReactionCount, filterLinks, sortPosts, estimateSize, partitionLinks, extractDomain, groupLinkItems, applyLinkFilters, boilerplateUrls, isSmilieUrl, parseEmbedPoster, embedSignUrl, parseSignResponse, parseSignToken, parseVideoPage, isVideoPageUrl, hqCandidates, imagePageHref, parseImagePage, parseImageApiResponse, sanitizeFileSeg, siteTagFromHost, cleanThreadTitle, zipKindTag, zipFileName, dlBasename, buildDlJobs, dlChunkPlan, dlFailClass, crc32, zipStoreU8, layoutMetrics, windowRange, originBurstingFromHist } = require(userJsPath);
 
 test('UMD export exposes the four pure functions', () => {
   assert.equal(typeof parseReactionCount, 'function');
@@ -576,4 +576,60 @@ test('originBurstingFromHist: isolated failure on healthy origin = not burst', (
 
 test('originBurstingFromHist: judges the LAST 8 only (old failures age out)', () => {
   assert.equal(originBurstingFromHist([false, false, false, false, true, true, true, true, true, true, true]), false); // 0/8 recent bad
+});
+
+// ---- download engine (v0.9.0) ----
+const MB = 1048576;
+test('dlChunkPlan: small totals stay single-part', () => {
+  assert.deepEqual(dlChunkPlan(0, 4), []);
+  assert.deepEqual(dlChunkPlan(2 * MB, 4), [[0, 2 * MB - 1]]);
+  assert.deepEqual(dlChunkPlan(8 * MB, 4), [[0, 8 * MB - 1]]); // <= 2*minPart
+  assert.deepEqual(dlChunkPlan(48 * MB, 1), [[0, 48 * MB - 1]]); // maxParts off
+});
+
+test('dlChunkPlan: splits evenly, concatenates exactly, honors maxParts', () => {
+  const plan = dlChunkPlan(48 * MB, 4);
+  assert.equal(plan.length, 4);
+  assert.deepEqual(plan[0], [0, 12 * MB - 1]);
+  // adjacency: no gaps, no overlaps, exact coverage
+  for (let i = 1; i < plan.length; i++) assert.equal(plan[i][0], plan[i - 1][1] + 1);
+  const last = plan[plan.length - 1];
+  assert.equal(last[1], 48 * MB - 1);
+  assert.equal(dlChunkPlan(100 * MB, 2).length, 2);
+  assert.equal(dlChunkPlan(100 * MB, 2)[0][1] + 1, 50 * MB); // even 50/50
+});
+
+test('dlChunkPlan: never more parts than maxParts, ragged tail lands in the last part', () => {
+  const plan = dlChunkPlan(200 * MB, 4);
+  assert.equal(plan.length, 4);
+  assert.equal(plan[3][1], 200 * MB - 1);
+  const span = plan[0][1] - plan[0][0] + 1;
+  for (const rg of plan) assert.ok(rg[1] - rg[0] + 1 <= span + 1);
+});
+
+test('dlFailClass: transient vs permanent', () => {
+  assert.equal(dlFailClass(0), 'trans');    // network error / abort
+  assert.equal(dlFailClass(408), 'trans');
+  assert.equal(dlFailClass(429), 'trans');
+  assert.equal(dlFailClass(500), 'trans');
+  assert.equal(dlFailClass(503), 'trans');
+  assert.equal(dlFailClass(404), 'perm');
+  assert.equal(dlFailClass(410), 'perm');
+  assert.equal(dlFailClass(403), 'perm');
+  assert.equal(dlFailClass(400), 'perm');
+  assert.equal(dlFailClass(418), 'perm');   // unknown 4xx: retry cannot fix it
+});
+
+test('zipKindTag: content-based kind', () => {
+  assert.equal(zipKindTag(true, false), 'Images');
+  assert.equal(zipKindTag(false, true), 'Videos');
+  assert.equal(zipKindTag(true, true), '');
+  assert.equal(zipKindTag(false, false), '');
+});
+
+test('zipFileName: kind suffix, mixed stays clean, no-title fallback', () => {
+  assert.equal(zipFileName('Xamvn', 'Tựa đề', 'Images'), '[Xamvn] Tựa đề (Images).zip');
+  assert.equal(zipFileName('Xamvn', 'Tựa đề', 'Videos'), '[Xamvn] Tựa đề (Videos).zip');
+  assert.equal(zipFileName('Xamvn', 'Tựa đề', ''), '[Xamvn] Tựa đề.zip');
+  assert.equal(zipFileName('', '', 'Videos'), 'thread (Videos).zip');
 });
