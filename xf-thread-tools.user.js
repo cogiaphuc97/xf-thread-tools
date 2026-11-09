@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         xf-thread-tools
 // @namespace    xf-thread-tools
-// @version      0.10.4
+// @version      0.10.5
 // @description  XenForo 2: sort thread posts by reaction count across all pages (cached) + floating media panel (images / external links).
 // @author       xf-thread-tools
 // @match        *://*/threads/*
@@ -4268,6 +4268,7 @@
         '@keyframes xft-dlslide{from{background-position:200% 0}to{background-position:-200% 0}}',
         '.xft-dl-run{background:hsl(var(--xft-ring)/.18)!important;border-color:hsl(var(--xft-ring))!important}',
         '.xft-jumps{position:absolute;right:10px;bottom:14px;display:flex;flex-direction:column;gap:6px;z-index:5}',
+        '.xft-jumps[hidden]{display:none}',
         '.xft-jumpbtn{width:30px;height:30px;padding:0;font-size:14px;line-height:1;border-radius:8px;box-shadow:0 2px 8px hsl(240 10% 3.9%/.25)}',
         // group headers: label + hairline filler; the fixed heights (30/24)
         // are the virtual grid's headH/subH inputs — keep CSS and
