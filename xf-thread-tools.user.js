@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         xf-thread-tools
 // @namespace    xf-thread-tools
-// @version      0.10.5
+// @version      0.11.0
 // @description  XenForo 2: sort thread posts by reaction count across all pages (cached) + floating media panel (images / external links).
 // @author       xf-thread-tools
 // @match        *://*/threads/*
@@ -3533,7 +3533,7 @@
     let aiCtxEl = null;
     let aiInputEl = null;
     let aiSeq = 0; // bump = rebuild the AI view (fetch ticks must not wipe drafts)
-    const aiChat = { msgs: [], pending: false, abort: null, models: [], modelsLoading: false, cfgOpen: false };
+    const aiChat = { msgs: [], pending: false, abort: null, models: [], modelsLoading: false, cfgOpen: false, streamText: '' };
 
     function aiCfgReady() {
       return !!settings.aiModel && !(settings.aiProvider === 'openai' && !settings.aiKey);
@@ -3550,7 +3550,9 @@
     // one request shape for chat + model list; GM XHR (CORS-free — required
     // for api.openai.com and cross-origin Ollama) with a fetch fallback.
     // 120s timeout: local models are slow before the first token.
-    function aiRequest(method, url, bodyObj, cb) {
+    // onChunk (optional) streams the body incrementally: TM's onprogress
+    // reports the FULL responseText so far — normalized to deltas here.
+    function aiRequest(method, url, bodyObj, cb, onChunk) {
       let fin = cb;
       const finish = (v) => { if (fin) { const f = fin; fin = null; f(v); } };
       const headers = { 'Content-Type': 'application/json' };
@@ -3562,10 +3564,15 @@
         else finish({ error: (v && v.error && typeof v.error.message === 'string') ? v.error.message : 'HTTP ' + status });
       };
       if (typeof GM_xmlhttpRequest === 'function') {
+        let seen = 0;
         try {
           const rq = GM_xmlhttpRequest({
             method: method, url: url, headers: headers, timeout: 120000,
             data: bodyObj ? JSON.stringify(bodyObj) : undefined,
+            onprogress: (r) => {
+              if (!onChunk || !r || typeof r.responseText !== 'string') return;
+              if (r.responseText.length > seen) { onChunk(r.responseText.slice(seen)); seen = r.responseText.length; }
+            },
             onload: (r) => onJson(r ? r.status | 0 : 0, r ? String(r.responseText || '') : ''),
             onerror: () => finish({ error: 'network' }),
             ontimeout: () => finish({ error: 'timeout' })
@@ -3580,7 +3587,20 @@
         signal: ctl ? ctl.signal : undefined,
         body: bodyObj ? JSON.stringify(bodyObj) : undefined
       })
-        .then(async (r) => onJson(r.status, await r.text()))
+        .then(async (r) => {
+          if (!onChunk || !r.body || !r.body.getReader) { onJson(r.status, await r.text()); return; }
+          const reader = r.body.getReader();
+          const dec = new TextDecoder();
+          let full = '';
+          for (;;) {
+            const st = await reader.read();
+            if (st.done) break;
+            const piece = dec.decode(st.value, { stream: true });
+            full += piece;
+            onChunk(piece);
+          }
+          onJson(r.status, full);
+        })
         .catch(() => finish({ error: 'network' }));
       return { abort: () => { try { if (ctl) ctl.abort(); } catch (e) {} } };
     }
@@ -3590,21 +3610,44 @@
       if (!aiCfgReady()) { aiChat.cfgOpen = true; aiSeq++; renderAiTab(true); return; }
       aiChat.msgs.push({ role: 'user', content: question });
       aiChat.pending = true;
+      aiChat.streamText = '';
       aiSeq++;
       renderAiTab(true);
       const ep = aiEndpoint(settings);
       const posts = orderedRecords().map((r) => ({ author: r.author, pageN: r.pageN, reactionCount: r.reactionCount, text: htmlToText(r.bodyHtml) }));
-      const body = { model: settings.aiModel, messages: aiMessages(buildAiTranscript(posts), question, aiChat.msgs.slice(0, -1)) };
+      const body = { model: settings.aiModel, messages: aiMessages(buildAiTranscript(posts), question, aiChat.msgs.slice(0, -1)), stream: true };
+      const sse = aiSseParser();
+      let acc = '';
+      let lastPaint = 0;
+      const onChunk = (piece) => {
+        for (const d of sse.push(piece)) acc += d;
+        if (!acc) return;
+        aiChat.streamText = acc;
+        const now = Date.now();
+        if (now - lastPaint >= 150) { lastPaint = now; aiSeq++; renderAiTab(true); } // throttled live bubble
+      };
       aiChat.abort = aiRequest('POST', ep.chat, body, (res) => {
         aiChat.pending = false;
         aiChat.abort = null;
-        const p = res && res.ok ? parseAiReply(res.json !== null && res.json !== undefined ? res.json : res.text) : null;
-        aiChat.msgs.push(p && p.text
-          ? { role: 'assistant', content: p.text }
-          : { role: 'error', content: 'AI: ' + ((p && p.error) || (res && res.error) || 'failed') });
+        let fin = null;
+        if (res && res.ok) {
+          if (!acc && res.text) { // no onprogress events: parse the full SSE body in one shot
+            const whole = aiSseParser();
+            for (const d of whole.push(res.text)) acc += d;
+          }
+          if (acc) fin = { text: acc };
+          else {
+            const p = parseAiReply(res.json !== null && res.json !== undefined ? res.json : res.text);
+            if (p.text) fin = p; // server ignored stream:true and answered plain JSON
+          }
+        }
+        if (fin) aiChat.msgs.push({ role: 'assistant', content: fin.text });
+        else if (acc && res && res.error === 'stopped') aiChat.msgs.push({ role: 'assistant', content: acc }); // keep the partial on Stop
+        else aiChat.msgs.push({ role: 'error', content: 'AI: ' + ((res && res.error) || 'failed') });
+        aiChat.streamText = '';
         aiSeq++;
         renderAiTab(true);
-      });
+      }, onChunk);
     }
     function aiTestConn(base) {
       if (aiChat.modelsLoading) return;
@@ -3707,6 +3750,7 @@
         vRange = { first: -1, last: -1, version: -1 };
       }
       vRowsEl = null;
+      const draft = aiInputEl && aiInputEl.isConnected ? aiInputEl.value : null; // live-rebuild safe
       const wrap = document.createElement('div');
       wrap.className = 'xft-ai';
       wrap.dataset.seq = seqKey;
@@ -3805,7 +3849,12 @@
       if (aiChat.pending) {
         const d = document.createElement('div');
         d.className = 'xft-ai-m xft-ai-asst xft-ai-pend';
-        d.textContent = '…';
+        if (aiChat.streamText) { // live-streamed reply, re-marked-down on each throttled paint
+          mdRenderInto(d, mdParse(aiChat.streamText));
+          d.appendChild(document.createTextNode('▍'));
+        } else {
+          d.textContent = '…';
+        }
         aiLogEl.appendChild(d);
       }
 
@@ -3838,6 +3887,7 @@
       wrap.append(cfg, ctxRow, aiLogEl, quick, bar);
       panelBodyEl.replaceChildren(wrap);
       aiViewEl = wrap;
+      if (draft !== null && aiInputEl) aiInputEl.value = draft;
       aiLogEl.scrollTop = aiLogEl.scrollHeight;
       panelBodyEl.scrollTop = scrollMemory[viewKey()] || 0;
     }
@@ -4774,6 +4824,35 @@
     return blocks;
   }
 
+  // ---------- SSE stream parsing for chat (pure — unit-tested) ----------
+  // OpenAI/Ollama streaming shape: `data: {json with choices[0].delta.content}`
+  // lines, terminated by `data: [DONE]`. Incremental: chunks may split lines
+  // anywhere; the buffer keeps the partial tail until its \n arrives.
+  function aiSseParser() {
+    let buf = '';
+    let done = false;
+    return {
+      push(chunk) {
+        buf += String(chunk || '');
+        const out = [];
+        let nl;
+        while ((nl = buf.indexOf('\n')) >= 0) {
+          const line = buf.slice(0, nl).replace(/\r$/, '');
+          buf = buf.slice(nl + 1);
+          if (line.slice(0, 5) !== 'data:') continue;
+          const d = line.slice(5).trim();
+          if (d === '[DONE]') { done = true; continue; }
+          let v = null;
+          try { v = JSON.parse(d); } catch (e) { continue; }
+          const c = v && v.choices && v.choices[0] && v.choices[0].delta && v.choices[0].delta.content;
+          if (typeof c === 'string' && c) out.push(c);
+        }
+        return out;
+      },
+      isDone() { return done; }
+    };
+  }
+
   // UMD export of the pure functions for node:test (no DOM / GM usage in them).
-  if (typeof module !== 'undefined' && module.exports) module.exports = { parseReactionCount, filterLinks, sortPosts, estimateSize, partitionLinks, extractDomain, groupLinkItems, applyLinkFilters, boilerplateUrls, isSmilieUrl, parseEmbedPoster, embedSignUrl, parseSignResponse, parseSignToken, parseVideoPage, isVideoPageUrl, hqCandidates, sanitizeFileSeg, siteTagFromHost, cleanThreadTitle, zipKindTag, zipFileName, imagePageHref, parseImagePage, parseImageApiResponse, dlBasename, buildDlJobs, dlChunkPlan, dlFailClass, crc32, zipStoreU8, layoutMetrics, windowRange, originBurstingFromHist, hostKey, dosDateTime, fmtSpeed, fmtEta, buildMediaLayout, htmlToText, buildAiTranscript, aiMessages, aiEndpoint, parseAiModels, parseAiReply, mdInlineTokens, mdParse };
+  if (typeof module !== 'undefined' && module.exports) module.exports = { parseReactionCount, filterLinks, sortPosts, estimateSize, partitionLinks, extractDomain, groupLinkItems, applyLinkFilters, boilerplateUrls, isSmilieUrl, parseEmbedPoster, embedSignUrl, parseSignResponse, parseSignToken, parseVideoPage, isVideoPageUrl, hqCandidates, sanitizeFileSeg, siteTagFromHost, cleanThreadTitle, zipKindTag, zipFileName, imagePageHref, parseImagePage, parseImageApiResponse, dlBasename, buildDlJobs, dlChunkPlan, dlFailClass, crc32, zipStoreU8, layoutMetrics, windowRange, originBurstingFromHist, hostKey, dosDateTime, fmtSpeed, fmtEta, buildMediaLayout, htmlToText, buildAiTranscript, aiMessages, aiEndpoint, parseAiModels, parseAiReply, mdInlineTokens, mdParse, aiSseParser };
 })();

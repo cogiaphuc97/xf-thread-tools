@@ -8,7 +8,7 @@ import path from 'node:path';
 
 const require = createRequire(import.meta.url);
 const userJsPath = path.join(path.dirname(fileURLToPath(import.meta.url)), '..', 'xf-thread-tools.user.js');
-const { htmlToText, buildAiTranscript, aiMessages, aiEndpoint, parseAiModels, parseAiReply, mdInlineTokens, mdParse } = require(userJsPath);
+const { htmlToText, buildAiTranscript, aiMessages, aiEndpoint, parseAiModels, parseAiReply, mdInlineTokens, mdParse, aiSseParser } = require(userJsPath);
 
 // ---- htmlToText ----
 test('htmlToText: tags stripped, block tags become newlines, whitespace collapsed', () => {
@@ -148,7 +148,6 @@ test('parseAiReply: provider error objects surface their message', () => {
 });
 
 // ---- markdown tokenizer (assistant bubbles) ----
-const seg = (blocks) => JSON.stringify(blocks);
 test('mdInlineTokens: code, bold, em, links; hrefs locked to http(s)', () => {
   assert.deepEqual(mdInlineTokens('a `x` b **y** c *z* d'), [
     { c: 'text', s: 'a ' }, { c: 'code', s: 'x' }, { c: 'text', s: ' b ' },
@@ -191,4 +190,35 @@ test('mdParse: **bold** line is a paragraph, not a bullet; blank-line grouping',
   const b = mdParse('**standalone**\n\npara two');
   assert.deepEqual(b.map((x) => x.t), ['p', 'p']);
   assert.deepEqual(b[0].segs, [{ c: 'strong', s: 'standalone' }]);
+});
+
+// ---- SSE stream parser ----
+test('aiSseParser: delta lines accumulate; role/usage chunks and non-data lines skipped', () => {
+  const p = aiSseParser();
+  assert.deepEqual(p.push('data: {"choices":[{"delta":{"role":"assistant"}}]}\n\n: keep-alive\n'), []);
+  assert.deepEqual(p.push('data: {"choices":[{"delta":{"content":"Hel"}}]}\n'), ['Hel']);
+  assert.deepEqual(p.push('data: {"choices":[{"delta":{"content":"lo"}}]}\ndata: {"choices":[],"usage":{"x":1}}\n'), ['lo']);
+  assert.equal(p.isDone(), false);
+  assert.deepEqual(p.push('data: [DONE]\n'), []);
+  assert.equal(p.isDone(), true);
+});
+
+test('aiSseParser: chunks may split ANYWHERE — mid-line, mid-marker, mid-JSON', () => {
+  const full = 'data: {"choices":[{"delta":{"content":"abc"}}]}\ndata: {"choices":[{"delta":{"content":"def"}}]}\ndata: [DONE]\n';
+  const p1 = aiSseParser();
+  const out1 = [];
+  for (let i = 0; i < full.length; i += 3) out1.push(...p1.push(full.slice(i, i + 3)));
+  assert.deepEqual(out1, ['abc', 'def']);
+  assert.equal(p1.isDone(), true);
+  const p2 = aiSseParser();
+  const out2 = [];
+  for (let i = 0; i < full.length; i++) out2.push(...p2.push(full.slice(i, i + 1)));
+  assert.deepEqual(out2, ['abc', 'def']);
+  assert.equal(p2.isDone(), true);
+});
+
+test('aiSseParser: CRLF endings and plain non-SSE JSON produce nothing', () => {
+  const p = aiSseParser();
+  assert.deepEqual(p.push('data: {"choices":[{"delta":{"content":"x"}}]}\r\n'), ['x']);
+  assert.deepEqual(p.push('{"choices":[{"message":{"content":"whole"}}]}'), []);
 });
