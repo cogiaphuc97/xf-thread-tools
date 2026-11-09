@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         xf-thread-tools
 // @namespace    xf-thread-tools
-// @version      0.9.0
+// @version      0.9.1
 // @description  XenForo 2: sort thread posts by reaction count across all pages (cached) + floating media panel (images / external links).
 // @author       xf-thread-tools
 // @match        *://*/threads/*
@@ -2154,11 +2154,6 @@
       for (const e of dlSpeedWin) s += e.b;
       return s / 3;
     }
-    function fmtSpeed(bps) {
-      if (bps >= 1048576) return (bps / 1048576).toFixed(1) + ' MB/s';
-      if (bps >= 1024) return (bps / 1024).toFixed(0) + ' KB/s';
-      return Math.round(bps) + ' B/s';
-    }
     // ETA from smoothed speed vs estimated remaining bytes: active jobs at
     // (total − loaded), queued jobs at the average size of finished files.
     // Zero until 3s of samples — a fake ETA in the first second is worse
@@ -2175,12 +2170,6 @@
       const avg = dlRun.done ? dlRun.bytes / dlRun.done : 0;
       remaining += queued * avg;
       return remaining > 0 ? remaining / spd : 0;
-    }
-    function fmtEta(s) {
-      if (!s || s < 2) return '';
-      if (s < 90) return '≈ ' + Math.max(1, Math.round(s)) + 's';
-      if (s < 5400) return '≈ ' + Math.round(s / 60) + 'm';
-      return '≈ 90m+';
     }
     function setStat(el, text) { if (el.textContent !== text) el.textContent = text; }
     // status dashboard: header (name/speed/ETA/stop), overall bar + counts,
@@ -3234,45 +3223,6 @@
     // sub-header per post inside each group. flat = media rows only.
     // Groups are built from the FILTERED item list, so sub-tab switches
     // (All/Image/Video) keep the grouping but drop empty groups.
-    function buildMediaLayout(items, mode) {
-      const lay = [];
-      // sequential 4-packs — NO holes (user-facing rule: the grid is always
-      // densely packed in every mode). Re-chunking after a retirement is
-      // safe now: rows reconcile cell-by-cell by URL, so surviving imgs keep
-      // their elements (and their decoded frames) even when they slide into
-      // a different row.
-      const chunk = (list) => { for (let j = 0; j < list.length; j += 4) lay.push({ idxs: list.slice(j, j + 4) }); };
-      if (mode !== 'post' && mode !== 'page' && mode !== 'user') {
-        chunk(items.map((_, i) => i));
-        return lay;
-      }
-      const groups = new Map(); // insertion order = first-appearance order
-      for (let i = 0; i < items.length; i++) {
-        const it = items[i];
-        const author = it.r.author || '?';
-        const gkey = mode === 'page' ? 'p' + (it.r.pageN || 1) : mode === 'user' ? 'u' + author : it.r.postId;
-        let g = groups.get(gkey);
-        if (!g) {
-          g = { label: mode === 'page' ? 'Page ' + (it.r.pageN || 1) : mode === 'user' ? author : '#' + it.pos + ' - ' + author,
-            postId: it.r.postId, subs: new Map() };
-          groups.set(gkey, g);
-        }
-        let s = g.subs.get(it.r.postId);
-        if (!s) { s = { pos: it.pos, author: author, postId: it.r.postId, list: [] }; g.subs.set(it.r.postId, s); }
-        s.list.push(i);
-      }
-      for (const g of groups.values()) {
-        lay.push({ hdr: 'main', label: g.label, postId: g.postId });
-        for (const s of g.subs.values()) {
-          // user groups already name the author in their main header — the
-          // post sub-header shows the number only
-          if (mode !== 'post') lay.push({ hdr: 'sub', label: mode === 'user' ? '#' + s.pos : '#' + s.pos + ' - ' + s.author, postId: s.postId });
-          chunk(s.list);
-        }
-      }
-      return lay;
-    }
-
     // shared preamble for the render pass AND bulk download: ordered records
     // (fetch-frontier filtered), post positions, boilerplate set. The
     // download list must match the grid exactly — one source of truth.
@@ -4216,6 +4166,59 @@
     return bad / n >= 0.5;
   }
 
+  // ---------- dashboard formatting (pure — unit-tested, no DOM) ----------
+  function fmtSpeed(bps) {
+    if (bps >= 1048576) return (bps / 1048576).toFixed(1) + ' MB/s';
+    if (bps >= 1024) return (bps / 1024).toFixed(0) + ' KB/s';
+    return Math.round(bps) + ' B/s';
+  }
+  function fmtEta(s) {
+    if (!s || s < 2) return '';
+    if (s < 90) return '≈ ' + Math.max(1, Math.round(s)) + 's';
+    if (s < 5400) return '≈ ' + Math.round(s / 60) + 'm';
+    return '≈ 90m+';
+  }
+
+  // ---------- media grid grouping/layout (pure — unit-tested, no DOM) ----------
+  function buildMediaLayout(items, mode) {
+    const lay = [];
+    // sequential 4-packs — NO holes (user-facing rule: the grid is always
+    // densely packed in every mode). Re-chunking after a retirement is
+    // safe now: rows reconcile cell-by-cell by URL, so surviving imgs keep
+    // their elements (and their decoded frames) even when they slide into
+    // a different row.
+    const chunk = (list) => { for (let j = 0; j < list.length; j += 4) lay.push({ idxs: list.slice(j, j + 4) }); };
+    if (mode !== 'post' && mode !== 'page' && mode !== 'user') {
+      chunk(items.map((_, i) => i));
+      return lay;
+    }
+    const groups = new Map(); // insertion order = first-appearance order
+    for (let i = 0; i < items.length; i++) {
+      const it = items[i];
+      const author = it.r.author || '?';
+      const gkey = mode === 'page' ? 'p' + (it.r.pageN || 1) : mode === 'user' ? 'u' + author : it.r.postId;
+      let g = groups.get(gkey);
+      if (!g) {
+        g = { label: mode === 'page' ? 'Page ' + (it.r.pageN || 1) : mode === 'user' ? author : '#' + it.pos + ' - ' + author,
+          postId: it.r.postId, subs: new Map() };
+        groups.set(gkey, g);
+      }
+      let s = g.subs.get(it.r.postId);
+      if (!s) { s = { pos: it.pos, author: author, postId: it.r.postId, list: [] }; g.subs.set(it.r.postId, s); }
+      s.list.push(i);
+    }
+    for (const g of groups.values()) {
+      lay.push({ hdr: 'main', label: g.label, postId: g.postId });
+      for (const s of g.subs.values()) {
+        // user groups already name the author in their main header — the
+        // post sub-header shows the number only
+        if (mode !== 'post') lay.push({ hdr: 'sub', label: mode === 'user' ? '#' + s.pos : '#' + s.pos + ' - ' + s.author, postId: s.postId });
+        chunk(s.list);
+      }
+    }
+    return lay;
+  }
+
   // UMD export of the pure functions for node:test (no DOM / GM usage in them).
-  if (typeof module !== 'undefined' && module.exports) module.exports = { parseReactionCount, filterLinks, sortPosts, estimateSize, partitionLinks, extractDomain, groupLinkItems, applyLinkFilters, boilerplateUrls, isSmilieUrl, parseEmbedPoster, embedSignUrl, parseSignResponse, parseSignToken, parseVideoPage, isVideoPageUrl, hqCandidates, sanitizeFileSeg, siteTagFromHost, cleanThreadTitle, zipKindTag, zipFileName, imagePageHref, parseImagePage, parseImageApiResponse, dlBasename, buildDlJobs, dlChunkPlan, dlFailClass, crc32, zipStoreU8, layoutMetrics, windowRange, originBurstingFromHist };
+  if (typeof module !== 'undefined' && module.exports) module.exports = { parseReactionCount, filterLinks, sortPosts, estimateSize, partitionLinks, extractDomain, groupLinkItems, applyLinkFilters, boilerplateUrls, isSmilieUrl, parseEmbedPoster, embedSignUrl, parseSignResponse, parseSignToken, parseVideoPage, isVideoPageUrl, hqCandidates, sanitizeFileSeg, siteTagFromHost, cleanThreadTitle, zipKindTag, zipFileName, imagePageHref, parseImagePage, parseImageApiResponse, dlBasename, buildDlJobs, dlChunkPlan, dlFailClass, crc32, zipStoreU8, layoutMetrics, windowRange, originBurstingFromHist, hostKey, dosDateTime, fmtSpeed, fmtEta, buildMediaLayout };
 })();
