@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         xf-thread-tools
 // @namespace    xf-thread-tools
-// @version      0.8.2
+// @version      0.8.3
 // @description  XenForo 2: sort thread posts by reaction count across all pages (cached) + floating media panel (images / external links).
 // @author       xf-thread-tools
 // @match        *://*/threads/*
@@ -2156,7 +2156,28 @@
       dlNet.last = now + wait;
       setTimeout(() => {
         if (!dlRun.running) { dlNet.active--; return; }
-        dlTry(job, 0, () => { dlNet.active--; dlPump(); });
+        // per-job context: idempotent release + kill, and an ABSOLUTE
+        // watchdog — any path that never settles (a thrown resolver edge,
+        // a wedged stream, an unknown unknown) must fail the job and free
+        // the slot instead of freezing the whole download at the same %
+        const ctx = { released: false, killed: false, onProg: null };
+        const rel = () => {
+          if (ctx.released) return;
+          ctx.released = true;
+          clearTimeout(wd);
+          dlNet.active--;
+          dlPump();
+        };
+        const wd = setTimeout(() => {
+          if (ctx.released || !dlRun.running) return;
+          ctx.killed = true;
+          dlRun.fail++;
+          if (!dlRun.lastErr) dlRun.lastErr = 'stalled job (watchdog)';
+          updateDlDash();
+          rel();
+        }, 480000);
+        ctx.onProg = dlByte;
+        dlTry(job, 0, rel, ctx);
       }, wait);
     }
     function dlAfter(release) {
@@ -2167,9 +2188,9 @@
       dlSpeedWin.push({ t: performance.now(), b: b });
       dlDashTick();
     }
-    function dlTry(job, ci, release) {
+    function dlTry(job, ci, release, ctx) {
       const settle = (blob) => {
-        if (dlRun.cancel) { release(); return; }
+        if (dlRun.cancel || ctx.killed) { release(); return; }
         if (blob) {
           dlRun.done++;
           dlRun.bytes += blob.size;
@@ -2181,15 +2202,15 @@
           dlAfter(release);
           return;
         }
-        if (dlRun.running && ci + 1 < job.cands.length) { dlTry(job, ci + 1, release); return; }
+        if (dlRun.running && ci + 1 < job.cands.length) { dlTry(job, ci + 1, release, ctx); return; }
         dlRun.fail++;
         dlAfter(release);
       };
       if (job.page) {
         // landing-page HQ: resolve the original, fall back to the embedded
         resolveImagePage(job.page, job.cands[0], (full) => {
-          if (dlRun.cancel) { release(); return; }
-          dlFetch(full || job.cands[ci], settle, dlByte);
+          if (dlRun.cancel || ctx.killed) { release(); return; }
+          dlFetch(full || job.cands[ci], settle, ctx.onProg);
         }, true); // user-initiated single — force past any failure cooldown
         return;
       }
@@ -2198,30 +2219,45 @@
         // file-page carrier), then fetch the bytes. Resolution shares the
         // same net slot so the 2-concurrent cap also throttles sign hits.
         resolveEmbedStream(job.cands[ci], (src) => {
-          if (dlRun.cancel) { release(); return; }
+          if (dlRun.cancel || ctx.killed) { release(); return; }
           if (!src) { dlRun.fail++; dlRun.lastErr = 'embed stream unresolved'; dlAfter(release); return; }
-          dlFetch(src, settle, dlByte);
+          dlFetch(src, settle, ctx.onProg);
         });
         return;
       }
-      dlFetch(job.cands[ci], settle, dlByte);
+      dlFetch(job.cands[ci], settle, ctx.onProg);
     }
     function dlFetch(url, cb, onProg) {
       let settled = false;
-      const done = (blob) => { if (!settled) { settled = true; cb(blob); } };
+      let firstByte = false;
+      const done = (blob) => { if (!settled) { settled = true; clearTimeout(hang); cb(blob); } };
+      // wedged-stream leash: no FIRST byte within 90s = dead — a stream that
+      // never opens must not hold a net slot (GM's own timeout only governs
+      // after the request is underway, and silent hangs fire nothing)
+      const hang = setTimeout(() => { if (!firstByte) done(null); }, 90000);
+      const prog = (b) => { firstByte = true; if (onProg) onProg(b); };
       if (typeof GM_xmlhttpRequest === 'function') {
-        let last = 0;
-        GM_xmlhttpRequest({
-          method: 'GET', url: url, responseType: 'blob', timeout: 180000,
-          onprogress: (r) => { if (onProg && r && r.loaded > last) { onProg(r.loaded - last); last = r.loaded; } },
-          onload: (r) => done(r && (r.status === 200 || r.status === 0) && r.response ? r.response : null),
-          onerror: () => done(null),
-          ontimeout: () => done(null)
-        });
-        return;
+        try {
+          let last = 0;
+          GM_xmlhttpRequest({
+            method: 'GET', url: url, responseType: 'blob', timeout: 180000,
+            onprogress: (r) => { if (r && r.loaded > last) { prog(r.loaded - last); last = r.loaded; } },
+            onload: (r) => done(r && (r.status === 200 || r.status === 0) && r.response ? r.response : null),
+            onerror: () => done(null),
+            ontimeout: () => done(null)
+          });
+          return;
+        } catch (e) {
+          // TM throws SYNCHRONOUSLY on URLs it cannot parse — an uncaught
+          // throw here leaks the net slot and froze whole downloads at the
+          // same job forever. Fall through to fetch, which will fail cleanly.
+        }
       }
-      fetch(url, { referrerPolicy: 'no-referrer' })
+      const ctl = (typeof AbortController !== 'undefined') ? new AbortController() : null;
+      const leash = ctl ? setTimeout(() => { try { ctl.abort(); } catch (e) {} }, 180000) : 0;
+      fetch(url, { referrerPolicy: 'no-referrer', signal: ctl ? ctl.signal : undefined })
         .then(async (r) => {
+          clearTimeout(leash);
           if (!r.ok) { done(null); return; }
           if (!r.body || !r.body.getReader) { done(await r.blob()); return; }
           const reader = r.body.getReader();
@@ -2230,11 +2266,11 @@
             const st = await reader.read();
             if (st.done) break;
             chunks.push(st.value);
-            if (onProg) onProg(st.value.length);
+            prog(st.value.length);
           }
           done(new Blob(chunks));
         })
-        .catch(() => done(null));
+        .catch(() => { clearTimeout(leash); done(null); });
     }
     async function buildZipBlob(files) { // files: [{ name, blob }]
       const enc = new TextEncoder();
