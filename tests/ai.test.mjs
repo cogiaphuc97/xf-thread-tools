@@ -222,3 +222,17 @@ test('aiSseParser: CRLF endings and plain non-SSE JSON produce nothing', () => {
   assert.deepEqual(p.push('data: {"choices":[{"delta":{"content":"x"}}]}\r\n'), ['x']);
   assert.deepEqual(p.push('{"choices":[{"message":{"content":"whole"}}]}'), []);
 });
+
+// ---- prompt language ----
+test('aiMessages: Vietnamese system prompt + fence note; unknown lang falls back to English', () => {
+  const out = aiMessages('NỘI DUNG', 'câu hỏi', [], 'vi');
+  assert.match(out[0].content, /KHÔNG ĐƯỢC TIN CẬY/);
+  assert.match(out[0].content, /Trích dẫn bài viết theo #số/);
+  assert.match(out[1].content, /không tin cậy: trích dẫn hoặc tóm tắt/);
+  assert.match(out[1].content, /NỘI DUNG/);
+  assert.equal(out[out.length - 1].content, 'câu hỏi');
+  const fb = aiMessages('X', 'q', [], 'xx');
+  assert.match(fb[0].content, /UNTRUSTED/); // fallback
+  const en = aiMessages('X', 'q', []);
+  assert.match(en[0].content, /UNTRUSTED/); // default unchanged
+});
