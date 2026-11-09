@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         xf-thread-tools
 // @namespace    xf-thread-tools
-// @version      0.10.1
+// @version      0.10.2
 // @description  XenForo 2: sort thread posts by reaction count across all pages (cached) + floating media panel (images / external links).
 // @author       xf-thread-tools
 // @match        *://*/threads/*
@@ -42,7 +42,7 @@
     forceAnimations: 0,          // 1 = run UI animations even under prefers-reduced-motion
     mediaGroup: 'flat',          // media grid grouping: flat | post | page | user
     selectors: {},               // per-site selector overrides, merged over BASE_SEL
-    aiProvider: 'openai',        // AI tab provider preset: openai | ollama | custom
+    aiProvider: 'ollama',        // AI tab provider preset (Ollama-only phase; engine stays provider-generic)
     aiBase: '',                  // '' = provider preset base URL
     aiModel: ''                  // selected chat model id
   };
@@ -642,17 +642,16 @@
       } catch (e) { /* ignore */ }
       return '';
     }
-    function writeAiKey(k) {
-      try {
-        if (typeof GM_setValue === 'function') GM_setValue(AI_KEY, String(k || ''));
-      } catch (e) { /* ignore */ }
-    }
     function saveSettings() {
       writeStore(SETTINGS_KEY, Object.assign({}, settings, { aiKey: undefined }));
     }
 
     const settings = Object.assign({}, DEFAULT_SETTINGS, readStore(SETTINGS_KEY, {}));
     settings.aiKey = readAiKey();
+    // Ollama-only phase: no provider picker — coerce stale stored presets and
+    // drop bases that point at the old default so the UI shows one truth
+    if (settings.aiProvider !== 'ollama') settings.aiProvider = 'ollama';
+    if (settings.aiBase === 'https://api.openai.com/v1') settings.aiBase = '';
     if (!settings.selectors || typeof settings.selectors !== 'object') settings.selectors = {};
     const SEL = Object.assign({}, BASE_SEL, settings.selectors);
 
@@ -3605,18 +3604,21 @@
         renderAiTab(true);
       });
     }
-    function aiLoadModels() {
+    function aiTestConn(base) {
       if (aiChat.modelsLoading) return;
       aiChat.modelsLoading = true;
+      aiChat.testMsg = '…connecting';
       aiSeq++;
       renderAiTab(true);
-      aiRequest('GET', aiEndpoint(settings).models, null, (res) => {
+      aiRequest('GET', aiEndpoint({ provider: 'ollama', base: base }).models, null, (res) => {
         aiChat.modelsLoading = false;
         if (res && res.ok) {
           aiChat.models = parseAiModels(res.json !== null && res.json !== undefined ? res.json : res.text);
           if (aiChat.models.length && aiChat.models.indexOf(settings.aiModel) < 0) settings.aiModel = aiChat.models[0];
+          aiChat.testMsg = '✓ connected — ' + aiChat.models.length + ' models';
+          saveSettings();
         } else {
-          aiChat.msgs.push({ role: 'error', content: 'AI: models: ' + ((res && res.error) || 'failed') });
+          aiChat.testMsg = '✗ ' + ((res && res.error) || 'failed');
         }
         aiSeq++;
         renderAiTab(true);
@@ -3627,7 +3629,7 @@
       if (panelCountEl) panelCountEl.textContent = 'AI';
       // seqKey drives view rebuilds — provider/base/model/cfg affect the UI,
       // the KEY does not (Save bumps aiSeq) and must never appear in the DOM
-      const seqKey = aiSeq + ':' + settings.aiProvider + ':' + settings.aiModel + ':' + settings.aiBase + ':' + (aiChat.cfgOpen ? 'c' : '-');
+      const seqKey = aiSeq + ':' + settings.aiProvider + ':' + settings.aiModel + ':' + settings.aiBase + ':' + (aiChat.testMsg || '') + ':' + (aiChat.cfgOpen ? 'c' : '-');
       if (!force && aiViewEl && aiViewEl.isConnected && aiViewEl.dataset.seq === seqKey) {
         if (aiCtxEl) aiCtxEl.textContent = aiCtxText(); // post count grows while crawling
         return;
@@ -3644,10 +3646,13 @@
       wrap.className = 'xft-ai';
       wrap.dataset.seq = seqKey;
 
-      // config strip (collapsible)
+      // config strip (collapsible) — Ollama-only phase: base URL + Test + model.
+      // Everything commits the moment it changes: a rebuild (Test round-trip)
+      // must never revert a control to a stale stored value.
       const cfg = document.createElement('div');
       cfg.className = 'xft-ai-cfg';
       cfg.hidden = !aiChat.cfgOpen;
+      const OLLAMA_BASE = aiEndpoint({ provider: 'ollama' }).base;
       const mkRow = (labelText) => {
         const row = document.createElement('label');
         row.className = 'xft-set-row';
@@ -3657,32 +3662,20 @@
         cfg.appendChild(row);
         return row;
       };
-      const provRow = mkRow('provider');
-      const provSel = document.createElement('select');
-      provSel.className = 'xft-gsel';
-      for (const p of [['openai', 'OpenAI'], ['ollama', 'Ollama (local)'], ['custom', 'Custom (OpenAI-compatible)']]) {
-        const o = document.createElement('option');
-        o.value = p[0];
-        o.textContent = p[1];
-        provSel.appendChild(o);
-      }
-      provSel.value = settings.aiProvider;
-      provRow.appendChild(provSel);
-      const keyRow = mkRow('API key');
-      const keyInp = document.createElement('input');
-      keyInp.type = 'password';
-      keyInp.autocomplete = 'off';
-      keyInp.value = settings.aiKey;
-      keyInp.placeholder = 'sk-… (not needed for Ollama)';
-      keyRow.appendChild(keyInp);
-      const baseRow = mkRow('base URL');
+      const baseRow = mkRow('Base URL');
       const baseInp = document.createElement('input');
       baseInp.type = 'text';
-      baseInp.value = settings.aiBase;
-      baseInp.placeholder = aiEndpoint({ provider: provSel.value }).base;
-      baseRow.appendChild(baseInp);
-      provSel.addEventListener('change', () => { baseInp.placeholder = aiEndpoint({ provider: provSel.value }).base; });
-      const modelRow = mkRow('model');
+      baseInp.value = settings.aiBase || OLLAMA_BASE; // autofilled, editable
+      baseInp.placeholder = OLLAMA_BASE;
+      const testBtn = mkBtn(aiChat.modelsLoading ? '…' : 'Test', () => {
+        const b = baseInp.value.trim() || OLLAMA_BASE;
+        baseInp.value = b;
+        settings.aiBase = b === OLLAMA_BASE ? '' : b; // '' = preset default
+        saveSettings();
+        aiTestConn(b); // success also loads + commits the model list
+      }, 'xft-btn');
+      baseRow.append(baseInp, testBtn);
+      const modelRow = mkRow('Model');
       const modelSel = document.createElement('select');
       modelSel.className = 'xft-gsel';
       modelSel.style.flex = '1';
@@ -3696,27 +3689,27 @@
       if (!list.length) {
         const o = document.createElement('option');
         o.value = '';
-        o.textContent = '(load models ↻)';
+        o.textContent = '(press Test)';
         modelSel.appendChild(o);
       }
       modelSel.value = settings.aiModel || list[0] || '';
-      const loadBtn = mkBtn(aiChat.modelsLoading ? '…' : '↻ models', () => aiLoadModels(), 'xft-btn');
-      modelRow.append(modelSel, loadBtn);
-      const hint = document.createElement('div');
-      hint.className = 'xft-ai-hint';
-      hint.textContent = 'API key is kept in the script manager’s own storage (never page localStorage); scripts on this page could still read it while this panel is open. Post texts are sent to the configured provider.';
-      cfg.appendChild(hint);
-      cfg.appendChild(mkBtn('Save', () => {
-        settings.aiProvider = provSel.value;
-        settings.aiKey = keyInp.value.trim();
-        writeAiKey(settings.aiKey); // GM-only store; never the localStorage fallback
-        settings.aiBase = baseInp.value.trim();
+      modelSel.addEventListener('change', () => {
         settings.aiModel = modelSel.value || '';
         saveSettings();
-        aiChat.cfgOpen = false;
-        aiSeq++;
-        renderAiTab(true);
-      }));
+        // no rebuild — the base input may hold uncommitted edits
+        if (aiCtxEl) aiCtxEl.textContent = aiCtxText();
+      });
+      modelRow.appendChild(modelSel);
+      if (aiChat.testMsg) {
+        const st = document.createElement('div');
+        st.className = 'xft-ai-testmsg' + (/^✗/.test(aiChat.testMsg) ? ' xft-ai-testbad' : '');
+        st.textContent = aiChat.testMsg;
+        cfg.appendChild(st);
+      }
+      const hint = document.createElement('div');
+      hint.className = 'xft-ai-hint';
+      hint.textContent = 'Ollama only for now — the model list and chat run against the Base URL above. Post texts are sent to that endpoint.';
+      cfg.appendChild(hint);
 
       // context status + config toggle
       const ctxRow = document.createElement('div');
@@ -3734,7 +3727,7 @@
         e0.className = 'xft-ai-empty';
         e0.textContent = aiCfgReady()
           ? 'Ask anything about this thread — it summarizes, finds posts, explains comments.'
-          : 'Configure a provider first (⚙ AI settings): OpenAI API key, or Ollama for local models.';
+          : 'Set the Base URL and press Test (⚙ AI settings) to load your Ollama models.';
         aiLogEl.appendChild(e0);
       }
       for (const m of aiChat.msgs) {
@@ -3772,7 +3765,9 @@
       aiInputEl.addEventListener('keydown', (e) => {
         if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); act(); }
       });
-      bar.append(aiInputEl, mkBtn(aiChat.pending ? 'Stop' : 'Send', act, 'xft-btn'));
+      const sendBtn = mkBtn(aiChat.pending ? '■' : '➤', act, 'xft-btn xft-ai-send');
+      sendBtn.title = aiChat.pending ? 'Stop' : 'Send';
+      bar.append(aiInputEl, sendBtn);
 
       wrap.append(cfg, ctxRow, aiLogEl, quick, bar);
       panelBodyEl.replaceChildren(wrap);
@@ -4281,12 +4276,15 @@
         '.xft-settings[hidden]{display:none}',
         '.xft-set-row{display:flex;align-items:center;gap:8px;margin:4px 0;font-size:11px;color:hsl(var(--xft-fg))}',
         // ---- AI chat tab ----
-        '.xft-ai{display:flex;flex-direction:column;gap:8px;min-height:100%}',
+        '.xft-ai{display:flex;flex-direction:column;gap:8px;height:100%}',
         '.xft-ai-cfg{display:flex;flex-direction:column;gap:2px;padding:8px;border:1px solid hsl(var(--xft-border));border-radius:var(--xft-radius);background:hsl(var(--xft-muted))}',
         '.xft-ai-cfg[hidden]{display:none}',
         '.xft-ai-hint{font-size:10px;color:hsl(var(--xft-muted-fg));margin:6px 0 2px}',
         '.xft-ai-ctxrow{display:flex;align-items:center;gap:8px;justify-content:space-between;font-size:11px;color:hsl(var(--xft-muted-fg))}',
-        '.xft-ai-log{display:flex;flex-direction:column;gap:6px;overflow-y:auto;max-height:46vh;min-height:120px;padding:8px;border:1px solid hsl(var(--xft-border));border-radius:var(--xft-radius);background:hsl(var(--xft-bg))}',
+        '.xft-ai-log{display:flex;flex-direction:column;gap:6px;overflow-y:auto;flex:1 1 auto;min-height:80px;padding:8px;border:1px solid hsl(var(--xft-border));border-radius:var(--xft-radius);background:hsl(var(--xft-bg))}',
+        '.xft-ai-send{flex:0 0 44px;width:44px;height:48px;min-width:44px;font-size:14px;line-height:1;padding:0}',
+        '.xft-ai-testmsg{font-size:11px;color:hsl(var(--xft-muted-fg))}',
+        '.xft-ai-testbad{color:hsl(0 62% 60%)}',
         '.xft-ai-empty{color:hsl(var(--xft-muted-fg));font-size:12px;padding:8px}',
         '.xft-ai-m{max-width:88%;padding:6px 10px;border-radius:calc(var(--xft-radius) - 2px);font-size:12px;line-height:1.45;white-space:pre-wrap;word-break:break-word}',
         '.xft-ai-user{align-self:flex-end;background:hsl(var(--xft-primary)/.15);border:1px solid hsl(var(--xft-primary)/.35)}',
