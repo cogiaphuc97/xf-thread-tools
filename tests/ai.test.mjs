@@ -8,7 +8,7 @@ import path from 'node:path';
 
 const require = createRequire(import.meta.url);
 const userJsPath = path.join(path.dirname(fileURLToPath(import.meta.url)), '..', 'xf-thread-tools.user.js');
-const { htmlToText, buildAiTranscript, aiMessages, aiEndpoint, parseAiModels, parseAiReply } = require(userJsPath);
+const { htmlToText, buildAiTranscript, aiMessages, aiEndpoint, parseAiModels, parseAiReply, mdInlineTokens, mdParse } = require(userJsPath);
 
 // ---- htmlToText ----
 test('htmlToText: tags stripped, block tags become newlines, whitespace collapsed', () => {
@@ -145,4 +145,50 @@ test('parseAiReply: provider error objects surface their message', () => {
   assert.deepEqual(parseAiReply({ error: 'quota exceeded' }), { error: 'quota exceeded' });
   assert.deepEqual(parseAiReply('nope{'), { error: 'invalid JSON' });
   assert.deepEqual(parseAiReply(null), { error: 'empty response' });
+});
+
+// ---- markdown tokenizer (assistant bubbles) ----
+const seg = (blocks) => JSON.stringify(blocks);
+test('mdInlineTokens: code, bold, em, links; hrefs locked to http(s)', () => {
+  assert.deepEqual(mdInlineTokens('a `x` b **y** c *z* d'), [
+    { c: 'text', s: 'a ' }, { c: 'code', s: 'x' }, { c: 'text', s: ' b ' },
+    { c: 'strong', s: 'y' }, { c: 'text', s: ' c ' }, { c: 'em', s: 'z' }, { c: 'text', s: ' d' }
+  ]);
+  assert.deepEqual(mdInlineTokens('see [site](https://x.test/a?b=1) now'), [
+    { c: 'text', s: 'see ' }, { c: 'link', s: 'site', href: 'https://x.test/a?b=1' }, { c: 'text', s: ' now' }
+  ]);
+  // non-http schemes and relative hrefs degrade to plain text
+  assert.deepEqual(mdInlineTokens('no [x](javascript:alert(1)) rel [y](/path)'), [
+    { c: 'text', s: 'no [x](javascript:alert(1)) rel [y](/path)' }
+  ]);
+  // snake_case is NOT italic (no underscore emphasis at all)
+  assert.deepEqual(mdInlineTokens('file_name_here'), [{ c: 'text', s: 'file_name_here' }]);
+});
+
+test('mdParse: headings, paragraphs, hr, quote, lists, fenced code', () => {
+  const b = mdParse('## Summary\n\nText line one\nline two\n\n---\n\n> quoted **deep**\n\n- a `x`\n- b\n\n1. first\n2. second\n\n```js\nconst z = 1;\n```');
+  assert.deepEqual(b.map((x) => x.t), ['h', 'p', 'hr', 'quote', 'ul', 'ol', 'code']);
+  assert.equal(b[0].level, 2);
+  assert.equal(b[1].segs[0].s, 'Text line one\nline two');
+  assert.deepEqual(b[3].segs, [{ c: 'text', s: 'quoted ' }, { c: 'strong', s: 'deep' }]);
+  assert.equal(b[4].items.length, 2);
+  assert.deepEqual(b[4].items[0], [{ c: 'text', s: 'a ' }, { c: 'code', s: 'x' }]);
+  assert.equal(b[5].items.length, 2);
+  assert.equal(b[6].lang, 'js');
+  assert.equal(b[6].text, 'const z = 1;');
+});
+
+test('mdParse: unterminated fence captures to EOF; empty and plain input', () => {
+  const b = mdParse('```\ntail code');
+  assert.equal(b.length, 1);
+  assert.equal(b[0].t, 'code');
+  assert.equal(b[0].text, 'tail code');
+  assert.deepEqual(mdParse(''), []);
+  assert.deepEqual(mdParse('plain'), [{ t: 'p', segs: [{ c: 'text', s: 'plain' }] }]);
+});
+
+test('mdParse: **bold** line is a paragraph, not a bullet; blank-line grouping', () => {
+  const b = mdParse('**standalone**\n\npara two');
+  assert.deepEqual(b.map((x) => x.t), ['p', 'p']);
+  assert.deepEqual(b[0].segs, [{ c: 'strong', s: 'standalone' }]);
 });

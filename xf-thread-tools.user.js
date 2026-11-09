@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         xf-thread-tools
 // @namespace    xf-thread-tools
-// @version      0.10.3
+// @version      0.10.4
 // @description  XenForo 2: sort thread posts by reaction count across all pages (cached) + floating media panel (images / external links).
 // @author       xf-thread-tools
 // @match        *://*/threads/*
@@ -3626,6 +3626,69 @@
         renderAiTab(true);
       });
     }
+    // assistant markdown -> DOM: tokens built by the pure mdParse; elements
+    // and text nodes only (no innerHTML anywhere on this path)
+    function mdInlineInto(el, segs) {
+      for (const s of segs) {
+        if (s.c === 'code') {
+          const c = document.createElement('code');
+          c.className = 'xft-ai-icode';
+          c.textContent = s.s;
+          el.appendChild(c);
+        } else if (s.c === 'strong') {
+          const b = document.createElement('strong');
+          b.textContent = s.s;
+          el.appendChild(b);
+        } else if (s.c === 'em') {
+          const e = document.createElement('em');
+          e.textContent = s.s;
+          el.appendChild(e);
+        } else if (s.c === 'link') {
+          const a = document.createElement('a');
+          a.href = s.href; // http(s) only, enforced at token level
+          a.target = '_blank';
+          a.rel = 'noopener noreferrer';
+          a.textContent = s.s;
+          el.appendChild(a);
+        } else {
+          const parts = String(s.s).split('\n'); // soft newlines -> <br>
+          for (let k = 0; k < parts.length; k++) {
+            if (k) el.appendChild(document.createElement('br'));
+            if (parts[k]) el.appendChild(document.createTextNode(parts[k]));
+          }
+        }
+      }
+    }
+    function mdRenderInto(el, blocks) {
+      for (const b of blocks) {
+        if (b.t === 'hr') { el.appendChild(document.createElement('hr')); continue; }
+        if (b.t === 'code') {
+          const pre = document.createElement('pre');
+          pre.className = 'xft-ai-code';
+          const code = document.createElement('code');
+          code.textContent = b.text;
+          pre.appendChild(code);
+          el.appendChild(pre);
+          continue;
+        }
+        let wrap;
+        if (b.t === 'h') wrap = document.createElement('h' + Math.min(4, Math.max(2, b.level)));
+        else if (b.t === 'quote') { wrap = document.createElement('blockquote'); }
+        else if (b.t === 'ul' || b.t === 'ol') {
+          wrap = document.createElement(b.t);
+          for (const item of b.items) {
+            const li = document.createElement('li');
+            mdInlineInto(li, item);
+            wrap.appendChild(li);
+          }
+          el.appendChild(wrap);
+          continue;
+        } else wrap = document.createElement('p');
+        mdInlineInto(wrap, b.segs);
+        el.appendChild(wrap);
+      }
+    }
+
     function renderAiTab(force) {
       if (!panelBodyEl) return;
       if (panelCountEl) panelCountEl.textContent = 'AI';
@@ -3735,7 +3798,8 @@
       for (const m of aiChat.msgs) {
         const d = document.createElement('div');
         d.className = 'xft-ai-m ' + (m.role === 'user' ? 'xft-ai-user' : m.role === 'assistant' ? 'xft-ai-asst' : 'xft-ai-err');
-        d.textContent = m.content;
+        if (m.role === 'assistant') mdRenderInto(d, mdParse(m.content));
+        else d.textContent = m.content; // user input + errors stay literal
         aiLogEl.appendChild(d);
       }
       if (aiChat.pending) {
@@ -4294,6 +4358,17 @@
         '.xft-ai-asst{align-self:flex-start;background:hsl(var(--xft-muted))}',
         '.xft-ai-err{align-self:flex-start;background:hsl(0 62% 45%/.12);border:1px solid hsl(0 62% 45%/.4);color:hsl(0 70% 75%)}',
         '.xft-ai-pend{opacity:.6}',
+        '.xft-ai-asst p{margin:0 0 6px}.xft-ai-asst p:last-child{margin-bottom:0}',
+        '.xft-ai-asst h2,.xft-ai-asst h3,.xft-ai-asst h4{margin:8px 0 4px;font-size:13px;line-height:1.3}',
+        '.xft-ai-asst h2{font-size:14px}.xft-ai-asst h3{font-size:13px}.xft-ai-asst h4{font-size:12px}',
+        '.xft-ai-asst ul,.xft-ai-asst ol{margin:0 0 6px;padding-left:18px}',
+        '.xft-ai-asst li{margin:2px 0}',
+        '.xft-ai-asst blockquote{margin:0 0 6px;padding:2px 10px;border-left:3px solid hsl(var(--xft-border));color:hsl(var(--xft-muted-fg))}',
+        '.xft-ai-asst hr{border:none;border-top:1px solid hsl(var(--xft-border));margin:8px 0}',
+        '.xft-ai-asst a{color:hsl(var(--xft-ring));text-decoration:underline;word-break:break-all}',
+        '.xft-ai-icode{font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;font-size:11px;background:hsl(var(--xft-bg));border:1px solid hsl(var(--xft-border));border-radius:4px;padding:1px 4px}',
+        '.xft-ai-code{margin:0 0 6px;padding:8px 10px;background:hsl(var(--xft-bg));border:1px solid hsl(var(--xft-border));border-radius:calc(var(--xft-radius) - 2px);overflow-x:auto;font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;font-size:11px;line-height:1.45;white-space:pre}',
+        '.xft-ai-asst .xft-ai-code:last-child{margin-bottom:0}',
         '.xft-ai-quick{display:flex;gap:6px;flex-wrap:wrap}',
         '.xft-ai-bar{display:flex;gap:6px;align-items:flex-end}',
         '.xft-ai-input{flex:1;min-width:0;resize:vertical;font:inherit;font-size:12px;line-height:1.4;padding:6px 8px;color:hsl(var(--xft-fg));background:hsl(var(--xft-bg));border:1px solid hsl(var(--xft-input));border-radius:calc(var(--xft-radius) - 2px)}',
@@ -4631,6 +4706,73 @@
     return text ? { text: text } : { error: 'empty response' };
   }
 
+  // ---------- assistant-reply markdown (pure tokenizer — unit-tested) ----------
+  // Chat models answer in markdown; bubbles render it. The PARSER is pure
+  // (string -> token tree); the DOM side builds elements/text nodes only —
+  // model output never passes through innerHTML.
+  // Link hrefs are locked to http(s) at the token level; everything else
+  // renders as plain text by construction.
+  function mdInlineTokens(s) {
+    const out = [];
+    const rx = /`([^`\n]+)`|\*\*([^*\n]+)\*\*|\*([^*\n]+)\*|\[([^\]\n]+)\]\((https?:\/\/[^)\s]+)\)/g;
+    let last = 0, m;
+    while ((m = rx.exec(s))) {
+      if (m.index > last) out.push({ c: 'text', s: s.slice(last, m.index) });
+      if (m[1] !== undefined) out.push({ c: 'code', s: m[1] });
+      else if (m[2] !== undefined) out.push({ c: 'strong', s: m[2] });
+      else if (m[3] !== undefined) out.push({ c: 'em', s: m[3] });
+      else out.push({ c: 'link', s: m[4], href: m[5] });
+      last = rx.lastIndex;
+    }
+    if (last < s.length) out.push({ c: 'text', s: s.slice(last) });
+    return out;
+  }
+  function mdParse(src) {
+    const lines = String(src || '').replace(/\r\n?/g, '\n').split('\n');
+    const blocks = [];
+    const flushP = (buf) => { if (buf.length) blocks.push({ t: 'p', segs: mdInlineTokens(buf.join('\n')) }); };
+    let pbuf = [];
+    let i = 0;
+    while (i < lines.length) {
+      const ln = lines[i];
+      if (/^\s*```/.test(ln)) { // fenced code (EOF-tolerant)
+        flushP(pbuf); pbuf = [];
+        const lang = ln.replace(/^\s*```/, '').trim();
+        const body = [];
+        i++;
+        while (i < lines.length && !/^\s*```/.test(lines[i])) { body.push(lines[i]); i++; }
+        i++;
+        blocks.push({ t: 'code', lang: lang, text: body.join('\n') });
+        continue;
+      }
+      if (!ln.trim()) { flushP(pbuf); pbuf = []; i++; continue; }
+      const h = /^(#{1,4})\s+(.*)$/.exec(ln);
+      if (h) { flushP(pbuf); pbuf = []; blocks.push({ t: 'h', level: h[1].length, segs: mdInlineTokens(h[2]) }); i++; continue; }
+      if (/^\s*(-{3,}|\*{3,})\s*$/.test(ln)) { flushP(pbuf); pbuf = []; blocks.push({ t: 'hr' }); i++; continue; }
+      if (/^>\s?/.test(ln)) { // blockquote: consecutive > lines merge
+        flushP(pbuf); pbuf = [];
+        const body = [];
+        while (i < lines.length) { const mq = /^>\s?(.*)$/.exec(lines[i]); if (!mq) break; body.push(mq[1]); i++; }
+        blocks.push({ t: 'quote', segs: mdInlineTokens(body.join('\n')) });
+        continue;
+      }
+      const isUl = /^\s*[-*+]\s+/.test(ln);
+      const isOl = /^\s*\d+[.)]\s+/.test(ln);
+      if (isUl || isOl) { // consecutive same-kind items group
+        flushP(pbuf); pbuf = [];
+        const rx = isUl ? /^\s*[-*+]\s+(.*)$/ : /^\s*\d+[.)]\s+(.*)$/;
+        const items = [];
+        while (i < lines.length) { const mm = rx.exec(lines[i]); if (!mm) break; items.push(mdInlineTokens(mm[1])); i++; }
+        blocks.push({ t: isUl ? 'ul' : 'ol', items: items });
+        continue;
+      }
+      pbuf.push(ln); // paragraph text (soft newlines become <br> at render)
+      i++;
+    }
+    flushP(pbuf);
+    return blocks;
+  }
+
   // UMD export of the pure functions for node:test (no DOM / GM usage in them).
-  if (typeof module !== 'undefined' && module.exports) module.exports = { parseReactionCount, filterLinks, sortPosts, estimateSize, partitionLinks, extractDomain, groupLinkItems, applyLinkFilters, boilerplateUrls, isSmilieUrl, parseEmbedPoster, embedSignUrl, parseSignResponse, parseSignToken, parseVideoPage, isVideoPageUrl, hqCandidates, sanitizeFileSeg, siteTagFromHost, cleanThreadTitle, zipKindTag, zipFileName, imagePageHref, parseImagePage, parseImageApiResponse, dlBasename, buildDlJobs, dlChunkPlan, dlFailClass, crc32, zipStoreU8, layoutMetrics, windowRange, originBurstingFromHist, hostKey, dosDateTime, fmtSpeed, fmtEta, buildMediaLayout, htmlToText, buildAiTranscript, aiMessages, aiEndpoint, parseAiModels, parseAiReply };
+  if (typeof module !== 'undefined' && module.exports) module.exports = { parseReactionCount, filterLinks, sortPosts, estimateSize, partitionLinks, extractDomain, groupLinkItems, applyLinkFilters, boilerplateUrls, isSmilieUrl, parseEmbedPoster, embedSignUrl, parseSignResponse, parseSignToken, parseVideoPage, isVideoPageUrl, hqCandidates, sanitizeFileSeg, siteTagFromHost, cleanThreadTitle, zipKindTag, zipFileName, imagePageHref, parseImagePage, parseImageApiResponse, dlBasename, buildDlJobs, dlChunkPlan, dlFailClass, crc32, zipStoreU8, layoutMetrics, windowRange, originBurstingFromHist, hostKey, dosDateTime, fmtSpeed, fmtEta, buildMediaLayout, htmlToText, buildAiTranscript, aiMessages, aiEndpoint, parseAiModels, parseAiReply, mdInlineTokens, mdParse };
 })();
