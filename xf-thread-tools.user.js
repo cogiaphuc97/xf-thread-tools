@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         xf-thread-tools
 // @namespace    xf-thread-tools
-// @version      0.13.0
+// @version      0.14.0
 // @description  XenForo 2: sort thread posts by reaction count across all pages (cached) + floating media panel (images / external links).
 // @author       xf-thread-tools
 // @match        *://*/threads/*
@@ -3534,7 +3534,7 @@
     let aiCtxEl = null;
     let aiInputEl = null;
     let aiSeq = 0; // bump = rebuild the AI view (fetch ticks must not wipe drafts)
-    const aiChat = { msgs: [], pending: false, abort: null, models: [], modelsLoading: false, cfgOpen: false, streamText: '' };
+    const aiChat = { msgs: [], pending: false, abort: null, models: [], modelsLoading: false, cfgOpen: false, streamText: '', ctxLens: {} };
 
     function aiCfgReady() {
       return !!settings.aiModel && !(settings.aiProvider === 'openai' && !settings.aiKey);
@@ -3544,8 +3544,10 @@
       let chars = 0;
       for (const r of recs) chars += String(r.bodyHtml || '').length;
       const m = settings.aiModel || 'no model';
+      const st = aiContextStats(chars, aiChat.ctxLens[settings.aiModel]);
+      const usage = st ? ' · ~' + st.pct + '% of ' + st.ctx + ' ctx' : '';
       return recs.length
-        ? 'context: ' + recs.length + ' posts · ~' + (Math.round(chars / 100) / 10) + 'k chars · ' + m
+        ? 'context: ' + recs.length + ' posts · ~' + (Math.round(chars / 100) / 10) + 'k chars' + usage + ' · ' + m
         : 'no posts cached yet · ' + m;
     }
     // one request shape for chat + model list; GM XHR (CORS-free — required
@@ -3647,9 +3649,12 @@
       const msgs = aiMessages(buildAiTranscript(posts), question, aiChat.msgs.slice(0, -1), settings.aiLang);
       // Ollama native /api/chat carries think:false (instant answers — the
       // OpenAI-compat /v1 endpoint ignores the field and thinking models burn
-      // the whole budget on hidden reasoning first).
+      // the whole budget on hidden reasoning first). num_ctx raises the usable
+      // window so the 24k-char transcript doesn't overflow Ollama's 4096
+      // default (capped at 16k — KV cache costs VRAM).
+      const ctxLen = aiChat.ctxLens[settings.aiModel];
       const body = native
-        ? { model: settings.aiModel, messages: msgs, stream: true, think: false }
+        ? { model: settings.aiModel, messages: msgs, stream: true, think: false, options: { num_ctx: Math.min(ctxLen || 8192, 16384) } }
         : { model: settings.aiModel, messages: msgs, stream: true };
       const sse = aiSseParser(pmode);
       let acc = '';
@@ -3690,10 +3695,13 @@
       aiChat.testMsg = '…connecting';
       aiSeq++;
       renderAiTab(true);
-      aiRequest('GET', aiEndpoint({ provider: 'ollama', base: base }).models, null, (res) => {
+      aiRequest('GET', aiOllamaOrigin(base) + '/api/tags', null, (res) => {
         aiChat.modelsLoading = false;
         if (res && res.ok) {
           aiChat.models = parseAiModels(res.json !== null && res.json !== undefined ? res.json : res.text);
+          aiChat.ctxLens = {};
+          const arr = res.json && Array.isArray(res.json.models) ? res.json.models : [];
+          for (const mo of arr) if (mo && mo.name && mo.details && mo.details.context_length) aiChat.ctxLens[mo.name] = mo.details.context_length;
           if (aiChat.models.length && aiChat.models.indexOf(settings.aiModel) < 0) settings.aiModel = aiChat.models[0];
           aiChat.testMsg = '✓ connected — ' + aiChat.models.length + ' models';
           saveSettings();
@@ -3881,7 +3889,7 @@
       aiCtxEl.textContent = aiCtxText();
       ctxRow.append(
         aiCtxEl,
-        mkBtn('🗑', () => {
+        mkBtn('＋ New chat', () => {
           if (aiChat.pending) return; // Stop first — never drop a live stream
           aiChat.msgs = [];
           aiChat.streamText = '';
@@ -3892,7 +3900,7 @@
       );
       const clearBtnEl = ctxRow.querySelector('.xft-ai-clear');
       if (clearBtnEl) {
-        clearBtnEl.title = 'Clear chat';
+        clearBtnEl.title = 'New chat';
         clearBtnEl.disabled = aiChat.pending;
       }
 
@@ -4783,6 +4791,7 @@
       + 'Answer questions about the thread, summarize it, or discuss specific posts. '
       + 'Reference posts by their #number and author. '
       + 'ANSWER FORMAT: give the direct answer FIRST (yes/no, or one short sentence), then elaborate — never bury the answer inside a long breakdown. '
+      + 'When citing posts write [#N] plus the author name only — never copy the (pN, ♥R) markers into your answer. '
       + 'Be concise. '
       + 'If no transcript was provided or it lacks the answer, say so instead of guessing.',
     vi: 'Bạn là trợ lý AI bên trong bảng công cụ của một diễn đàn. '
@@ -4794,6 +4803,7 @@
       + 'Trả lời câu hỏi về chủ đề, tóm tắt, hoặc thảo luận các bài viết cụ thể. '
       + 'Trích dẫn bài viết theo #số và tên tác giả. '
       + 'ĐỊNH DẠNG TRẢ LỜI: đưa câu trả lời trực tiếp TRƯỚC (có/không, hoặc một câu ngắn), sau đó mới trình bày chi tiết — không được chôn câu trả lời trong một đoạn phân tích dài. '
+      + 'Khi trích dẫn bài viết chỉ ghi [#số] và tên tác giả — không bao giờ chép các ký hiệu (pN, ♥R) vào câu trả lời. '
       + 'Trả lời ngắn gọn. '
       + 'Nếu không có transcript hoặc transcript không chứa câu trả lời, hãy nói vậy thay vì đoán.'
   };
@@ -4830,10 +4840,23 @@
   // /api/chat — the OpenAI-compat /v1 layer silently drops the field (verified
   // live: gemma4/qwen3.5 think no matter what /v1 sends). Strip a trailing
   // /v1 from the configured base to recover the server origin.
-  function aiNativeChatUrl(base) {
+  function aiOllamaOrigin(base) {
     let b = String(base || '').trim().replace(/\/+$/, '');
     if (/\/v1$/i.test(b)) b = b.slice(0, -3);
-    return b + '/api/chat';
+    return b;
+  }
+  function aiNativeChatUrl(base) {
+    return aiOllamaOrigin(base) + '/api/chat';
+  }
+  // Rough context-window usage for the status line: ~4 chars per token is
+  // close enough for mixed VN/EN forum text, plus ~800 tokens of system
+  // prompt + fence overhead. Null when the model's window is unknown.
+  function aiContextStats(chars, ctxLen) {
+    if (!ctxLen || ctxLen <= 0) return null;
+    const est = Math.round(chars / 4) + 800;
+    const pct = Math.min(999, Math.round((est / ctxLen) * 100));
+    const k = ctxLen >= 1024 ? Math.round(ctxLen / 1024) + 'k' : String(ctxLen);
+    return { est: est, pct: pct, ctx: k };
   }
   // Model lists: OpenAI {data:[{id}]} and Ollama-native {models:[{name}]} both accepted.
   function parseAiModels(json) {
@@ -4909,13 +4932,37 @@
         blocks.push({ t: 'quote', segs: mdInlineTokens(body.join('\n')) });
         continue;
       }
-      const isUl = /^\s*[-*+]\s+/.test(ln);
-      const isOl = /^\s*\d+[.)]\s+/.test(ln);
-      if (isUl || isOl) { // consecutive same-kind items group
+      const RX_UL = /^\s*[-*+]\s+(.*)$/;
+      const RX_OL = /^\s*\d+[.)]\s+(.*)$/;
+      const RX_OL_BOLD = /^\s*\*\*\s*\d+[.)]\s*(?:\*\*)?/;
+      const isUl = RX_UL.test(ln);
+      const isOl = !isUl && (RX_OL.test(ln) || RX_OL_BOLD.test(ln));
+      if (isUl || isOl) { // same-kind items group into ONE list; ONE blank line
+        // between items stays in the list (loose list — models put blank lines
+        // between their points). Bold-numbered items (**1. label:**) count as
+        // ol: models often write every marker as "1." and a real <ol>
+        // renumbers them 1..n instead of showing a wall of literal "1.".
         flushP(pbuf); pbuf = [];
-        const rx = isUl ? /^\s*[-*+]\s+(.*)$/ : /^\s*\d+[.)]\s+(.*)$/;
         const items = [];
-        while (i < lines.length) { const mm = rx.exec(lines[i]); if (!mm) break; items.push(mdInlineTokens(mm[1])); i++; }
+        let blanks = 0;
+        while (i < lines.length) {
+          const cur = lines[i];
+          if (!cur.trim()) { if (++blanks > 1) break; i++; continue; }
+          if (isUl) {
+            const mu = RX_UL.exec(cur);
+            if (!mu) break;
+            items.push(mdInlineTokens(mu[1]));
+          } else {
+            const mo = RX_OL.exec(cur);
+            if (mo) items.push(mdInlineTokens(mo[1]));
+            else if (RX_OL_BOLD.test(cur)) {
+              const c = cur.replace(RX_OL_BOLD, '').replace(/\*\*/, ''); // marker + the label's stray closing bold
+              items.push(mdInlineTokens(c.trim()));
+            } else break;
+          }
+          blanks = 0;
+          i++;
+        }
         blocks.push({ t: isUl ? 'ul' : 'ol', items: items });
         continue;
       }
@@ -4967,5 +5014,5 @@
   }
 
   // UMD export of the pure functions for node:test (no DOM / GM usage in them).
-  if (typeof module !== 'undefined' && module.exports) module.exports = { parseReactionCount, filterLinks, sortPosts, estimateSize, partitionLinks, extractDomain, groupLinkItems, applyLinkFilters, boilerplateUrls, isSmilieUrl, parseEmbedPoster, embedSignUrl, parseSignResponse, parseSignToken, parseVideoPage, isVideoPageUrl, hqCandidates, sanitizeFileSeg, siteTagFromHost, cleanThreadTitle, zipKindTag, zipFileName, imagePageHref, parseImagePage, parseImageApiResponse, dlBasename, buildDlJobs, dlChunkPlan, dlFailClass, crc32, zipStoreU8, layoutMetrics, windowRange, originBurstingFromHist, hostKey, dosDateTime, fmtSpeed, fmtEta, buildMediaLayout, htmlToText, buildAiTranscript, aiMessages, aiEndpoint, aiNativeChatUrl, parseAiModels, parseAiReply, mdInlineTokens, mdParse, aiSseParser };
+  if (typeof module !== 'undefined' && module.exports) module.exports = { parseReactionCount, filterLinks, sortPosts, estimateSize, partitionLinks, extractDomain, groupLinkItems, applyLinkFilters, boilerplateUrls, isSmilieUrl, parseEmbedPoster, embedSignUrl, parseSignResponse, parseSignToken, parseVideoPage, isVideoPageUrl, hqCandidates, sanitizeFileSeg, siteTagFromHost, cleanThreadTitle, zipKindTag, zipFileName, imagePageHref, parseImagePage, parseImageApiResponse, dlBasename, buildDlJobs, dlChunkPlan, dlFailClass, crc32, zipStoreU8, layoutMetrics, windowRange, originBurstingFromHist, hostKey, dosDateTime, fmtSpeed, fmtEta, buildMediaLayout, htmlToText, buildAiTranscript, aiMessages, aiEndpoint, aiOllamaOrigin, aiNativeChatUrl, aiContextStats, parseAiModels, parseAiReply, mdInlineTokens, mdParse, aiSseParser };
 })();
