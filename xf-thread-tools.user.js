@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         xf-thread-tools
 // @namespace    xf-thread-tools
-// @version      0.8.1
+// @version      0.8.2
 // @description  XenForo 2: sort thread posts by reaction count across all pages (cached) + floating media panel (images / external links).
 // @author       xf-thread-tools
 // @match        *://*/threads/*
@@ -1015,14 +1015,28 @@
           if (n === seededPage) { hub.progress.done = n; notify(); continue; }
           if (!force && hub.pagesDone.has(n)) { hub.progress.done = n; notify(); continue; } // resume: page already cached
           let html = null;
-          try {
-            const res = await fetch(threadUrl('/page-' + n), { credentials: 'include' });
-            if (!res.ok) { warnOnce('fetch stopped: HTTP ' + res.status + ' on page ' + n); break; }
-            html = await res.text();
-          } catch (err) {
-            warnOnce('fetch stopped: network error on page ' + n + ' (' + ((err && err.message) || err) + ')');
-            break;
+          // transient challenges (403/429/5xx, network blips) mid-run used
+          // to end the fetch PARTIAL ("Fetch stopped early") — retry with
+          // backoff before declaring partial. 404/410 are permanent, no
+          // retry. Abort still wins instantly.
+          let partialWhy = '';
+          for (let attempts = 0; html === null; attempts++) {
+            if (hub.abortRef.aborted) break;
+            let why = '';
+            try {
+              const ctl = (typeof AbortController !== 'undefined') ? new AbortController() : null;
+              const leash = ctl ? setTimeout(() => { try { ctl.abort(); } catch (e) {} }, 15000) : 0;
+              const res = await fetch(threadUrl('/page-' + n), { credentials: 'include', signal: ctl ? ctl.signal : undefined });
+              clearTimeout(leash);
+              if (res.ok) { html = await res.text(); break; }
+              why = 'HTTP ' + res.status;
+              if (res.status !== 403 && res.status !== 429 && res.status < 500) break; // permanent
+            } catch (err) { why = 'network error (' + ((err && err.message) || err) + ')'; }
+            if (attempts >= 2) { partialWhy = why; break; }
+            await sleep(attempts === 0 ? 3000 : 8000); // challenges clear in seconds
           }
+          if (hub.abortRef.aborted) break;
+          if (html === null) { warnOnce('fetch stopped: ' + (partialWhy || 'aborted') + ' on page ' + n); break; }
           const doc = new DOMParser().parseFromString(html, 'text/html');
           const recs = extractPostsFromDoc(doc, n);
           for (const r of recs) hub.records.set(r.postId, r);
@@ -1699,7 +1713,11 @@
           return;
         } catch (e) { /* fall through to fetch */ }
       }
-      fetch(url, { credentials: 'omit' })
+      // the fetch fallback needs its own leash: a hung connection would hold
+      // an imgPageNet slot forever and starve every queued resolve after it
+      const ctl = (typeof AbortController !== 'undefined') ? new AbortController() : null;
+      if (ctl) setTimeout(() => { try { ctl.abort(); } catch (e) {} }, 10000);
+      fetch(url, { credentials: 'omit', signal: ctl ? ctl.signal : undefined })
         .then((r) => r.text())
         .then(onOk)
         .catch(onErr);
@@ -1754,8 +1772,13 @@
     }
     // Image landing pages (/img/<id>): the embed is a re-encoded copy (random
     // uuid / /th/ thumb) and the full-quality original — often a signed URL —
-    // is only referenced by the page. Cached per page URL; '' = dead page.
+    // is only referenced by the page. Only SUCCESSES are cached — a failure
+    // cools down for 30s instead (dense grids trip the host's challenge
+    // mid-queue; the page is usually fine seconds later, and a permanent ''
+    // poisoned whole grid tails to embedded quality for the session while
+    // later-run downloads resolved fine — "zip max, view low").
     const imgPageCache = new Map();
+    const imgPageCooldown = new Map(); // pageUrl -> retry-not-before timestamp
     const imgPageInflight = new Map();
     // landing-page/API fetches run serialized (2 concurrent, 350ms apart) —
     // scrolling a dense grid resolves one page per cell and a burst would
@@ -1777,14 +1800,22 @@
     function imgPageGet(url, onOk, onErr) {
       runImgPageNet((done) => gmGetText(url, (t) => { onOk(t); done(); }, () => { onErr(); done(); }));
     }
-    function resolveImagePage(pageUrl, embedded, cb) {
+    function resolveImagePage(pageUrl, embedded, cb, force) {
       const c = imgPageCache.get(pageUrl);
       if (c !== undefined) { cb(c && c !== embedded ? c : ''); return; }
+      // recent failure: grid cells wait out the cooldown (they are many);
+      // force (viewer / download — user-initiated singles) goes straight
+      // through to a fresh attempt
+      if (!force && Date.now() < (imgPageCooldown.get(pageUrl) || 0)) { cb(''); return; }
       if (imgPageInflight.has(pageUrl)) { imgPageInflight.get(pageUrl).push(cb); return; }
       const queue = [cb];
       imgPageInflight.set(pageUrl, queue);
       const finish = (hit) => {
-        imgPageCache.set(pageUrl, hit);
+        if (hit) imgPageCache.set(pageUrl, hit);
+        else {
+          if (imgPageCooldown.size > 400) imgPageCooldown.delete(imgPageCooldown.keys().next().value);
+          imgPageCooldown.set(pageUrl, Date.now() + 30000);
+        }
         imgPageInflight.delete(pageUrl);
         for (const fn of queue) fn(hit);
       };
@@ -2159,7 +2190,7 @@
         resolveImagePage(job.page, job.cands[0], (full) => {
           if (dlRun.cancel) { release(); return; }
           dlFetch(full || job.cands[ci], settle, dlByte);
-        });
+        }, true); // user-initiated single — force past any failure cooldown
         return;
       }
       if (job.kind === 'embed') {
@@ -2465,8 +2496,22 @@
       // hit fires synchronously and setStage's src write would overwrite it.
       // Skipped when a static marker chain exists (.md/.th win, cheaper).
       if (pageUrl && cands.length === 1) {
-        resolveImagePage(pageUrl, url, (full) => {
-          if (!full || im.src === full) return;
+        // the VIEWER (thumb=false) forces past any failure cooldown — a
+        // user-initiated single is worth a fresh attempt. Grid cells wait
+        // the cooldown out (they are many, and bursts are what trip the
+        // host in the first place), but a failed cell gets ONE delayed
+        // retry landing right as the cooldown expires — attached cells
+        // must not stay at embedded quality forever.
+        let retriedHq = false;
+        const wantHq = (force2) => resolveImagePage(pageUrl, url, (full) => {
+          if (!full) {
+            // retry FORCED: any later failure (a download's resolve, another
+            // cell) can have REFRESHED the cooldown past this retry — one
+            // fresh single request 31s out is burst-safe
+            if (!retriedHq && im.isConnected) { retriedHq = true; setTimeout(() => wantHq(true), 31000); }
+            return;
+          }
+          if (im.src === full) return;
           // decode the original OFFSCREEN first: swapping src on the live img
           // paints the progressive stream part-by-part. Preload + decode()
           // means the swap shows a complete frame, then a short crossfade
@@ -2488,12 +2533,15 @@
               requestAnimationFrame(() => top.classList.add('xft-hq-on'));
               setTimeout(() => { im.src = full; top.remove(); }, 450); // swap beneath, then drop the layer
             }, { once: true });
+            // the swap layer must never linger invisible on a dead original
+            top.addEventListener('error', () => { top.remove(); }, { once: true });
             host.appendChild(top);
             if (top.complete && top.naturalWidth) top.dispatchEvent(new Event('load'));
           };
           if (pre.decode) pre.decode().then(show, show);
           else pre.addEventListener('load', show, { once: true });
-        });
+        }, force2 || !thumb);
+        wantHq();
       }
       // A failure cached by Chrome replays instantly with NO error event, and
       // 1×1 placeholders (svg data-URIs, hotlink-block pixels) "load" as a
