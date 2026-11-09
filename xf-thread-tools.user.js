@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         xf-thread-tools
 // @namespace    xf-thread-tools
-// @version      0.8.3
+// @version      0.9.0
 // @description  XenForo 2: sort thread posts by reaction count across all pages (cached) + floating media panel (images / external links).
 // @author       xf-thread-tools
 // @match        *://*/threads/*
@@ -183,10 +183,18 @@
     if (bar > 0) t = t.slice(0, bar); // trailing " | Forum" suffix
     return t.replace(/[\\/:*?"<>|]/g, '').replace(/\s+/g, ' ').trim();
   }
-  function zipFileName(tag, title) {
+  // Single-kind zips (an images-only or videos-only download) drop the
+  // inner Pics//Videos/ folders and say so in the zip name instead.
+  function zipKindTag(hasImg, hasVid) {
+    if (hasImg && !hasVid) return 'Images';
+    if (hasVid && !hasImg) return 'Videos';
+    return '';
+  }
+  function zipFileName(tag, title, kind) {
     const t = cleanThreadTitle(title);
-    if (!t) return (tag || 'thread') + '.zip';
-    return '[' + (tag || 'Site') + '] ' + t + '.zip';
+    const k = kind ? ' (' + kind + ')' : '';
+    if (!t) return (tag || 'thread') + k + '.zip';
+    return '[' + (tag || 'Site') + '] ' + t + k + '.zip';
   }
   // Image-page resolution: some hosts embed a RE-ENCODED copy (random uuid,
   // /th/ directory, ...) while the original full-quality file is only linked
@@ -296,6 +304,33 @@
       });
     }
     return { jobs: jobs, skip: 0 };
+  }
+  // Chunk plan for ranged (split) downloads: cut total bytes into at most
+  // maxParts evenly sized [start, end] INCLUSIVE ranges that concatenate to
+  // exactly the original bytes. A small total (≤ 2×minPart) or maxParts ≤ 1
+  // means one part — no point parallelizing a few MB.
+  function dlChunkPlan(total, maxParts, minPart) {
+    const MIN = minPart || 4 * 1048576;
+    const t = Math.max(0, Math.floor(total || 0));
+    if (!t) return [];
+    if (t <= MIN * 2 || !(maxParts > 1)) return [[0, t - 1]];
+    const n = Math.max(2, Math.min(maxParts, Math.floor(t / MIN)));
+    const size = Math.ceil(t / n);
+    const out = [];
+    for (let i = 0; i * size < t; i++) {
+      const s = i * size;
+      out.push([s, Math.min(s + size, t) - 1]);
+    }
+    return out;
+  }
+  // Failure policy for the download engine: 'trans' = retry the same URL
+  // (network error, timeout, 408/429, 5xx); 'perm' = burn the URL and walk
+  // to the next candidate (auth/gone/not-found and any unknown 4xx — a
+  // retry cannot fix a URL the server rejects on merits).
+  function dlFailClass(status) {
+    const s = status | 0;
+    if (s === 0 || s === 408 || s === 429 || s >= 500) return 'trans';
+    return 'perm';
   }
 
   // Minimal zip (method 0 / STORE) writer — no dependencies. Layout per
@@ -2051,22 +2086,40 @@
 
     // ---------- bulk download (media tab) ----------
     // Fetches every listed file (GM XHR — no CORS limits; fetch() fallback),
-    // zips them STORE into ONE <thread title>.zip (Pics/ + Videos/ inside)
-    // and saves it via a blob anchor — no GM_download needed, no per-file
-    // download prompts. Embed player tiles are resolved to their direct
-    // stream (sign endpoint / file page) and land in Videos/. Fetches are
-    // serialized 2-at-a-time for the same CDN-burst reason as the HQ queue;
-    // a second click cancels the run.
+    // zips them STORE into ONE <thread title>.zip and saves it via a blob
+    // anchor — no GM_download needed, no per-file download prompts. Player
+    // embed tiles resolve to their direct stream. Balanced parallel profile
+    // (user-approved 0.9.0): 6 files in flight, big files split into ≤4
+    // ranged parts (GM path only — Range is CORS-unsafe on fetch), per-
+    // origin caps stop one CDN monopolizing the pool, per-attempt retries
+    // + layered leashes make every path settle; a second click stops.
     const dlRun = { running: false, cancel: false, phase: 'idle', total: 0, done: 0, fail: 0, bytes: 0, lastErr: '' };
-    const dlNet = { active: 0, queue: [], last: 0 };
-    const DL_NET_MAX = 2;
-    const DL_NET_GAP = 400;
+    const dlNet = { active: 0, queue: [], last: 0, conns: 0 };
+    const DL_NET_MAX = 6;
+    const DL_NET_GAP = 200;
+    const DL_PER_ORIGIN_FILES = 4;
+    const DL_PER_ORIGIN_CONNS = 8;
+    const DL_CONN_MAX = 12;           // global connections (files + chunk parts)
+    const DL_CHUNK_MIN = 16 * 1048576; // split only files ≥ 16 MB
+    const DL_CHUNK_PARTS = 4;
+    const DL_RETRY_MAX = 2;           // retries per candidate URL (3 tries)
+    const DL_TTFB = 30000;            // no first byte in 30s = dead attempt
+    const DL_STALL = 45000;           // no bytes for 45s mid-stream = dead attempt
+    const DL_READ = 180000;           // per-attempt read ceiling
+    const DL_WATCHDOG = 480000;       // absolute per job, retries included
     const DL_BYTE_CAP = 3500 * 1024 * 1024; // zip offsets are 32-bit — stop well under 4 GB
+    const dlOriginFiles = new Map(); // origin → jobs in flight
+    const dlOriginConns = new Map(); // origin → open connections (files + parts)
+    let dlConnWaiters = [];           // parked part-starters waiting on a connection
+    let dlRunSeq = 0;                 // run identity — stale timers must not touch a new run
     let dlJobs = [];
     let dlBtnEl = null;
-    let dlBarEl = null, dlNameEl = null, dlFillEl = null, dlStatsEl = null, dlCancelEl = null, dlCloseEl = null;
+    let dlBarEl = null, dlNameEl = null, dlFillEl = null, dlStatsEl = null, dlStopEl = null, dlCloseEl = null;
+    let dlSpdEl = null, dlPctEl = null, dlListEl = null;
+    let dlFailPins = [];              // last ≤4 failed jobs, pinned as rows
     let dlSpeedWin = []; // [{t, b}] byte deltas — rolling 3s window for the speed readout
     let dlDashAt = 0;    // dash repaint throttle stamp
+    let dlStartedAt = 0; // ETA warm-up gate
     function threadTitleRaw() {
       const h = document.querySelector('h1.p-title-value');
       let t = '';
@@ -2080,8 +2133,8 @@
       if (!t.trim()) t = document.title || '';
       return t;
     }
-    function zipName() {
-      return zipFileName(siteTagFromHost(location.hostname), threadTitleRaw());
+    function zipName(kind) {
+      return zipFileName(siteTagFromHost(location.hostname), threadTitleRaw(), kind);
     }
     function updateDlBtn() {
       if (!dlBtnEl) return;
@@ -2089,8 +2142,10 @@
       dlBtnEl.classList.toggle('xft-dl-run', !!dlRun.running);
       dlBtnEl.title = dlRun.running
         ? 'Stop the bulk download'
-        : 'Download the ' + panelSubTab + ' list as one zip (Pics/ + Videos/, named after the thread). '
-          + 'Player embeds are resolved to their direct stream and included.';
+        : 'Download the ' + panelSubTab + ' list as one zip named after the thread. '
+          + 'Mixed lists get Pics/ + Videos/ folders; single-type lists skip the folder '
+          + 'and say (Images) or (Videos) in the zip name. Player embeds are resolved '
+          + 'to their direct stream and included.';
     }
     function dlSpeed() {
       const now = performance.now();
@@ -2104,39 +2159,137 @@
       if (bps >= 1024) return (bps / 1024).toFixed(0) + ' KB/s';
       return Math.round(bps) + ' B/s';
     }
+    // ETA from smoothed speed vs estimated remaining bytes: active jobs at
+    // (total − loaded), queued jobs at the average size of finished files.
+    // Zero until 3s of samples — a fake ETA in the first second is worse
+    // than none.
+    function dlEtaSecs() {
+      const spd = dlSpeed();
+      if (spd < 1024 || performance.now() - dlStartedAt < 3000) return 0;
+      let remaining = 0;
+      let queued = 0;
+      for (const j of dlJobs) {
+        if (j.state === 'run' && j.total > 0) remaining += Math.max(0, j.total - (j.loaded || 0));
+        else if (j.state === 'queue') queued++;
+      }
+      const avg = dlRun.done ? dlRun.bytes / dlRun.done : 0;
+      remaining += queued * avg;
+      return remaining > 0 ? remaining / spd : 0;
+    }
+    function fmtEta(s) {
+      if (!s || s < 2) return '';
+      if (s < 90) return '≈ ' + Math.max(1, Math.round(s)) + 's';
+      if (s < 5400) return '≈ ' + Math.round(s / 60) + 'm';
+      return '≈ 90m+';
+    }
     function setStat(el, text) { if (el.textContent !== text) el.textContent = text; }
-    // status dashboard: % bar, downloading/downloaded/failed counts, speed, cancel
+    // status dashboard: header (name/speed/ETA/stop), overall bar + counts,
+    // and a live row per in-flight file plus pinned failures
     function updateDlDash() {
       if (!dlBarEl) return;
-      const fetching = dlRun.phase === 'fetch';
-      dlBarEl.classList.toggle('xft-dlzip', dlRun.phase === 'zip');
+      const ph = dlRun.phase;
+      dlBarEl.classList.toggle('xft-dlzip', ph === 'zip');
       const finished = dlRun.total ? dlRun.done + dlRun.fail : 0;
-      if (fetching) {
-        dlFillEl.style.width = (dlRun.total ? Math.floor((finished / dlRun.total) * 100) : 0) + '%';
-        while (dlStatsEl.children.length < 5) dlStatsEl.appendChild(document.createElement('span'));
+      if (ph === 'fetch') {
+        const pct = dlRun.total ? Math.floor((finished / dlRun.total) * 100) : 0;
+        dlFillEl.style.width = pct + '%';
+        setStat(dlPctEl, pct + '%');
+        while (dlStatsEl.children.length < 3) dlStatsEl.appendChild(document.createElement('span'));
         const c = dlStatsEl.children;
-        setStat(c[0], (dlRun.total ? Math.floor((finished / dlRun.total) * 100) : 0) + '%');
-        setStat(c[1], '↓ ' + dlNet.active);
-        c[1].className = dlNet.active ? 'xft-dl-on' : '';
-        setStat(c[2], '✓ ' + dlRun.done);
-        c[2].className = 'xft-dl-ok';
-        setStat(c[3], '✗ ' + dlRun.fail);
-        c[3].className = dlRun.fail ? 'xft-dl-bad' : '';
-        setStat(c[4], fmtSpeed(dlSpeed()));
-      } else if (dlRun.phase === 'zip') {
+        setStat(c[0], finished + '/' + dlRun.total + ' files');
+        setStat(c[1], dlRun.done ? '✓ ' + dlRun.done : '');
+        c[1].className = dlRun.done ? 'xft-dl-ok' : '';
+        setStat(c[2], dlRun.fail ? '✗ ' + dlRun.fail : '');
+        c[2].className = dlRun.fail ? 'xft-dl-bad' : '';
+        const eta = fmtEta(dlEtaSecs());
+        const spd = fmtSpeed(dlSpeed()) + (eta ? ' · ' + eta : '');
+        if (dlSpdEl.textContent !== spd) dlSpdEl.textContent = spd;
+        dlListEl.hidden = false;
+        renderDlRows();
+      } else if (ph === 'zip') {
         dlFillEl.style.width = '100%';
         dlStatsEl.textContent = 'Zipping ' + dlRun.done + ' files · ' + (dlRun.bytes / 1048576).toFixed(1) + ' MB';
-      } else if (dlRun.phase === 'done' || dlRun.phase === 'error') {
-        dlFillEl.style.width = dlRun.phase === 'done' ? '100%' : '0%';
-        dlStatsEl.textContent = dlRun.phase === 'error'
+        dlSpdEl.textContent = '';
+        dlListEl.hidden = true;
+      } else if (ph === 'done' || ph === 'error') {
+        dlFillEl.style.width = ph === 'done' ? '100%' : '0%';
+        setStat(dlPctEl, ph === 'done' ? '100%' : '');
+        dlStatsEl.textContent = ph === 'error'
           ? (dlRun.lastErr || 'zip error')
           : (dlRun.cancel ? 'Stopped — ' : '✓ Saved ')
             + dlRun.done + '/' + dlRun.total + ' files'
             + (dlRun.fail ? ' · ' + dlRun.fail + ' failed' : '')
             + ' · ' + (dlRun.bytes / 1048576).toFixed(1) + ' MB';
+        dlSpdEl.textContent = '';
+        dlListEl.hidden = true;
       }
-      dlCancelEl.hidden = !fetching;
-      dlCloseEl.hidden = fetching || dlRun.phase === 'zip';
+      dlStopEl.hidden = ph !== 'fetch';
+      dlCloseEl.hidden = ph === 'fetch' || ph === 'zip';
+    }
+    // One list row per job, created lazily and reconciled in place — rows
+    // never churn DOM, only text/width. Name column flexes+ellipsizes so a
+    // long filename can never shift the fixed bar/%/meta cluster.
+    function dlRowEl(job) {
+      if (!job._rowEl) {
+        const r = document.createElement('div');
+        r.className = 'xft-dlrow';
+        const n = document.createElement('span');
+        n.className = 'xft-dlrowname';
+        const bar = document.createElement('i');
+        bar.className = 'xft-dlrowbar';
+        const fill = document.createElement('b');
+        bar.appendChild(fill);
+        const pct = document.createElement('span');
+        pct.className = 'xft-dlrowpct';
+        const meta = document.createElement('span');
+        meta.className = 'xft-dlrowmeta';
+        r.append(n, bar, pct, meta);
+        job._rowEl = r;
+        job._rowName = n; job._rowFill = fill; job._rowPct = pct; job._rowMeta = meta;
+      }
+      return job._rowEl;
+    }
+    function renderDlRows() {
+      if (!dlListEl) return;
+      const want = [];
+      for (const j of dlJobs) if (j.state === 'run') want.push(j);
+      for (const j of dlFailPins) if (want.indexOf(j) < 0) want.push(j);
+      for (const el of Array.from(dlListEl.children)) {
+        const j = el._job;
+        if (!j || want.indexOf(j) < 0) {
+          el.remove();
+          if (j) j._rowEl = null;
+        }
+      }
+      let ref = null;
+      for (let i = want.length - 1; i >= 0; i--) {
+        const el = dlRowEl(want[i]);
+        el._job = want[i];
+        if (el.parentNode !== dlListEl || el.nextSibling !== ref) dlListEl.insertBefore(el, ref);
+        ref = el;
+      }
+      for (const j of want) {
+        if (j.state === 'fail') {
+          j._rowEl.classList.add('xft-dlrow-bad');
+          j._rowFill.style.width = '100%';
+          j._rowPct.textContent = '✗';
+          j._rowMeta.textContent = j.errWhy || 'failed';
+        } else {
+          j._rowEl.classList.remove('xft-dlrow-bad');
+          const p = j.total > 0 ? Math.min(100, Math.floor(((j.loaded || 0) / j.total) * 100)) : 0;
+          j._rowFill.style.width = p + '%';
+          j._rowPct.textContent = j.total > 0 ? p + '%' : '…';
+          j._rowMeta.textContent = j.badge || fmtSpeed(j.spd || 0);
+        }
+        if (j._rowName.textContent !== j.name) {
+          j._rowName.textContent = j.name;
+          j._rowName.title = j.name;
+        }
+      }
+    }
+    function dlPinFail(job) {
+      dlFailPins.push(job);
+      if (dlFailPins.length > 4) dlFailPins.shift();
     }
     function dlDashTick() {
       if (dlRun.phase !== 'fetch') return;
@@ -2145,40 +2298,125 @@
       dlDashAt = now;
       updateDlDash();
     }
+    function dlJobOrigin(job) {
+      try { return new URL(job.cands[0]).origin; } catch (e) { return '*'; }
+    }
+    function dlURLOrigin(url) {
+      try { return new URL(url).origin; } catch (e) { return '*'; }
+    }
+    function dlSlotRelease(job) {
+      dlNet.active = Math.max(0, dlNet.active - 1);
+      const o = dlJobOrigin(job);
+      dlOriginFiles.set(o, Math.max(0, (dlOriginFiles.get(o) || 0) - 1));
+      dlPump();
+    }
+    // ---- connection pool: files AND chunk parts draw from per-origin +
+    // global connection budgets; a part that cannot start yet parks in
+    // dlConnWaiters and drains as connections free ----
+    function dlConnAcquire(ctx, origin, run) {
+      if (ctx.released || ctx.killed) return;
+      if (dlNet.conns < DL_CONN_MAX && (dlOriginConns.get(origin) || 0) < DL_PER_ORIGIN_CONNS) {
+        dlNet.conns++;
+        dlOriginConns.set(origin, (dlOriginConns.get(origin) || 0) + 1);
+        run();
+        return;
+      }
+      const w = { ctx: ctx, origin: origin, run: run };
+      ctx.waits.push(w);
+      dlConnWaiters.push(w);
+    }
+    function dlConnRelease(ctx, origin) {
+      dlNet.conns = Math.max(0, dlNet.conns - 1);
+      dlOriginConns.set(origin, Math.max(0, (dlOriginConns.get(origin) || 0) - 1));
+      dlConnDrain();
+    }
+    function dlConnDrain() {
+      for (let i = 0; i < dlConnWaiters.length; ) {
+        const w = dlConnWaiters[i];
+        if (w.ctx.released || w.ctx.killed) { dlConnWaiters.splice(i, 1); continue; }
+        if (dlNet.conns >= DL_CONN_MAX || (dlOriginConns.get(w.origin) || 0) >= DL_PER_ORIGIN_CONNS) { i++; continue; }
+        dlConnWaiters.splice(i, 1);
+        const k = w.ctx.waits.indexOf(w);
+        if (k >= 0) w.ctx.waits.splice(k, 1);
+        dlNet.conns++;
+        dlOriginConns.set(w.origin, (dlOriginConns.get(w.origin) || 0) + 1);
+        w.run();
+      }
+    }
+    function dlConnFetch(ctx, origin, url, opts, cb) {
+      dlConnAcquire(ctx, origin, () => {
+        if (ctx.released || ctx.killed || (opts.isDead && opts.isDead())) {
+          dlConnRelease(ctx, origin);
+          cb({ why: 'cancel', status: 0, cls: 'trans' });
+          return;
+        }
+        let h = null;
+        h = dlFetchX(url, opts, (r) => {
+          dlConnRelease(ctx, origin);
+          if (h) ctx.handles.delete(h);
+          cb(r);
+        });
+        if (h) ctx.handles.add(h);
+      });
+    }
+    function dlCtxAbort(ctx) {
+      ctx.waits.length = 0;
+      for (const h of Array.from(ctx.handles)) { try { h.abort(); } catch (e) {} }
+      ctx.handles.clear();
+    }
     function dlPump() {
       if (!dlRun.running) return;
-      if (!dlNet.queue.length) { if (dlNet.active === 0) dlFinish(); return; }
-      if (dlNet.active >= DL_NET_MAX) return;
-      const job = dlNet.queue.shift();
-      dlNet.active++;
-      const now = Date.now();
-      const wait = Math.max(0, dlNet.last + DL_NET_GAP - now);
-      dlNet.last = now + wait;
-      setTimeout(() => {
-        if (!dlRun.running) { dlNet.active--; return; }
-        // per-job context: idempotent release + kill, and an ABSOLUTE
-        // watchdog — any path that never settles (a thrown resolver edge,
-        // a wedged stream, an unknown unknown) must fail the job and free
-        // the slot instead of freezing the whole download at the same %
-        const ctx = { released: false, killed: false, onProg: null };
-        const rel = () => {
-          if (ctx.released) return;
-          ctx.released = true;
-          clearTimeout(wd);
-          dlNet.active--;
-          dlPump();
-        };
-        const wd = setTimeout(() => {
-          if (ctx.released || !dlRun.running) return;
-          ctx.killed = true;
-          dlRun.fail++;
-          if (!dlRun.lastErr) dlRun.lastErr = 'stalled job (watchdog)';
-          updateDlDash();
-          rel();
-        }, 480000);
-        ctx.onProg = dlByte;
-        dlTry(job, 0, rel, ctx);
-      }, wait);
+      while (dlNet.queue.length) {
+        if (dlNet.active >= DL_NET_MAX) return;
+        let idx = -1;
+        for (let i = 0; i < dlNet.queue.length; i++) {
+          if ((dlOriginFiles.get(dlJobOrigin(dlNet.queue[i])) || 0) < DL_PER_ORIGIN_FILES) { idx = i; break; }
+        }
+        if (idx < 0) return; // every queued job's origin is saturated — releases re-pump
+        const job = dlNet.queue.splice(idx, 1)[0];
+        dlNet.active++;
+        const origin = dlJobOrigin(job);
+        dlOriginFiles.set(origin, (dlOriginFiles.get(origin) || 0) + 1);
+        const now = Date.now();
+        const wait = Math.max(0, dlNet.last + DL_NET_GAP - now);
+        dlNet.last = now + wait;
+        setTimeout(() => {
+          if (!dlRun.running || job.state !== 'queue') { dlSlotRelease(job); return; }
+          dlRunJob(job, origin);
+        }, wait);
+      }
+      if (dlNet.active === 0) dlFinish();
+    }
+    function dlRunJob(job, origin) {
+      job.state = 'run';
+      job.loaded = 0; job.total = 0; job.spd = 0; job.badge = ''; job.errWhy = ''; job.noChunk = false; job._lastP = 0;
+      updateDlDash();
+      // per-job context: idempotent release, abortable handles, and an
+      // ABSOLUTE watchdog — any path that never settles must fail the job
+      // and free the slot (0.8.3 contract; retries run INSIDE the watch-
+      // dog). ctx.runId: a stale watchdog from a stopped run must not
+      // poison the next one.
+      const ctx = { released: false, killed: false, runId: dlRunSeq, origin: origin, waits: [], handles: new Set() };
+      job._ctx = ctx;
+      const rel = () => {
+        if (ctx.released) return;
+        ctx.released = true;
+        clearTimeout(wd);
+        dlCtxAbort(ctx);
+        dlSlotRelease(job);
+      };
+      const wd = setTimeout(() => {
+        if (ctx.released || ctx.runId !== dlRunSeq) return;
+        ctx.killed = true;
+        job.state = 'fail';
+        job.errWhy = 'watchdog';
+        dlRun.fail++;
+        dlPinFail(job);
+        if (!dlRun.lastErr) dlRun.lastErr = 'stalled job (watchdog)';
+        rel();
+        updateDlDash();
+      }, DL_WATCHDOG);
+      dlAttempt(job, 0, 0, rel, ctx);
     }
     function dlAfter(release) {
       updateDlDash();
@@ -2188,89 +2426,266 @@
       dlSpeedWin.push({ t: performance.now(), b: b });
       dlDashTick();
     }
-    function dlTry(job, ci, release, ctx) {
-      const settle = (blob) => {
-        if (dlRun.cancel || ctx.killed) { release(); return; }
-        if (blob) {
-          dlRun.done++;
-          dlRun.bytes += blob.size;
-          job.blob = blob;
-          if (dlRun.bytes > DL_BYTE_CAP) { // stop scheduling; keep what's fetched
-            dlRun.lastErr = 'size cap reached — zip truncated';
-            dlNet.queue.length = 0;
-          }
-          dlAfter(release);
+    // One file attempt: walk candidates, retry transients (≤ DL_RETRY_MAX,
+    // backoff 2s→6s, Retry-After honored up to 30s), perm failures burn the
+    // URL and walk to the next candidate.
+    function dlAttempt(job, ci, tryN, release, ctx) {
+      if (dlRun.cancel || ctx.killed || ctx.released) { release(); return; }
+      job.loaded = 0; job.total = 0; job._lastP = 0;
+      const failWith = (why, status, retryAfter, clsOverride) => {
+        if (dlRun.cancel || ctx.killed || ctx.released) { release(); return; }
+        const cls = clsOverride || dlFailClass(status);
+        if (cls === 'trans' && tryN < DL_RETRY_MAX) {
+          const wait = retryAfter > 0 ? Math.min(30000, retryAfter * 1000) : (tryN === 0 ? 2000 : 6000);
+          job.badge = '↻ ' + (tryN + 1) + '/' + DL_RETRY_MAX;
+          job.errWhy = why;
+          updateDlDash();
+          setTimeout(() => {
+            if (dlRun.cancel || ctx.killed || ctx.released) { release(); return; }
+            job.badge = '';
+            dlAttempt(job, ci, tryN + 1, release, ctx);
+          }, wait);
           return;
         }
-        if (dlRun.running && ci + 1 < job.cands.length) { dlTry(job, ci + 1, release, ctx); return; }
+        if (ci + 1 < job.cands.length) {
+          job.badge = '';
+          job.noChunk = false;
+          dlAttempt(job, ci + 1, 0, release, ctx);
+          return;
+        }
+        job.state = 'fail';
+        job.badge = '';
+        job.errWhy = why;
         dlRun.fail++;
+        dlPinFail(job);
         dlAfter(release);
+      };
+      const stream = (url) => {
+        dlStream(job, ctx, url, (r) => {
+          if (dlRun.cancel || ctx.killed || ctx.released) { release(); return; }
+          if (r.blob) {
+            job.state = 'done';
+            job.badge = '';
+            dlRun.done++;
+            dlRun.bytes += r.blob.size;
+            job.blob = r.blob;
+            if (dlRun.bytes > DL_BYTE_CAP) { // stop scheduling; keep what's fetched
+              dlRun.lastErr = 'size cap reached — zip truncated';
+              dlNet.queue.length = 0;
+            }
+            dlAfter(release);
+            return;
+          }
+          failWith(r.why || 'failed', r.status | 0, r.retryAfter | 0, r.cls);
+        });
       };
       if (job.page) {
         // landing-page HQ: resolve the original, fall back to the embedded
-        resolveImagePage(job.page, job.cands[0], (full) => {
-          if (dlRun.cancel || ctx.killed) { release(); return; }
-          dlFetch(full || job.cands[ci], settle, ctx.onProg);
+        job.badge = '…';
+        resolveImagePage(job.page, job.cands[ci], (full) => {
+          if (dlRun.cancel || ctx.killed || ctx.released) { release(); return; }
+          job.badge = '';
+          stream(full || job.cands[ci]);
         }, true); // user-initiated single — force past any failure cooldown
         return;
       }
       if (job.kind === 'embed') {
         // player tiles: resolve to the direct stream (sign endpoint or
         // file-page carrier), then fetch the bytes. Resolution shares the
-        // same net slot so the 2-concurrent cap also throttles sign hits.
+        // same job so the caps also throttle sign hits.
+        job.badge = '…';
         resolveEmbedStream(job.cands[ci], (src) => {
-          if (dlRun.cancel || ctx.killed) { release(); return; }
-          if (!src) { dlRun.fail++; dlRun.lastErr = 'embed stream unresolved'; dlAfter(release); return; }
-          dlFetch(src, settle, ctx.onProg);
+          if (dlRun.cancel || ctx.killed || ctx.released) { release(); return; }
+          job.badge = '';
+          if (!src) { failWith('embed unresolved', 0, 0, 'trans'); return; }
+          stream(src);
         });
         return;
       }
-      dlFetch(job.cands[ci], settle, ctx.onProg);
+      stream(job.cands[ci]);
     }
-    function dlFetch(url, cb, onProg) {
+    // One file → bytes. GM path probes with a Range request: a 206 answer
+    // with a Content-Range total ≥ DL_CHUNK_MIN switches to parallel ranged
+    // parts (the probe body IS part 0); a 200 answer means the server
+    // ignored Range and the response is already the whole file. The fetch
+    // fallback never chunks — Range is CORS-unsafe there.
+    function dlStream(job, ctx, url, cb) {
+      const origin = dlURLOrigin(url);
+      const canChunk = !job.noChunk && typeof GM_xmlhttpRequest === 'function';
+      const mkProg = () => {
+        let last = 0;
+        return (loaded, total) => {
+          if (total > 0 && !job.total) job.total = total;
+          if (loaded > last) {
+            const d = loaded - last;
+            last = loaded;
+            dlByte(d);
+            job.loaded = (job.loaded || 0) + d;
+            const t = performance.now();
+            const dt = t - (job._lastP || t);
+            job._lastP = t;
+            if (dt > 0) job.spd = job.spd ? job.spd * 0.7 + ((d / dt) * 1000) * 0.3 : (d / dt) * 1000;
+            dlDashTick();
+          }
+        };
+      };
+      dlConnFetch(ctx, origin, url, { range: canChunk ? [0, DL_CHUNK_MIN - 1] : null, onProg: mkProg() }, (r) => {
+        if (ctx.killed || ctx.released || dlRun.cancel) { cb({ why: 'cancel', cls: 'trans' }); return; }
+        if (!r.blob) { cb(r); return; }
+        if (r.status === 206 && !r.total) {
+          // 206 without Content-Range: the body may be partial — never save
+          // it blind; restart this attempt single-stream
+          job.noChunk = true;
+          cb({ why: 'partial without size', status: 0, cls: 'trans' });
+          return;
+        }
+        if (r.status !== 206 || r.total < DL_CHUNK_MIN) { cb({ blob: r.blob }); return; }
+        if (r.blob.size !== DL_CHUNK_MIN) {
+          job.noChunk = true;
+          cb({ why: 'probe size mismatch', status: 0, cls: 'trans' });
+          return;
+        }
+        const rest = dlChunkPlan(r.total - DL_CHUNK_MIN, DL_CHUNK_PARTS - 1);
+        if (!rest.length) { cb({ blob: r.blob }); return; }
+        const spans = rest.map((rg) => [rg[0] + DL_CHUNK_MIN, rg[1] + DL_CHUNK_MIN]);
+        job.total = r.total;
+        job.loaded = r.blob.size;
+        job.badge = '↔ ' + (spans.length + 1);
+        const blobs = [r.blob];
+        let left = spans.length;
+        let dead = false;
+        const finishParts = (res) => {
+          dead = true;
+          job.badge = '';
+          cb(res);
+        };
+        const killSiblings = () => {
+          for (const h of Array.from(ctx.handles)) { try { h.abort(); } catch (e) {} }
+        };
+        const runPart = (i, tryN) => {
+          if (dead || ctx.killed || ctx.released || dlRun.cancel) return;
+          const s = spans[i][0];
+          const e = spans[i][1];
+          dlConnFetch(ctx, origin, url, {
+            range: [s, e],
+            onProg: mkProg(),
+            isDead: () => dead
+          }, (rr) => {
+            if (dead) return;
+            if (rr.blob) {
+              if (rr.blob.size !== e - s + 1) {
+                // server ignored Range mid-run (challenge page, HTML
+                // error) — assembling would corrupt the file; restart
+                // the attempt single-stream
+                job.noChunk = true;
+                killSiblings();
+                finishParts({ why: 'part size mismatch', status: 0, cls: 'trans' });
+                return;
+              }
+              blobs[i + 1] = rr.blob;
+              if (--left === 0) finishParts({ blob: new Blob(blobs) });
+              return;
+            }
+            if (dlFailClass(rr.status | 0) === 'trans' && tryN < DL_RETRY_MAX) {
+              const wait = rr.retryAfter > 0 ? Math.min(30000, rr.retryAfter * 1000) : (tryN === 0 ? 2000 : 6000);
+              setTimeout(() => runPart(i, tryN + 1), wait);
+              return;
+            }
+            killSiblings();
+            finishParts({ why: rr.why || 'part failed', status: rr.status | 0, retryAfter: rr.retryAfter | 0 });
+          });
+        };
+        for (let i = 0; i < spans.length; i++) runPart(i, 0);
+      });
+    }
+    // One HTTP GET (GM XHR preferred, fetch fallback) with the full leash
+    // set: TTFB, mid-stream stall, read ceiling. Range is GM-only. cb gets
+    // {blob, status, total} on success or {why, status, retryAfter, cls}.
+    function dlFetchX(url, opts, cb) {
       let settled = false;
       let firstByte = false;
-      const done = (blob) => { if (!settled) { settled = true; clearTimeout(hang); cb(blob); } };
-      // wedged-stream leash: no FIRST byte within 90s = dead — a stream that
-      // never opens must not hold a net slot (GM's own timeout only governs
-      // after the request is underway, and silent hangs fire nothing)
-      const hang = setTimeout(() => { if (!firstByte) done(null); }, 90000);
-      const prog = (b) => { firstByte = true; if (onProg) onProg(b); };
+      let ttfbT = 0;
+      let stallT = 0;
+      let leash = 0;
+      const finish = (r) => {
+        if (settled) return;
+        settled = true;
+        clearTimeout(ttfbT);
+        clearTimeout(stallT);
+        clearTimeout(leash);
+        cb(r);
+      };
+      const prog = (loaded, total) => {
+        if (!firstByte) {
+          firstByte = true;
+          clearTimeout(ttfbT);
+        }
+        clearTimeout(stallT);
+        stallT = setTimeout(() => finish({ why: 'stalled', status: 0, cls: 'trans' }), DL_STALL);
+        if (opts.onProg) opts.onProg(loaded, total);
+      };
+      const retryAfterOf = (hs) => {
+        const m = String(hs || '').match(/retry-after:\s*(\d+)/i);
+        return m ? parseInt(m[1], 10) : 0;
+      };
+      // a stream that never opens must not hold a connection (GM's own
+      // timeout only governs after the request is underway)
+      ttfbT = setTimeout(() => { if (!firstByte) finish({ why: 'no first byte', status: 0, cls: 'trans' }); }, DL_TTFB);
       if (typeof GM_xmlhttpRequest === 'function') {
         try {
-          let last = 0;
-          GM_xmlhttpRequest({
-            method: 'GET', url: url, responseType: 'blob', timeout: 180000,
-            onprogress: (r) => { if (r && r.loaded > last) { prog(r.loaded - last); last = r.loaded; } },
-            onload: (r) => done(r && (r.status === 200 || r.status === 0) && r.response ? r.response : null),
-            onerror: () => done(null),
-            ontimeout: () => done(null)
+          const gmRq = GM_xmlhttpRequest({
+            method: 'GET',
+            url: url,
+            responseType: 'blob',
+            timeout: DL_READ,
+            headers: opts.range ? { Range: 'bytes=' + opts.range[0] + '-' + opts.range[1] } : undefined,
+            onprogress: (r) => { if (r && r.loaded) prog(r.loaded, (r && r.total) | 0); },
+            onload: (r) => {
+              const st = r ? (r.status | 0) : 0;
+              if (r && (st === 200 || st === 206 || st === 0) && r.response) {
+                let total = 0;
+                if (st === 206) {
+                  const m = String(r.responseHeaders || '').match(/content-range:\s*bytes\s+\d+-\d+\/(\d+)/i);
+                  total = m ? parseInt(m[1], 10) : 0;
+                }
+                finish({ blob: r.response, status: st, total: total, retryAfter: retryAfterOf(r.responseHeaders) });
+                return;
+              }
+              finish({ why: 'HTTP ' + st, status: st, retryAfter: r ? retryAfterOf(r.responseHeaders) : 0 });
+            },
+            onerror: () => finish({ why: 'network', status: 0, cls: 'trans' }),
+            ontimeout: () => finish({ why: 'read timeout', status: 0, cls: 'trans' })
           });
-          return;
+          return { abort: () => { try { if (gmRq && gmRq.abort) gmRq.abort(); } catch (e) {} } };
         } catch (e) {
-          // TM throws SYNCHRONOUSLY on URLs it cannot parse — an uncaught
-          // throw here leaks the net slot and froze whole downloads at the
-          // same job forever. Fall through to fetch, which will fail cleanly.
+          // TM throws SYNCHRONOUSLY on URLs it cannot parse (0.8.3) — fall
+          // through to fetch, which fails cleanly instead of leaking the slot.
         }
       }
       const ctl = (typeof AbortController !== 'undefined') ? new AbortController() : null;
-      const leash = ctl ? setTimeout(() => { try { ctl.abort(); } catch (e) {} }, 180000) : 0;
+      leash = ctl ? setTimeout(() => { try { ctl.abort(); } catch (e) {} }, DL_READ) : 0;
       fetch(url, { referrerPolicy: 'no-referrer', signal: ctl ? ctl.signal : undefined })
         .then(async (r) => {
-          clearTimeout(leash);
-          if (!r.ok) { done(null); return; }
-          if (!r.body || !r.body.getReader) { done(await r.blob()); return; }
+          if (!r.ok) {
+            const ra = parseInt(r.headers.get('retry-after') || '0', 10) || 0;
+            finish({ why: 'HTTP ' + r.status, status: r.status, retryAfter: ra });
+            return;
+          }
+          if (!r.body || !r.body.getReader) { finish({ blob: await r.blob(), status: r.status, total: 0 }); return; }
           const reader = r.body.getReader();
           const chunks = [];
+          let loaded = 0;
           for (;;) {
             const st = await reader.read();
             if (st.done) break;
             chunks.push(st.value);
-            prog(st.value.length);
+            loaded += st.value.length;
+            prog(loaded, 0);
           }
-          done(new Blob(chunks));
+          finish({ blob: new Blob(chunks), status: r.status, total: 0 });
         })
-        .catch(() => { clearTimeout(leash); done(null); });
+        .catch(() => finish({ why: 'fetch failed', status: 0, cls: 'trans' }));
+      return { abort: () => { try { if (ctl) ctl.abort(); } catch (e) {} } };
     }
     async function buildZipBlob(files) { // files: [{ name, blob }]
       const enc = new TextEncoder();
@@ -2290,11 +2705,11 @@
       const cd = concatU8(cds);
       return new Blob(parts.concat([cd, zipEocd(files.length, cd.length, off)]), { type: 'application/zip' });
     }
-    function dlSaveZip(zip) {
+    function dlSaveZip(zip, kind) {
       const u = URL.createObjectURL(zip);
       const a = document.createElement('a');
       a.href = u;
-      a.download = zipName();
+      a.download = zipName(kind);
       document.body.appendChild(a);
       a.click();
       a.remove();
@@ -2308,15 +2723,26 @@
         updateDlDash();
         return;
       }
+      // Single-kind runs (user ask 0.9.0): drop the inner folder and tag
+      // the zip name. Decided from what actually DOWNLOADED, not the list.
+      const keep = dlJobs.filter((j) => j.blob);
+      let hImg = false;
+      let hVid = false;
+      for (const j of keep) {
+        if (j.kind === 'video' || j.kind === 'embed') hVid = true;
+        else hImg = true;
+      }
+      const kind = zipKindTag(hImg, hVid);
       // zip assembly needs the main thread free for arrayBuffer reads — defer
       // a tick so the final stats paint first
       dlRun.phase = 'zip';
       updateDlDash();
       setTimeout(() => {
-        buildZipBlob(dlJobs.filter((j) => j.blob).map((j) => ({
-          name: (j.kind === 'video' || j.kind === 'embed' ? 'Videos/' : 'Pics/') + j.name, blob: j.blob
+        buildZipBlob(keep.map((j) => ({
+          name: kind ? j.name : (j.kind === 'video' || j.kind === 'embed' ? 'Videos/' : 'Pics/') + j.name,
+          blob: j.blob
         })))
-          .then((z) => { dlSaveZip(z); dlRun.phase = 'done'; updateDlDash(); })
+          .then((z) => { dlSaveZip(z, kind); dlRun.phase = 'done'; updateDlDash(); })
           .catch((e) => {
             dlRun.lastErr = 'zip failed: ' + (e && e.message ? e.message : e);
             dlRun.phase = 'error';
@@ -2325,16 +2751,31 @@
       }, 30);
     }
     function startBulkDownload() {
-      if (dlRun.running) { // second click = cancel affordance
+      if (dlRun.running) { // second click = stop affordance
         dlRun.cancel = true;
         dlRun.running = false;
         dlNet.queue.length = 0;
+        dlRunSeq++; // stale watchdogs/timers from this run must not touch the next
+        for (const j of dlJobs) {
+          if (j._ctx && !j._ctx.released) {
+            j._ctx.killed = true;
+            j._ctx.runId = -1;
+            dlCtxAbort(j._ctx);
+          }
+        }
+        dlConnWaiters.length = 0;
+        dlNet.conns = 0;
+        dlNet.active = 0;
+        dlOriginFiles.clear();
+        dlOriginConns.clear();
         dlFinish();
         return;
       }
       const pd = panelData();
       const res = buildDlJobs(collectMediaItems(pd).items);
       dlJobs = res.jobs;
+      for (const j of dlJobs) j.state = 'queue';
+      dlRunSeq++;
       dlRun.running = true;
       dlRun.cancel = false;
       dlRun.total = dlJobs.length;
@@ -2343,6 +2784,13 @@
       dlRun.bytes = 0;
       dlRun.lastErr = '';
       dlSpeedWin = [];
+      dlFailPins = [];
+      dlConnWaiters = [];
+      dlNet.active = 0;
+      dlNet.conns = 0;
+      dlOriginFiles.clear();
+      dlOriginConns.clear();
+      dlStartedAt = performance.now();
       if (!dlJobs.length) {
         dlRun.running = false;
         dlRun.phase = 'idle';
@@ -2351,8 +2799,11 @@
           dlBarEl.hidden = false;
           dlBarEl.classList.remove('xft-dlzip');
           dlFillEl.style.width = '0%';
-          dlCancelEl.hidden = true;
+          setStat(dlPctEl, '');
+          dlListEl.hidden = true;
+          dlStopEl.hidden = true;
           dlCloseEl.hidden = false;
+          dlSpdEl.textContent = '';
           dlStatsEl.textContent = 'Nothing to download on this tab.';
           setTimeout(() => { if (dlRun.phase === 'idle') dlBarEl.hidden = true; }, 2500);
         }
@@ -2361,8 +2812,17 @@
       dlNet.queue = dlJobs.slice();
       dlRun.phase = 'fetch';
       if (dlBarEl) {
-        dlNameEl.textContent = zipName();
-        dlNameEl.title = zipName();
+        // header names the predicted kind (actual saved name is decided by
+        // what downloads — a failed last video won't claim "(Videos)")
+        let pImg = false;
+        let pVid = false;
+        for (const j of dlJobs) {
+          if (j.kind === 'video' || j.kind === 'embed') pVid = true;
+          else pImg = true;
+        }
+        const nm = zipName(zipKindTag(pImg, pVid));
+        dlNameEl.textContent = nm;
+        dlNameEl.title = nm;
         dlBarEl.hidden = false;
       }
       updateDlBtn();
@@ -3341,25 +3801,36 @@
       updateDlBtn();
       subtabsEl.append(subTabBtns.all, subTabBtns.image, subTabBtns.video, groupSel, dlBtn);
 
-      // bulk download status dashboard: file name, % bar, counts, speed, cancel
+      // bulk download dashboard: header (name / speed / ETA / stop),
+      // overall bar + counts, live rows for in-flight files (+ pinned fails)
       dlBarEl = document.createElement('div');
       dlBarEl.className = 'xft-dlbar';
       dlBarEl.hidden = true;
       dlNameEl = document.createElement('span');
       dlNameEl.className = 'xft-dlname';
-      dlCancelEl = mkBtn('Cancel', () => { if (dlRun.running) startBulkDownload(); }, 'xft-btn xft-dlcancel');
+      dlSpdEl = document.createElement('span');
+      dlSpdEl.className = 'xft-dlspd';
+      dlStopEl = mkBtn('Stop', () => { if (dlRun.running) startBulkDownload(); }, 'xft-btn xft-dlstop');
       dlCloseEl = mkBtn('✕', () => { dlBarEl.hidden = true; }, 'xft-btn xft-dlclose');
       dlCloseEl.hidden = true;
       const dlTop = document.createElement('div');
       dlTop.className = 'xft-dltop';
-      dlTop.append(dlNameEl, dlCancelEl, dlCloseEl);
+      dlTop.append(dlNameEl, dlSpdEl, dlStopEl, dlCloseEl);
+      const dlProgRow = document.createElement('div');
+      dlProgRow.className = 'xft-dlprogrow';
       const dlProg = document.createElement('div');
       dlProg.className = 'xft-dlprog';
       dlFillEl = document.createElement('i');
       dlProg.appendChild(dlFillEl);
+      dlPctEl = document.createElement('span');
+      dlPctEl.className = 'xft-dlpct';
+      dlProgRow.append(dlProg, dlPctEl);
       dlStatsEl = document.createElement('div');
       dlStatsEl.className = 'xft-dlstats';
-      dlBarEl.append(dlTop, dlProg, dlStatsEl);
+      dlListEl = document.createElement('div');
+      dlListEl.className = 'xft-dlrows';
+      dlListEl.hidden = true;
+      dlBarEl.append(dlTop, dlProgRow, dlStatsEl, dlListEl);
 
       linksBarEl = buildLinksBar();
 
@@ -3472,12 +3943,26 @@
         '.xft-dlbar[hidden]{display:none}',
         '.xft-dltop{display:flex;align-items:center;gap:6px;min-width:0}',
         '.xft-dlname{flex:1;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;font-weight:600}',
-        '.xft-dlprog{height:6px;border-radius:99px;background:hsl(var(--xft-border));overflow:hidden}',
+        '.xft-dlspd{color:hsl(var(--xft-muted-fg));font-variant-numeric:tabular-nums;font-size:11px;white-space:nowrap}',
+        '.xft-dlstop{height:22px;padding:0 8px;font-size:11px}',
+        '.xft-dlprogrow{display:flex;align-items:center;gap:8px}',
+        '.xft-dlprog{flex:1;height:6px;border-radius:99px;background:hsl(var(--xft-border));overflow:hidden}',
         '.xft-dlprog>i{display:block;height:100%;width:0;background:hsl(var(--xft-ring));border-radius:99px;transition:width .25s}',
+        '.xft-dlpct{width:34px;text-align:right;font-variant-numeric:tabular-nums;font-size:11px;color:hsl(var(--xft-muted-fg));flex:none}',
         '.xft-dlstats{display:flex;gap:12px;color:hsl(var(--xft-muted-fg));font-variant-numeric:tabular-nums;font-size:11px;white-space:nowrap;overflow:hidden}',
         '.xft-dl-ok{color:hsl(142 60% 45%)}',
         '.xft-dl-bad{color:hsl(var(--xft-destructive))}',
         '.xft-dl-on{color:hsl(var(--xft-fg))}',
+        '.xft-dlrows{display:flex;flex-direction:column;gap:2px;max-height:132px;overflow-y:auto;scrollbar-width:thin;margin-top:2px}',
+        '.xft-dlrows[hidden]{display:none}',
+        '.xft-dlrow{display:flex;align-items:center;gap:8px;min-width:0;font-size:11px;line-height:18px}',
+        '.xft-dlrowname{flex:1;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;color:hsl(var(--xft-fg))}',
+        '.xft-dlrowbar{width:56px;height:4px;border-radius:99px;background:hsl(var(--xft-border));overflow:hidden;flex:none}',
+        '.xft-dlrowbar>b{display:block;height:100%;width:0;background:hsl(var(--xft-ring));border-radius:99px}',
+        '.xft-dlrowpct{width:30px;text-align:right;font-variant-numeric:tabular-nums;color:hsl(var(--xft-muted-fg));flex:none}',
+        '.xft-dlrowmeta{width:72px;text-align:right;font-variant-numeric:tabular-nums;color:hsl(var(--xft-muted-fg));overflow:hidden;text-overflow:ellipsis;white-space:nowrap;flex:none}',
+        '.xft-dlrow-bad .xft-dlrowname,.xft-dlrow-bad .xft-dlrowpct,.xft-dlrow-bad .xft-dlrowmeta{color:hsl(var(--xft-destructive))}',
+        '.xft-dlrow-bad .xft-dlrowbar>b{background:hsl(var(--xft-destructive))}',
         '.xft-dlzip .xft-dlprog>i{width:100%;background:linear-gradient(90deg,transparent,hsl(var(--xft-ring)),transparent);background-size:200% 100%;animation:xft-dlslide 1.1s linear infinite}',
         '@keyframes xft-dlslide{from{background-position:200% 0}to{background-position:-200% 0}}',
         '.xft-dl-run{background:hsl(var(--xft-ring)/.18)!important;border-color:hsl(var(--xft-ring))!important}',
@@ -3732,5 +4217,5 @@
   }
 
   // UMD export of the pure functions for node:test (no DOM / GM usage in them).
-  if (typeof module !== 'undefined' && module.exports) module.exports = { parseReactionCount, filterLinks, sortPosts, estimateSize, partitionLinks, extractDomain, groupLinkItems, applyLinkFilters, boilerplateUrls, isSmilieUrl, parseEmbedPoster, embedSignUrl, parseSignResponse, parseSignToken, parseVideoPage, isVideoPageUrl, hqCandidates, sanitizeFileSeg, siteTagFromHost, cleanThreadTitle, zipFileName, imagePageHref, parseImagePage, parseImageApiResponse, dlBasename, buildDlJobs, crc32, zipStoreU8, layoutMetrics, windowRange, originBurstingFromHist };
+  if (typeof module !== 'undefined' && module.exports) module.exports = { parseReactionCount, filterLinks, sortPosts, estimateSize, partitionLinks, extractDomain, groupLinkItems, applyLinkFilters, boilerplateUrls, isSmilieUrl, parseEmbedPoster, embedSignUrl, parseSignResponse, parseSignToken, parseVideoPage, isVideoPageUrl, hqCandidates, sanitizeFileSeg, siteTagFromHost, cleanThreadTitle, zipKindTag, zipFileName, imagePageHref, parseImagePage, parseImageApiResponse, dlBasename, buildDlJobs, dlChunkPlan, dlFailClass, crc32, zipStoreU8, layoutMetrics, windowRange, originBurstingFromHist };
 })();
