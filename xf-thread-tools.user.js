@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         xf-thread-tools
 // @namespace    xf-thread-tools
-// @version      0.12.1
+// @version      0.13.0
 // @description  XenForo 2: sort thread posts by reaction count across all pages (cached) + floating media panel (images / external links).
 // @author       xf-thread-tools
 // @match        *://*/threads/*
@@ -3641,9 +3641,17 @@
       aiSeq++;
       renderAiTab(true);
       const ep = aiEndpoint(settings);
+      const native = settings.aiProvider === 'ollama';
+      const pmode = native ? 'ollama' : 'openai';
       const posts = orderedRecords().map((r) => ({ author: r.author, pageN: r.pageN, reactionCount: r.reactionCount, text: htmlToText(r.bodyHtml) }));
-      const body = { model: settings.aiModel, messages: aiMessages(buildAiTranscript(posts), question, aiChat.msgs.slice(0, -1), settings.aiLang), stream: true };
-      const sse = aiSseParser();
+      const msgs = aiMessages(buildAiTranscript(posts), question, aiChat.msgs.slice(0, -1), settings.aiLang);
+      // Ollama native /api/chat carries think:false (instant answers — the
+      // OpenAI-compat /v1 endpoint ignores the field and thinking models burn
+      // the whole budget on hidden reasoning first).
+      const body = native
+        ? { model: settings.aiModel, messages: msgs, stream: true, think: false }
+        : { model: settings.aiModel, messages: msgs, stream: true };
+      const sse = aiSseParser(pmode);
       let acc = '';
       let lastPaint = 0;
       const onChunk = (piece) => {
@@ -3653,13 +3661,13 @@
         const now = Date.now();
         if (now - lastPaint >= 150) { lastPaint = now; aiSeq++; renderAiTab(true); } // throttled live bubble
       };
-      aiChat.abort = aiRequest('POST', ep.chat, body, (res) => {
+      aiChat.abort = aiRequest('POST', native ? aiNativeChatUrl(ep.base) : ep.chat, body, (res) => {
         aiChat.pending = false;
         aiChat.abort = null;
         let fin = null;
         if (res && res.ok) {
-          if (!acc && res.text) { // no onprogress events: parse the full SSE body in one shot
-            const whole = aiSseParser();
+          if (!acc && res.text) { // no onprogress events: parse the full stream body in one shot
+            const whole = aiSseParser(pmode);
             for (const d of whole.push(res.text)) acc += d;
           }
           if (acc) fin = { text: acc };
@@ -3862,7 +3870,7 @@
       }
       const hint = document.createElement('div');
       hint.className = 'xft-ai-hint';
-      hint.textContent = 'Ollama only for now — the model list and chat run against the Base URL above. Post texts are sent to that endpoint.';
+      hint.textContent = 'Ollama only for now — the model list and chat run against the Base URL above. Post texts are sent to that endpoint. Chat uses Ollama\'s native API with thinking off (think:false) — gemma4/qwen3.5 answer instantly.';
       cfg.appendChild(hint);
 
       // context status + config toggle
@@ -4818,6 +4826,15 @@
     const base = String(c.base || c.aiBase || '').trim().replace(/\/+$/, '') || AI_BASES[c.provider || c.aiProvider] || AI_BASES.openai;
     return { base: base, chat: base + '/chat/completions', models: base + '/models' };
   }
+  // Ollama native chat API. Thinking control (`think:false`) exists ONLY on
+  // /api/chat — the OpenAI-compat /v1 layer silently drops the field (verified
+  // live: gemma4/qwen3.5 think no matter what /v1 sends). Strip a trailing
+  // /v1 from the configured base to recover the server origin.
+  function aiNativeChatUrl(base) {
+    let b = String(base || '').trim().replace(/\/+$/, '');
+    if (/\/v1$/i.test(b)) b = b.slice(0, -3);
+    return b + '/api/chat';
+  }
   // Model lists: OpenAI {data:[{id}]} and Ollama-native {models:[{name}]} both accepted.
   function parseAiModels(json) {
     let v = json;
@@ -4837,7 +4854,8 @@
     if (!v || typeof v !== 'object') return { error: 'empty response' };
     if (v.error) return { error: (v.error && typeof v.error.message === 'string') ? v.error.message : String(v.error) };
     const ch = Array.isArray(v.choices) ? v.choices[0] : null;
-    const text = ch && ch.message && typeof ch.message.content === 'string' ? ch.message.content.trim() : '';
+    const text = ch && ch.message && typeof ch.message.content === 'string' ? ch.message.content.trim()
+      : (v.message && typeof v.message.content === 'string' ? v.message.content.trim() : ''); // Ollama native {message:{content}}
     return text ? { text: text } : { error: 'empty response' };
   }
 
@@ -4909,12 +4927,15 @@
   }
 
   // ---------- SSE stream parsing for chat (pure — unit-tested) ----------
-  // OpenAI/Ollama streaming shape: `data: {json with choices[0].delta.content}`
-  // lines, terminated by `data: [DONE]`. Incremental: chunks may split lines
-  // anywhere; the buffer keeps the partial tail until its \n arrives.
-  function aiSseParser() {
+  // OpenAI shape: `data: {json with choices[0].delta.content}` lines,
+  // terminated by `data: [DONE]`. Ollama NATIVE shape (mode 'ollama'):
+  // NDJSON lines {message:{content}} terminated by {done:true} — no data:
+  // prefix. Both incremental: chunks may split lines anywhere; the buffer
+  // keeps the partial tail until its \n arrives.
+  function aiSseParser(mode) {
     let buf = '';
     let done = false;
+    const native = mode === 'ollama';
     return {
       push(chunk) {
         buf += String(chunk || '');
@@ -4923,13 +4944,21 @@
         while ((nl = buf.indexOf('\n')) >= 0) {
           const line = buf.slice(0, nl).replace(/\r$/, '');
           buf = buf.slice(nl + 1);
-          if (line.slice(0, 5) !== 'data:') continue;
-          const d = line.slice(5).trim();
+          const d = line.slice(0, 5) === 'data:' ? line.slice(5).trim() : line.trim();
+          if (!d) continue;
           if (d === '[DONE]') { done = true; continue; }
           let v = null;
           try { v = JSON.parse(d); } catch (e) { continue; }
-          const c = v && v.choices && v.choices[0] && v.choices[0].delta && v.choices[0].delta.content;
-          if (typeof c === 'string' && c) out.push(c);
+          if (native) {
+            // message.thinking is deliberately ignored: if a thinking model
+            // ever leaks reasoning, it must never reach the chat bubble.
+            if (v.done === true) done = true;
+            const c = v.message && typeof v.message.content === 'string' ? v.message.content : '';
+            if (c) out.push(c);
+          } else {
+            const c = v && v.choices && v.choices[0] && v.choices[0].delta && v.choices[0].delta.content;
+            if (typeof c === 'string' && c) out.push(c);
+          }
         }
         return out;
       },
@@ -4938,5 +4967,5 @@
   }
 
   // UMD export of the pure functions for node:test (no DOM / GM usage in them).
-  if (typeof module !== 'undefined' && module.exports) module.exports = { parseReactionCount, filterLinks, sortPosts, estimateSize, partitionLinks, extractDomain, groupLinkItems, applyLinkFilters, boilerplateUrls, isSmilieUrl, parseEmbedPoster, embedSignUrl, parseSignResponse, parseSignToken, parseVideoPage, isVideoPageUrl, hqCandidates, sanitizeFileSeg, siteTagFromHost, cleanThreadTitle, zipKindTag, zipFileName, imagePageHref, parseImagePage, parseImageApiResponse, dlBasename, buildDlJobs, dlChunkPlan, dlFailClass, crc32, zipStoreU8, layoutMetrics, windowRange, originBurstingFromHist, hostKey, dosDateTime, fmtSpeed, fmtEta, buildMediaLayout, htmlToText, buildAiTranscript, aiMessages, aiEndpoint, parseAiModels, parseAiReply, mdInlineTokens, mdParse, aiSseParser };
+  if (typeof module !== 'undefined' && module.exports) module.exports = { parseReactionCount, filterLinks, sortPosts, estimateSize, partitionLinks, extractDomain, groupLinkItems, applyLinkFilters, boilerplateUrls, isSmilieUrl, parseEmbedPoster, embedSignUrl, parseSignResponse, parseSignToken, parseVideoPage, isVideoPageUrl, hqCandidates, sanitizeFileSeg, siteTagFromHost, cleanThreadTitle, zipKindTag, zipFileName, imagePageHref, parseImagePage, parseImageApiResponse, dlBasename, buildDlJobs, dlChunkPlan, dlFailClass, crc32, zipStoreU8, layoutMetrics, windowRange, originBurstingFromHist, hostKey, dosDateTime, fmtSpeed, fmtEta, buildMediaLayout, htmlToText, buildAiTranscript, aiMessages, aiEndpoint, aiNativeChatUrl, parseAiModels, parseAiReply, mdInlineTokens, mdParse, aiSseParser };
 })();
