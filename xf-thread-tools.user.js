@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         xf-thread-tools
 // @namespace    xf-thread-tools
-// @version      0.17.2
+// @version      0.17.3
 // @description  XenForo 2: sort thread posts by reaction count across all pages (cached) + floating media panel (images / external links).
 // @author       xf-thread-tools
 // @match        *://*/threads/*
@@ -1885,7 +1885,8 @@
       if (c && c.exp - now > 60) { cb(c.url); return; }
       const sign = embedSignUrl(url);
       const view = embedViewApiUrl(url);
-      if (!sign && !view && !isVideoPageUrl(url) && !VID_EXT_RE.test(url)) { cb(''); return; }
+      const directFile = VID_EXT_RE.test(url) || IMG_EXT_RE.test(url);
+      if (!sign && !view && !isVideoPageUrl(url) && !directFile) { cb(''); return; }
       if (embedStreamInflight.has(url)) { embedStreamInflight.get(url).push(cb); return; }
       const queue = [cb];
       embedStreamInflight.set(url, queue);
@@ -1927,10 +1928,11 @@
         // stream URL, no page fetch needed
         gmPostJson(view.url, { file_slug: view.slug },
           (t) => finish(parseViewApiResponse(t, now)), () => finish(null));
-      } else if (VID_EXT_RE.test(url)) {
-        // route 3: DIRECT file URLs that 301 to an HTML page (bunkr moved
-        // cdn/<file>.mp4 -> /f/<file>.mp4): <video> gets HTML and dies. Fetch,
-        // and if the answer parses as a file page, resolve through it
+      } else if (directFile) {
+        // route 3: DIRECT file URLs (video OR image) that 301 to an HTML page
+        // (bunkr-family cdn/<file> -> /f/<file>): the media element gets HTML
+        // and dies. Fetch, and if the answer parses as a file page, resolve
+        // through it
         gmGetText(url, (text) => finishCarrier(parseVideoPage(text)), () => finish(null));
       } else {
         resolveViaPage();
@@ -3077,11 +3079,22 @@
         v.addEventListener('error', function onErr() {
           // a direct CDN file that 301'd to an HTML page (bunkr cdn -> /f/)
           // errors on first load — resolve through the page carrier once,
-          // then give up as broken
+          // then give up as broken. xftMoved doubles as the PENDING flag: the
+          // resolve walk (fetch + sign) can outlast the dead-probe below,
+          // which must not retire a slot that is about to play.
           if (!v.dataset.xftMoved) {
             v.dataset.xftMoved = '1';
             resolveEmbedStream(url, (src) => {
-              if (src) { v.referrerPolicy = 'no-referrer'; v.src = src; return; }
+              v.dataset.xftMoved = '';
+              if (src) {
+                // undo any dead-probe misfire, then swap — load clears the rest
+                brokenMediaUrls.delete(url);
+                const host = v.closest('.xft-cell, .xft-vslot');
+                if (host) host.classList.remove('xft-broken');
+                v.referrerPolicy = 'no-referrer';
+                v.src = src;
+                return;
+              }
               markMediaBroken(v, url);
             });
             return;
@@ -3089,9 +3102,11 @@
           markMediaBroken(v, url);
         });
         v.addEventListener('loadeddata', () => markMediaLoaded(v), { once: true });
-        // cached failures never fire events — probe after a moment
+        // cached failures never fire events — probe after a moment; NEVER
+        // while a moved-page resolve is pending (the real-host walk takes
+        // longer than this timer)
         setTimeout(() => {
-          if (v.readyState === 0 && v.networkState === 3) markMediaBroken(v, url); // NETWORK_NO_SOURCE
+          if (v.readyState === 0 && v.networkState === 3 && !v.dataset.xftMoved) markMediaBroken(v, url); // NETWORK_NO_SOURCE
         }, 800);
         return v;
       }
@@ -3129,6 +3144,25 @@
           return;
         }
         im.removeEventListener('error', onErr);
+        // moved-page resolve (bunkr-style): a direct IMAGE url can 301 to an
+        // HTML landing page just like the video kind — resolve through the
+        // page carrier once, swap the src; only a real failure falls through
+        if (!im.dataset.xftMoved) {
+          im.dataset.xftMoved = '1';
+          resolveEmbedStream(url, (src) => {
+            im.dataset.xftMoved = '';
+            if (src) {
+              brokenMediaUrls.delete(url);
+              const host = im.closest('.xft-cell, .xft-vslot, .xft-vthumb');
+              if (host) host.classList.remove('xft-broken');
+              im.referrerPolicy = 'no-referrer';
+              im.src = src;
+              return;
+            }
+            markMediaBroken(im, url);
+          });
+          return;
+        }
         // burst-failing origin: the file may be fine, the CDN is choking —
         // HOLD the slot and recheck in the background (no hole, no reflow)
         if (originBursting(url)) { enterStall(im, url); return; }
@@ -3205,7 +3239,9 @@
       // way — probe for both, or the cell renders blank forever. A src-LESS
       // img (waiting in the HQ queue, or mid-retry) is complete with nw=0
       // but NOT dead — probing it retired whole ranges of healthy cells.
-      const checkDead = () => { if (im.getAttribute('src') && im.complete && im.naturalWidth <= 1 && !stallState.has(url)) markMediaBroken(im, url); };
+      // xftMoved = a moved-page resolve is IN FLIGHT for this element — the
+      // error/complete/nw<=1 state it sees is the OLD url's, not a verdict
+      const checkDead = () => { if (!im.dataset.xftMoved && im.getAttribute('src') && im.complete && im.naturalWidth <= 1 && !stallState.has(url)) markMediaBroken(im, url); };
       const checkTiny = () => {
         // 2..140px square-ish = smilie/sticker (no URL marker exists) —
         // retire the item. Animate the cell out first, then the debounced
