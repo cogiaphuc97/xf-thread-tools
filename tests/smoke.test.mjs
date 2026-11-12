@@ -24,8 +24,8 @@ test('bundle passes node --check', () => {
 
 test('UMD export exposes every pure function (bundle equivalence)', () => {
   const api = require(bundlePath);
-  // src module symbol count (69) minus pure helpers not UMD-exported;
-  // the tail is the authority: assert the exported set is complete and callable.
+  // src/ pure modules export 82 symbols; the UMD tail re-exports 62 of them
+  // (the module-tested set). The tail is the authority: complete and callable.
   const names = Object.keys(api);
   assert.ok(names.length >= 62, `expected >=62 UMD exports, got ${names.length}`);
   for (const n of names) assert.equal(typeof api[n], 'function', `${n} not a function`);

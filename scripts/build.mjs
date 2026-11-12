@@ -9,7 +9,7 @@
 //   - shell (src/shell/): userscript meta header, runtime guard, UMD tail.
 // Self-check: node --check on the output; refuses to write on any error.
 import { spawnSync } from 'node:child_process';
-import { readFileSync, writeFileSync, existsSync } from 'node:fs';
+import { readFileSync, writeFileSync, renameSync, rmSync, existsSync } from 'node:fs';
 import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
@@ -93,13 +93,15 @@ parts.push('})();');
 
 const bundle = parts.join('\n') + '\n';
 
-// ---- self-check before write ---------------------------------------------------
-const tmp = join(ROOT, 'xf-thread-tools.user.js');
+// ---- check on a temp copy, then swap in (never leaves a broken deliverable) ----
+const out = join(ROOT, 'xf-thread-tools.user.js');
+const tmp = out.replace(/\.js$/, '.tmp.js'); // keep .js: node --check infers format from extension
 writeFileSync(tmp, bundle);
 const check = spawnSync('node', ['--check', tmp], { encoding: 'utf8' });
 if (check.status !== 0) {
-  // leave the broken file for inspection but exit non-zero
+  rmSync(tmp);
   console.error(check.stderr);
-  throw new Error('node --check failed on built bundle');
+  throw new Error('node --check failed on built bundle (existing bundle left untouched)');
 }
+renameSync(tmp, out);
 // silent on success: ralph verify fingerprints stdout; keep the gate clean

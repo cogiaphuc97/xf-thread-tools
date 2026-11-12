@@ -134,7 +134,7 @@ function phasePure() {
       .map(([file, syms]) => `import { ${[...syms].sort().join(', ')} } from './${file.split('/').pop()}';`)
       .join('\n');
     // export prefix on top-level declarations
-    const exported = body.replace(/^  (const|let|var|function|async function|class)\s/gm, (m, kw) => `  export ${kw} `);
+    const exported = body.replace(/^  (const|let|var|function|async function|class)\s/gm, (_, kw) => `  export ${kw} `);
     // de-indent 2 -> 0 for ESM (bundle build re-indents via wrapper? no: keep 2-space, valid ESM either way)
     const header = `// ${mod.name}: ${mod.desc} (split from the single-file userscript; see scripts/modules.json)\n`;
     mkdirSync(join(ROOT, dirname(mod.file)), { recursive: true });
