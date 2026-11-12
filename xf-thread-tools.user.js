@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         xf-thread-tools
 // @namespace    xf-thread-tools
-// @version      0.17.0
+// @version      0.17.1
 // @description  XenForo 2: sort thread posts by reaction count across all pages (cached) + floating media panel (images / external links).
 // @author       xf-thread-tools
 // @match        *://*/threads/*
@@ -749,7 +749,8 @@
       abortRef: null,                // { aborted: boolean }
       pagesDone: new Set(),          // fetched page numbers (resume support)
       capNotice: false,
-      partialNotice: false
+      partialNotice: false,
+      partialWhy: ''
     };
     let recordsVersion = 0;          // bumped on every records mutation
     let posMap = null;
@@ -1101,11 +1102,13 @@
       hub.fetchRunning = true;
       hub.abortRef = { aborted: false };
       hub.partialNotice = false;
+      hub.partialWhy = '';
       let warned = false;
       const warnOnce = (msg) => {
         if (warned) return;
         warned = true;
         hub.partialNotice = true;
+        hub.partialWhy = msg.replace(/^fetch stopped: /, '');
         console.warn('[xf-thread-tools] ' + msg + ' — keeping partial data.');
       };
       try {
@@ -1143,7 +1146,7 @@
               clearTimeout(leash);
               if (res.ok) { html = await res.text(); break; }
               why = 'HTTP ' + res.status;
-              if (res.status !== 403 && res.status !== 429 && res.status < 500) break; // permanent
+              if (res.status !== 403 && res.status !== 429 && res.status < 500) { partialWhy = why; break; } // permanent, no retry
             } catch (err) { why = 'network error (' + ((err && err.message) || err) + ')'; }
             if (attempts >= 2) { partialWhy = why; break; }
             await sleep(attempts === 0 ? 3000 : 8000); // challenges clear in seconds
@@ -1164,6 +1167,7 @@
           (!hub.abortRef.aborted && !warned && !cache.stopPersist) ||
           (hub.meta.pageCount === 1 && seededPage === 1);
         hub.meta.complete = complete;
+        if (complete) { hub.partialNotice = false; hub.partialWhy = ''; } // a finished run clears the stale stop notice
         hub.meta.fetchedAt = Date.now();
         hub.meta.postIds = orderedRecords().map((r) => r.postId);
         hub.meta.pagesDone = Array.from(hub.pagesDone);
@@ -1189,6 +1193,17 @@
         return Promise.resolve();
       }
       currentRun = runFetch(force).catch(() => {}).then(() => { currentRun = null; });
+      return currentRun;
+    }
+
+    // Continue an incomplete fetch WITHOUT clearing anything: pagesDone pages
+    // skip, the live page re-seeds, and each unfetched page gets a fresh
+    // retry budget. This is the ▶ Resume path — the affordance for "Fetch
+    // stopped early" (challenge blip, network drop) and for resuming a
+    // user-stopped run on huge threads.
+    function resumeFetch() {
+      if (hub.fetchRunning || currentRun) return;
+      currentRun = runFetch(false).catch(() => {}).then(() => { currentRun = null; });
       return currentRun;
     }
 
@@ -1356,6 +1371,7 @@
     let panelCountEl = null;
     let panelCancelBtn = null;
     let panelRefreshBtn = null;
+    let panelResumeBtn = null;
     let noteEl = null;
     let tabFilesBtn = null;
     let tabLinksBtn = null;
@@ -3180,6 +3196,9 @@
       // mid-run and no accidental Stop (fetch runs to completion)
       if (panelCancelBtn) panelCancelBtn.disabled = busy;
       if (panelRefreshBtn) panelRefreshBtn.disabled = busy;
+      // Resume only exists for a stopped/incomplete run with data worth
+      // keeping — hidden on a clean slate (Refresh covers that) and while busy
+      if (panelResumeBtn) panelResumeBtn.hidden = busy || hub.meta.complete || hub.records.size === 0;
       // NOT disabled while pending: the second click cancels + sorts partial
       if (sorterPending) setSortBtn('⚡ ' + t + '…', false);
     }
@@ -3418,8 +3437,12 @@
       }
       // skip rebuild when nothing changed — background fetch progress ticks
       // must not churn the grid or reset the user's scroll position
-      // (sub-tab + search + filter selections are part of the signature)
-      const sig = panelTab + ':' + panelSubTab + ':' + settings.mediaGroup + ':' + rowLimit + ':' + JSON.stringify([
+      // (sub-tab + search + filter selections are part of the signature; so
+      // is the note line — a stop/complete transition must re-render it even
+      // when the data signature itself did not change)
+      const noteSig = hub.partialNotice ? 'p:' + hub.partialWhy
+        : (!hub.fetchRunning && !hub.meta.complete && hub.records.size > 0) ? 'i:' + hub.pagesDone.size + '/' + hub.meta.pageCount : 'c';
+      const sig = panelTab + ':' + panelSubTab + ':' + settings.mediaGroup + ':' + rowLimit + ':' + noteSig + ':' + JSON.stringify([
         linkSearchEl ? linkSearchEl.value : '',
         linkUserSel ? Array.from(linkUserSel).sort() : null,
         linkDomainSel ? Array.from(linkDomainSel).sort() : null,
@@ -3562,7 +3585,15 @@
       }
       const notes = [];
       if (hub.capNotice || cache.stopPersist) notes.push('Cache cap reached — new data kept in memory only (not persisted).');
-      if (hub.partialNotice) notes.push('Fetch stopped early — list is partial.');
+      if (hub.partialNotice) notes.push('Fetch stopped early — list is partial' + (hub.partialWhy ? ' (' + hub.partialWhy + ')' : '') + '. Press ▶ Resume to continue from where it stopped.');
+      // partialNotice is runtime-only; a REVISITED thread (cached partial from
+      // an earlier session) must not look complete — meta.complete is
+      // persisted, so derive the notice from it. Covers boot-with-cache (no
+      // auto-refetch by design) and autoFetch-off browsing.
+      else if (!hub.fetchRunning && !hub.meta.complete && hub.records.size > 0) {
+        const have = hub.pagesDone.size || (hub.meta.pagesDone || []).length;
+        notes.push('List is partial (' + have + '/' + hub.meta.pageCount + ' pages cached). Press ▶ Resume to fetch the rest.');
+      }
       noteEl.hidden = !notes.length;
       noteEl.textContent = notes.join(' ');
     }
@@ -4330,9 +4361,11 @@
       });
       panelCancelBtn = cancelBtn;
       panelRefreshBtn = refreshBtn;
+      const resumeBtn = mkBtn('▶ Resume', () => resumeFetch());
+      panelResumeBtn = resumeBtn;
       const gearBtn = mkBtn('⚙', () => toggleSettings());
       const closeBtn = mkBtn('✕', () => setPanelOpen(false));
-      head.append(title, progressEl, cancelBtn, refreshBtn, gearBtn, closeBtn);
+      head.append(title, progressEl, cancelBtn, refreshBtn, resumeBtn, gearBtn, closeBtn);
 
       const tabs = document.createElement('div');
       tabs.className = 'xft-tabs';
