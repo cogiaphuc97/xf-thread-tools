@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         xf-thread-tools
 // @namespace    xf-thread-tools
-// @version      0.17.4
+// @version      0.18.0
 // @description  XenForo 2: sort thread posts by reaction count across all pages (cached) + floating media panel (images / external links).
 // @author       xf-thread-tools
 // @match        *://*/threads/*
@@ -292,6 +292,7 @@
     const seen = new Set();
     const jobs = [];
     for (const it of (Array.isArray(items) ? items : [])) {
+      if (it.kind === 'album') continue; // the album PAGE is navigation, not a downloadable file
       const isVid = it.kind === 'video' || it.kind === 'embed';
       const base = isVid ? String(it.url || '').replace(/#.*$/, '') : String(it.url || '');
       if (!base || seen.has(base)) continue;
@@ -545,6 +546,71 @@
     if (!/^https?:\/\//i.test(s)) return false;
     const path = s.replace(/^https?:\/\/[^/]+/i, '').split(/[?#]/)[0];
     return /^\/v\/[^/]+\.(mp4|webm|mkv|mov|m4v)$/i.test(path) || /^\/f\/[^/]+$/i.test(path) || isFileDPageUrl(s);
+  }
+
+  // Album pages (path /a/<id>, no extension): hosts that group many files
+  // behind one landing page. Cross-host callers also guard against the
+  // forum's own /a/ routes (same test the /d/ reclassification uses).
+  function isAlbumPageUrl(u) {
+    const s = String(u || '');
+    if (!/^https?:\/\//i.test(s)) return false;
+    const path = s.replace(/^https?:\/\/[^/]+/i, '').split(/[?#]/)[0];
+    return /^\/a\/[A-Za-z0-9_-]{3,64}$/.test(path);
+  }
+
+  // Server-rendered album page parser: each grid item block carries the
+  // filename in a title attr, a download href (/f/<slug>) and an absolute
+  // thumbnail img. Archive/other extensions are skipped — only playable
+  // media becomes a grid child. Relative hrefs resolve against the album
+  // page URL. Returns [{url, kind, thumb}].
+  function parseAlbumPage(html, baseUrl) {
+    const h = String(html || '');
+    const out = [];
+    if (!h) return out;
+    const unesc = (s) => s.replace(/&quot;/g, '"').replace(/&#39;/g, "'").replace(/&amp;/g, '&');
+    // split on the item-block class marker; each chunk is one item's markup
+    const blocks = h.split(/class="[^"]*\btheItem\b/).slice(1);
+    for (const b of blocks) {
+      const t = b.match(/title="([^"]{1,300})"/);
+      const name = t ? unesc(t[1]) : '';
+      const href = b.match(/href="(\/f\/[A-Za-z0-9_-]{3,64})"/);
+      if (!name || !href) continue;
+      const kind = VID_EXT_RE.test(name) ? 'video' : (IMG_EXT_RE.test(name) ? 'image' : '');
+      if (!kind) continue; // archives / unknown — not grid media
+      let url = '';
+      try { url = new URL(href[1], baseUrl).href; } catch (e) { continue; }
+      const th = b.match(/src="(https?:\/\/[^"]+)"/); // icons are relative — absolute srcs only
+      out.push({ url: url, kind: kind, thumb: th ? unesc(th[1]) : '' });
+    }
+    return out;
+  }
+
+  // JSON album API parser (SPA hosts whose /a/ page is an empty shell but
+  // expose <origin>/api/albums/<id>): images[] entries carry the DIRECT
+  // original url plus a thumb; kind comes from mime. pageId is the item's
+  // own landing-page id — used to dedup against the same image embedded in
+  // a post at medium quality. Returns {children, lastPage} | null.
+  function parseAlbumApiResponse(text) {
+    try {
+      const j = JSON.parse(String(text || ''));
+      if (!j || !Array.isArray(j.images)) return null;
+      const children = [];
+      for (const im of j.images) {
+        if (!im || typeof im.original_url !== 'string' || !/^https?:\/\//.test(im.original_url)) continue;
+        const mime = String(im.mime || '');
+        const kind = mime.indexOf('video/') === 0 ? 'video' : (mime.indexOf('image/') === 0 ? 'image' : '');
+        if (!kind) continue;
+        children.push({
+          url: im.original_url,
+          kind: kind,
+          thumb: typeof im.thumb_url === 'string' ? im.thumb_url : '',
+          pageId: typeof im.encoded_id === 'string' ? im.encoded_id : ''
+        });
+      }
+      const pag = j.pagination || {};
+      const last = Math.max(1, parseInt(pag.last_page, 10) || 1);
+      return { children: children, lastPage: last };
+    } catch (e) { return null; }
   }
 
   function partitionLinks(hrefList) {
@@ -883,9 +949,11 @@
       // where the resolver streams them direct; same-host /d/ routes are the
       // forum's own and stay on Links
       const restLinks = [];
+      const albums = [];
       for (const u of parts.links) {
         const abs = absolutize(u);
         if (isFileDPageUrl(abs) && extractDomain(abs) !== hostKey(location.host)) videos.push(abs);
+        else if (isAlbumPageUrl(abs) && extractDomain(abs) !== hostKey(location.host)) albums.push(abs);
         else restLinks.push(u);
       }
       const imgSet = new Set(images.filter(Boolean));
@@ -904,6 +972,7 @@
         images: Array.from(new Set(images.filter(Boolean))),
         videos: Array.from(new Set(videos.filter(Boolean))),
         embeds: Array.from(new Set(embeds.filter(Boolean))),
+        albums: albums.length ? Array.from(new Set(albums)) : undefined, // old records: undefined
         imgPages: Object.keys(imgPages).length ? imgPages : undefined // old records: undefined
       };
     }
@@ -1447,8 +1516,39 @@
       cell.className = 'xft-cell';
       cell.dataset.xftUrl = it.url;
       cell.title = '[#' + it.pos + '] ' + (it.r.author || '?') + ' — open';
+      // album tile: the link itself, not a viewer item — click opens the
+      // album page; the count label fills in once expansion lands
+      if (it.kind === 'album') {
+        cell.classList.add('xft-album');
+        const tile = document.createElement('div');
+        tile.className = 'xft-vtile xft-album-tile';
+        const cnt = document.createElement('span');
+        cnt.className = 'xft-album-count';
+        const kids = albumChildren.get(it.url);
+        cnt.textContent = kids && kids.length ? kids.length + ' files' : 'album…';
+        tile.appendChild(cnt);
+        const label = document.createElement('span');
+        label.className = 'xft-cell-label';
+        label.textContent = '#' + it.pos + ' ' + (it.r.author || '?');
+        cell.append(tile, label);
+        const url0 = it.url;
+        cell.addEventListener('click', () => { try { window.open(url0, '_blank'); } catch (e) {} });
+        ensureAlbum(url0, (ch) => {
+          if (ch && ch.length && cell.isConnected) cnt.textContent = ch.length + ' files';
+        });
+        return cell;
+      }
       const isVideo = it.kind === 'video' || it.kind === 'embed';
-      const thumb = buildMediaEl(it.kind, it.url, true, (it.r.imgPages || {})[it.url] || '');
+      // album children with a known thumbnail display it directly — no per-
+      // file page fetch for the tile (the album page already carried it)
+      const thumb = (it.album && it.thumb)
+        ? (() => {
+            const tile = document.createElement('div');
+            tile.className = 'xft-vtile';
+            attachTilePoster(tile, it.thumb);
+            return tile;
+          })()
+        : buildMediaEl(it.kind, it.url, true, (it.r.imgPages || {})[it.url] || '');
       // shimmer while the media loads (cached-complete images come back
       // already ok'd — no flash for them)
       if ((it.kind === 'image' || it.kind === 'embed')
@@ -1469,6 +1569,15 @@
         badge.className = 'xft-cell-badge';
         badge.textContent = '▶';
         cell.appendChild(badge);
+      }
+      // album children carry an A marker so they read as album members, not
+      // direct post media (top-LEFT — the ▶ badge owns top-right)
+      if (it.album) {
+        const ab = document.createElement('span');
+        ab.className = 'xft-cell-badge xft-badge-album';
+        ab.textContent = 'A';
+        ab.title = 'from album';
+        cell.appendChild(ab);
       }
       // resolve the index AT CLICK TIME: retirement waves shift indexes,
       // a fill-time closure would open the wrong item after a removal
@@ -2006,6 +2115,96 @@
           if (hit) finish(hit); else viaPage();
         }, viaPage);
       } else viaPage();
+    }
+
+    // ---------- album expansion (0.18) ----------
+    // /a/<id> album links expand into per-file grid children. Server-rendered
+    // hosts answer the page HTML itself (item grid inline); SPA hosts answer
+    // an empty shell and serve the list from <origin>/api/albums/<id>. One
+    // expansion per album per session (6h GM-storage cache, failures cool
+    // down 60s — never cached as empty). Fetches ride the shared 2-concurrent
+    // /350ms landing-page queue: a thread with dozens of albums must not
+    // burst the host the way the poster queue once did.
+    const ALBUMS_KEY = 'xfThreadTools:albumExpansions';
+    const albumStore = readStore(ALBUMS_KEY, {}) || {};
+    const albumChildren = new Map();  // albumUrl -> children[] (runtime mirror of the store)
+    const albumInflight = new Map();
+    const albumCooldown = new Map();
+    const ALBUM_TTL_MS = 6 * 3600 * 1000;
+    const ALBUM_MAX_PAGES = 10;
+    function saveAlbumStore() {
+      const keys = Object.keys(albumStore);
+      if (keys.length > 40) {
+        keys.sort((a, b) => ((albumStore[a] && albumStore[a].at) || 0) - ((albumStore[b] && albumStore[b].at) || 0));
+        for (const k of keys.slice(0, keys.length - 40)) delete albumStore[k];
+      }
+      writeStore(ALBUMS_KEY, albumStore);
+    }
+    function albumDone(url, children) {
+      if (children && children.length) {
+        albumChildren.set(url, children);
+        albumStore[url] = { children: children, at: Date.now() };
+        saveAlbumStore();
+      } else {
+        albumCooldown.set(url, Date.now() + 60000);
+      }
+      const q = albumInflight.get(url) || [];
+      albumInflight.delete(url);
+      // children arriving changes the grid item list — re-render the media
+      // tab once (signature reset forces it even when counts alone collide)
+      if (panelIsOpen() && panelTab === 'media') { lastPanelSignature = ''; renderPanelBody(); }
+      for (const fn of q) fn(children && children.length ? children : null);
+    }
+    function fetchAlbumApiPage(url, page, onOk, onErr) {
+      let origin = '';
+      let id = '';
+      try {
+        const u = new URL(url);
+        origin = u.origin;
+        id = u.pathname.split('/').pop() || '';
+      } catch (e) { onErr(); return; }
+      if (!id) { onErr(); return; }
+      imgPageGet(origin + '/api/albums/' + encodeURIComponent(id) + '?per_page=100&page=' + page, onOk, onErr);
+    }
+    function expandAlbum(url) {
+      // HTML first: server-rendered hosts answer the full item grid in the
+      // page (one request, children + thumbs together). An SPA shell (no
+      // item grid) or a fetch error falls through to the JSON album API.
+      imgPageGet(url, (text) => {
+        const kids = parseAlbumPage(text, url);
+        if (kids.length) { albumDone(url, kids); return; }
+        const acc = [];
+        const seen = new Set();
+        const step = (page) => {
+          if (page > ALBUM_MAX_PAGES) { albumDone(url, acc); return; }
+          fetchAlbumApiPage(url, page, (t) => {
+            const p = parseAlbumApiResponse(t);
+            if (p) for (const c of p.children) { if (!seen.has(c.url)) { seen.add(c.url); acc.push(c); } }
+            if (p && page < p.lastPage) step(page + 1);
+            else albumDone(url, acc);
+          }, () => albumDone(url, acc));
+        };
+        step(1);
+      }, () => {
+        // page GET failed outright — still try the API before giving up
+        fetchAlbumApiPage(url, 1, (t) => {
+          const p = parseAlbumApiResponse(t);
+          albumDone(url, p ? p.children : null);
+        }, () => albumDone(url, null));
+      });
+    }
+    function ensureAlbum(url, cb) {
+      if (albumChildren.has(url)) { cb(albumChildren.get(url)); return; }
+      const st = albumStore[url];
+      if (st && Array.isArray(st.children) && st.children.length && Date.now() - (st.at || 0) < ALBUM_TTL_MS) {
+        albumChildren.set(url, st.children);
+        cb(st.children);
+        return;
+      }
+      if (Date.now() < (albumCooldown.get(url) || 0)) { cb(null); return; }
+      if (albumInflight.has(url)) { albumInflight.get(url).push(cb); return; }
+      albumInflight.set(url, [cb]);
+      expandAlbum(url);
     }
     let settingsView = null;
     let panelTab = 'files';
@@ -3487,10 +3686,46 @@
         push(r.images, 'image');
         push(r.videos, 'video');
         push(r.embeds, 'embed');
+        // album links surface as their own tile (All tab); children join the
+        // grid as normal items tagged with their album once expanded
+        for (const a of (r.albums || [])) {
+          if (keep(a)) all.push({ r: r, url: String(a || ''), pos: d.posMap.get(r.postId) || 0, kind: 'album', ord: raw });
+          raw++;
+        }
+      }
+      // expanded album children — appended AFTER the direct pass so a child
+      // can be deduped against a direct link from ANY record, not just
+      // earlier ones. Children carry the album's record (group + jump work)
+      // and the album marker for the badge.
+      const directUrls = new Set();
+      const pageIds = new Set(); // item-page ids of embedded images (/img/<id> wrappers)
+      for (const r of d.orderedShown) {
+        for (const url of (r.images || []).concat(r.videos || []).concat(r.embeds || [])) directUrls.add(String(url || ''));
+        for (const p of Object.values(r.imgPages || {})) {
+          const m = String(p || '').match(/\/([A-Za-z0-9_-]{3,64})$/);
+          if (m) pageIds.add(m[1]);
+        }
+      }
+      const childSeen = new Set();
+      for (const r of d.orderedShown) {
+        for (const a of (r.albums || [])) {
+          const kids = albumChildren.get(a);
+          if (!kids) continue;
+          for (const c of kids) {
+            if (!c || !keep(c.url) || directUrls.has(c.url) || childSeen.has(c.url)) continue;
+            // an embedded medium copy of the same image already holds this
+            // slot (its landing page id matches the child's pageId) — the
+            // existing item's HQ chain upgrades it to the original
+            if (c.pageId && pageIds.has(c.pageId)) continue;
+            childSeen.add(c.url);
+            all.push({ r: r, url: String(c.url || ''), pos: d.posMap.get(r.postId) || 0, kind: c.kind === 'video' ? 'video' : 'image', album: String(a || ''), thumb: c.thumb || '', ord: raw });
+            raw++;
+          }
+        }
       }
       // embeds are videos hosted elsewhere — they count under the Video tab
       const mediaCounts = { all: all.length, image: 0, video: 0 };
-      for (const it of all) mediaCounts[it.kind === 'embed' ? 'video' : it.kind] += 1;
+      for (const it of all) { if (it.kind === 'album') continue; mediaCounts[it.kind === 'embed' ? 'video' : it.kind] += 1; }
       const items = panelSubTab === 'all' ? all : all.filter((it) => it.kind === panelSubTab || (panelSubTab === 'video' && it.kind === 'embed'));
       return { all: all, items: items, mediaCounts: mediaCounts };
     }
@@ -3508,7 +3743,9 @@
         mediaCounts = m.mediaCounts;
         updateSubTabCounts(mediaCounts);
         items = m.items;
-        viewerItems = items.map((it) => ({ kind: it.kind, url: it.url, postId: it.r.postId, pos: it.pos, author: it.r.author, page: (it.r.imgPages || {})[it.url] || '' }));
+        // album tiles open the host page in a tab, not the viewer — the
+        // viewer walks media only; children are ordinary viewer items
+        viewerItems = items.filter((it) => it.kind !== 'album').map((it) => ({ kind: it.kind, url: it.url, postId: it.r.postId, pos: it.pos, author: it.r.author, page: (it.r.imgPages || {})[it.url] || '', album: it.album || '', thumb: it.thumb || '' }));
       } else {
         for (const r of pd.orderedShown) {
           for (const url of r.links) if (!boiler.has(url)) items.push({ r: r, url: url, pos: pd.posMap.get(r.postId) || 0, kind: 'link' });
@@ -4705,6 +4942,9 @@
         '.xft-cell-label{position:absolute;left:0;right:0;bottom:0;background:linear-gradient(transparent,hsl(240 10% 3.9%/.82));color:hsl(0 0% 98%);font-size:10px;padding:12px 5px 4px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;pointer-events:none}',
         // shadcn Badge (secondary) for the ▶ marker
         '.xft-cell-badge{position:absolute;top:4px;right:4px;background:hsl(240 10% 3.9%/.72);color:hsl(0 0% 98%);border-radius:9999px;font-size:10px;font-weight:500;padding:1px 7px;pointer-events:none}',
+        '.xft-badge-album{top:4px;left:4px;right:auto;background:hsl(var(--xft-ring)/.55)}',
+        '.xft-album-tile{flex-direction:column;gap:2px}',
+        '.xft-album-count{font-size:11px;font-weight:600;color:hsl(var(--xft-muted-fg));background:hsl(var(--xft-muted));border-radius:9999px;padding:2px 10px}',
         '.xft-broken{opacity:.15;filter:grayscale(1)}',
         // stalled: origin is burst-failing — the slot is HELD while a
         // background ladder rechecks; visually distinct from shimmer
@@ -5390,5 +5630,5 @@
   }
 
   // UMD export of the pure functions for node:test (no DOM / GM usage in them).
-  if (typeof module !== 'undefined' && module.exports) module.exports = { parseReactionCount, filterLinks, sortPosts, estimateSize, partitionLinks, extractDomain, groupLinkItems, applyLinkFilters, boilerplateUrls, isSmilieUrl, parseEmbedPoster, embedSignUrl, parseSignResponse, parseSignToken, parseVideoPage, isVideoPageUrl, isFileDPageUrl, embedViewApiUrl, parseViewApiResponse, hqCandidates, sanitizeFileSeg, siteTagFromHost, cleanThreadTitle, zipKindTag, zipFileName, imagePageHref, parseImagePage, parseImageApiResponse, dlBasename, buildDlJobs, dlChunkPlan, dlFailClass, crc32, zipStoreU8, layoutMetrics, windowRange, originBurstingFromHist, hostKey, dosDateTime, fmtSpeed, fmtEta, buildMediaLayout, htmlToText, buildAiTranscript, aiMessages, aiEndpoint, aiOllamaOrigin, aiNativeChatUrl, aiContextStats, aiNumCtx, aiTranscriptBudget, aiQueryTerms, aiScorePost, aiSearchPosts, parseAiModels, parseAiReply, mdInlineTokens, mdParse, aiSseParser };
+  if (typeof module !== 'undefined' && module.exports) module.exports = { parseReactionCount, filterLinks, sortPosts, estimateSize, partitionLinks, extractDomain, groupLinkItems, applyLinkFilters, boilerplateUrls, isSmilieUrl, parseEmbedPoster, embedSignUrl, parseSignResponse, parseSignToken, parseVideoPage, isVideoPageUrl, isFileDPageUrl, embedViewApiUrl, parseViewApiResponse, isAlbumPageUrl, parseAlbumPage, parseAlbumApiResponse, hqCandidates, sanitizeFileSeg, siteTagFromHost, cleanThreadTitle, zipKindTag, zipFileName, imagePageHref, parseImagePage, parseImageApiResponse, dlBasename, buildDlJobs, dlChunkPlan, dlFailClass, crc32, zipStoreU8, layoutMetrics, windowRange, originBurstingFromHist, hostKey, dosDateTime, fmtSpeed, fmtEta, buildMediaLayout, htmlToText, buildAiTranscript, aiMessages, aiEndpoint, aiOllamaOrigin, aiNativeChatUrl, aiContextStats, aiNumCtx, aiTranscriptBudget, aiQueryTerms, aiScorePost, aiSearchPosts, parseAiModels, parseAiReply, mdInlineTokens, mdParse, aiSseParser };
 })();

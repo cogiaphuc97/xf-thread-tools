@@ -8,7 +8,7 @@ import path from 'node:path';
 
 const require = createRequire(import.meta.url);
 const userJsPath = path.join(path.dirname(fileURLToPath(import.meta.url)), '..', 'xf-thread-tools.user.js');
-const { parseReactionCount, filterLinks, sortPosts, estimateSize, partitionLinks, extractDomain, groupLinkItems, applyLinkFilters, boilerplateUrls, isSmilieUrl, parseEmbedPoster, embedSignUrl, parseSignResponse, parseSignToken, parseVideoPage, isVideoPageUrl, isFileDPageUrl, embedViewApiUrl, parseViewApiResponse, hqCandidates, imagePageHref, parseImagePage, parseImageApiResponse, sanitizeFileSeg, siteTagFromHost, cleanThreadTitle, zipKindTag, zipFileName, dlBasename, buildDlJobs, dlChunkPlan, dlFailClass, crc32, zipStoreU8, layoutMetrics, windowRange, originBurstingFromHist } = require(userJsPath);
+const { parseReactionCount, filterLinks, sortPosts, estimateSize, partitionLinks, extractDomain, groupLinkItems, applyLinkFilters, boilerplateUrls, isSmilieUrl, parseEmbedPoster, embedSignUrl, parseSignResponse, parseSignToken, parseVideoPage, isVideoPageUrl, isFileDPageUrl, embedViewApiUrl, parseViewApiResponse, isAlbumPageUrl, parseAlbumPage, parseAlbumApiResponse, hqCandidates, imagePageHref, parseImagePage, parseImageApiResponse, sanitizeFileSeg, siteTagFromHost, cleanThreadTitle, zipKindTag, zipFileName, dlBasename, buildDlJobs, dlChunkPlan, dlFailClass, crc32, zipStoreU8, layoutMetrics, windowRange, originBurstingFromHist } = require(userJsPath);
 
 test('UMD export exposes the four pure functions', () => {
   assert.equal(typeof parseReactionCount, 'function');
@@ -683,4 +683,78 @@ test('zipFileName: kind suffix, mixed stays clean, no-title fallback', () => {
   assert.equal(zipFileName('Xamvn', 'Tựa đề', 'Videos'), '[Xamvn] Tựa đề (Videos).zip');
   assert.equal(zipFileName('Xamvn', 'Tựa đề', ''), '[Xamvn] Tựa đề.zip');
   assert.equal(zipFileName('', '', 'Videos'), 'thread (Videos).zip');
+});
+
+// ---- album expansion (0.18) ----
+test('isAlbumPageUrl: /a/<id> shapes', () => {
+  assert.equal(isAlbumPageUrl('https://bunkr.cr/a/EAednZ0S'), true);
+  assert.equal(isAlbumPageUrl('https://goonbox.cr/a/YDo0O5'), true);
+  assert.equal(isAlbumPageUrl('https://x.invalid/a/abc-123_xyz'), true);
+  assert.equal(isAlbumPageUrl('https://x.invalid/a/ab'), false);           // id < 3
+  assert.equal(isAlbumPageUrl('https://x.invalid/a/a.mp4'), false);        // extension = file
+  assert.equal(isAlbumPageUrl('https://x.invalid/a/one/two'), false);      // nested path
+  assert.equal(isAlbumPageUrl('https://x.invalid/f/something'), false);
+  assert.equal(isAlbumPageUrl('/a/EAednZ0S'), false);                      // not absolute
+  assert.equal(isAlbumPageUrl('javascript:alert(1)'), false);
+});
+
+test('parseAlbumPage: bunkr-shaped item grid -> children', () => {
+  const html = [
+    '<html><body><div id="galleryGrid">',
+    '<div class="relative group/item theItem" title="clip01.mp4">',
+    '  <img class="grid-images_box-img" src="https://static.scdn.st/u1/thumbs/clip01.png">',
+    '  <a class="after:absolute" href="/f/SLUGONE" aria-label="download"></a>',
+    '</div>',
+    '<div class="relative group/item theItem" title="photo &amp; 02.jpg">',
+    '  <img class="grid-images_box-img" src="https://static.scdn.st/u1/thumbs/photo02.png">',
+    '  <a class="after:absolute" href="/f/SLUGTWO" aria-label="download"></a>',
+    '</div>',
+    '<div class="relative group/item theItem" title="archive.zip">',
+    '  <img class="grid-images_box-img" src="https://static.scdn.st/u1/thumbs/archive.png">',
+    '  <a class="after:absolute" href="/f/SLUGTHREE" aria-label="download"></a>',
+    '</div>',
+    '</div></body></html>'
+  ].join('');
+  const kids = parseAlbumPage(html, 'https://host.invalid/a/alb1');
+  assert.equal(kids.length, 2); // zip skipped — not playable media
+  assert.deepEqual(kids[0], { url: 'https://host.invalid/f/SLUGONE', kind: 'video', thumb: 'https://static.scdn.st/u1/thumbs/clip01.png' });
+  assert.equal(kids[1].kind, 'image');
+  assert.equal(kids[1].url, 'https://host.invalid/f/SLUGTWO');
+});
+
+test('parseAlbumPage: empty shell / non-album html -> []', () => {
+  assert.deepEqual(parseAlbumPage('', 'https://host.invalid/a/x'), []);
+  assert.deepEqual(parseAlbumPage('<!doctype html><div id="app"></div>', 'https://host.invalid/a/x'), []);
+});
+
+test('parseAlbumApiResponse: goonbox shape -> children + pagination', () => {
+  const j = JSON.stringify({
+    album: { encoded_id: 'YDo0O5', images_count: 2 },
+    images: [
+      { encoded_id: 'i1', mime: 'image/jpeg', original_url: 'https://cdn.invalid/imgheaven/a.jpg', thumb_url: 'https://cdn.invalid/th/a.jpg' },
+      { encoded_id: 'i2', mime: 'image/webp', original_url: 'https://cdn.invalid/imgheaven/b.webp', thumb_url: '' },
+      { encoded_id: 'i3', mime: 'application/zip', original_url: 'https://cdn.invalid/x.zip', thumb_url: '' },
+      { encoded_id: 'i4', mime: 'video/mp4', original_url: 'https://cdn.invalid/v.mp4', thumb_url: 'https://cdn.invalid/th/v.png' }
+    ],
+    pagination: { current_page: 1, last_page: 3, per_page: 100, total: 250 }
+  });
+  const p = parseAlbumApiResponse(j);
+  assert.equal(p.lastPage, 3);
+  assert.equal(p.children.length, 3); // zip entry skipped
+  assert.deepEqual(p.children[0], { url: 'https://cdn.invalid/imgheaven/a.jpg', kind: 'image', thumb: 'https://cdn.invalid/th/a.jpg', pageId: 'i1' });
+  assert.equal(p.children[2].kind, 'video');
+  assert.equal(p.children[2].pageId, 'i4');
+  // garbage
+  assert.equal(parseAlbumApiResponse('<html>not json</html>'), null);
+  assert.equal(parseAlbumApiResponse('{"images": null}'), null);
+});
+
+test('buildDlJobs skips album tiles', () => {
+  const items = [
+    { kind: 'album', url: 'https://host.invalid/a/alb1' },
+    { kind: 'image', url: 'https://cdn.invalid/x.jpg' }
+  ];
+  const jobs = buildDlJobs(items).jobs;
+  assert.equal(jobs.length, 1);
+  assert.ok(jobs[0].cands[0].includes('x.jpg'));
 });
