@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         xf-thread-tools
 // @namespace    xf-thread-tools
-// @version      0.14.0
+// @version      0.15.0
 // @description  XenForo 2: sort thread posts by reaction count across all pages (cached) + floating media panel (images / external links).
 // @author       xf-thread-tools
 // @match        *://*/threads/*
@@ -45,7 +45,8 @@
     aiProvider: 'ollama',        // AI tab provider preset (Ollama-only phase; engine stays provider-generic)
     aiBase: '',                  // '' = provider preset base URL
     aiModel: '',                 // selected chat model id
-    aiLang: 'en'                 // default-prompt language: en | vi
+    aiLang: 'en',                // default-prompt language: en | vi
+    aiCtxTokens: 0               // context window for chat: 0 = auto (min(model,16k))
   };
   const BASE_SEL = {
     post: 'article.message--post[data-content^="post-"]',
@@ -3544,10 +3545,12 @@
       let chars = 0;
       for (const r of recs) chars += String(r.bodyHtml || '').length;
       const m = settings.aiModel || 'no model';
-      const st = aiContextStats(chars, aiChat.ctxLens[settings.aiModel]);
+      const numCtx = aiNumCtx(settings.aiCtxTokens, aiChat.ctxLens[settings.aiModel]);
+      const sent = Math.min(chars, aiTranscriptBudget(numCtx));
+      const st = aiContextStats(sent, numCtx);
       const usage = st ? ' · ~' + st.pct + '% of ' + st.ctx + ' ctx' : '';
       return recs.length
-        ? 'context: ' + recs.length + ' posts · ~' + (Math.round(chars / 100) / 10) + 'k chars' + usage + ' · ' + m
+        ? 'context: ' + recs.length + ' posts · sending ~' + (Math.round(sent / 100) / 10) + 'k of ~' + (Math.round(chars / 100) / 10) + 'k chars' + usage + ' · ' + m
         : 'no posts cached yet · ' + m;
     }
     // one request shape for chat + model list; GM XHR (CORS-free — required
@@ -3646,15 +3649,18 @@
       const native = settings.aiProvider === 'ollama';
       const pmode = native ? 'ollama' : 'openai';
       const posts = orderedRecords().map((r) => ({ author: r.author, pageN: r.pageN, reactionCount: r.reactionCount, text: htmlToText(r.bodyHtml) }));
-      const msgs = aiMessages(buildAiTranscript(posts), question, aiChat.msgs.slice(0, -1), settings.aiLang);
+      const numCtx = aiNumCtx(settings.aiCtxTokens, aiChat.ctxLens[settings.aiModel]);
+      const msgs = aiMessages(
+        buildAiTranscript(posts, { budget: aiTranscriptBudget(numCtx) }),
+        question, aiChat.msgs.slice(0, -1), settings.aiLang);
       // Ollama native /api/chat carries think:false (instant answers — the
       // OpenAI-compat /v1 endpoint ignores the field and thinking models burn
-      // the whole budget on hidden reasoning first). num_ctx raises the usable
-      // window so the 24k-char transcript doesn't overflow Ollama's 4096
-      // default (capped at 16k — KV cache costs VRAM).
-      const ctxLen = aiChat.ctxLens[settings.aiModel];
+      // the whole budget on hidden reasoning first). num_ctx opens the usable
+      // window (auto = model max capped at 16k; the Context setting overrides)
+      // — without it Ollama silently runs 4096 and truncates the transcript
+      // from the front.
       const body = native
-        ? { model: settings.aiModel, messages: msgs, stream: true, think: false, options: { num_ctx: Math.min(ctxLen || 8192, 16384) } }
+        ? { model: settings.aiModel, messages: msgs, stream: true, think: false, options: { num_ctx: numCtx } }
         : { model: settings.aiModel, messages: msgs, stream: true };
       const sse = aiSseParser(pmode);
       let acc = '';
@@ -3870,6 +3876,23 @@
         renderAiTab(true); // relabels the quick prompts (input draft is stashed+restored)
       });
       langRow.appendChild(langSel);
+      const ctxRowCfg = mkRow('Context');
+      const ctxSel = document.createElement('select');
+      ctxSel.className = 'xft-gsel';
+      ctxSel.style.flex = '1';
+      for (const c of [[0, 'Auto'], [8192, '8k'], [16384, '16k'], [32768, '32k'], [65536, '64k'], [131072, '128k']]) {
+        const o = document.createElement('option');
+        o.value = String(c[0]);
+        o.textContent = c[1];
+        ctxSel.appendChild(o);
+      }
+      ctxSel.value = String(settings.aiCtxTokens > 0 ? settings.aiCtxTokens | 0 : 0);
+      ctxSel.addEventListener('change', () => {
+        settings.aiCtxTokens = parseInt(ctxSel.value, 10) || 0;
+        saveSettings();
+        if (aiCtxEl) aiCtxEl.textContent = aiCtxText(); // bigger window = bigger slice, no rebuild needed
+      });
+      ctxRowCfg.appendChild(ctxSel);
       if (aiChat.testMsg) {
         const st = document.createElement('div');
         st.className = 'xft-ai-testmsg' + (/^✗/.test(aiChat.testMsg) ? ' xft-ai-testbad' : '');
@@ -4751,10 +4774,15 @@
   }
   // Thread transcript for the model: one line per cached post, ordered
   // page/seq, #N = position (same numbers the sorted view shows).
+  // Over budget (big threads dwarf any window): keep the opener + top
+  // keepTop reacted posts (the thread's substance), then fill head→tail
+  // with the remaining budget. Output stays chronological; each dropped
+  // run gets one `… [N posts omitted] …` marker.
   function buildAiTranscript(posts, opts) {
     const o = opts || {};
     const perPost = o.perPost > 0 ? o.perPost | 0 : 700;
     const budget = o.budget > 0 ? o.budget | 0 : 24000;
+    const keepTop = o.keepTop === undefined ? 25 : (o.keepTop | 0);
     if (!Array.isArray(posts) || !posts.length) return '';
     const lines = [];
     for (let i = 0; i < posts.length; i++) {
@@ -4768,16 +4796,46 @@
       const rc = p.reactionCount > 0 ? ', ♥' + p.reactionCount : '';
       lines.push('[#' + (i + 1) + '] ' + (p.author || '?') + ' (p' + (p.pageN || 1) + rc + '): ' + t);
     }
-    const all = lines.join('\n');
-    if (all.length <= budget) return all;
-    // over budget: keep head + tail (60/40), count the omitted middle posts
-    const head = Math.floor(budget * 0.6);
-    const tail = Math.max(0, budget - head);
-    let acc = 0, hi = 0;
-    while (hi < lines.length && acc + lines[hi].length + 1 <= head) { acc += lines[hi].length + 1; hi++; }
-    let acc2 = 0, lo = lines.length;
-    while (lo > hi && acc2 + lines[lo - 1].length + 1 <= tail) { lo--; acc2 += lines[lo].length + 1; }
-    return lines.slice(0, hi).join('\n') + '\n… [middle truncated, ' + (lo - hi) + ' posts omitted] …\n' + lines.slice(lo).join('\n');
+    const len = (i) => lines[i].length + 1;
+    const total = lines.reduce((a, l) => a + l.length + 1, 0);
+    if (total <= budget) return lines.join('\n');
+    // survivors: opener + top-reacted (highest reactions first, earliest
+    // breaks ties), skipping picks that don't fit
+    const MARK = 30; // per-gap marker allowance
+    const picks = [0].concat(
+      posts.map((p, i) => ({ i: i, r: (p && p.reactionCount) > 0 ? p.reactionCount | 0 : 0 }))
+        .filter((x) => x.r > 0 && x.i > 0)
+        .sort((a, b) => (b.r - a.r) || (a.i - b.i))
+        .slice(0, Math.max(0, keepTop))
+        .map((x) => x.i)
+    ).filter((v, idx, arr) => arr.indexOf(v) === idx);
+    const inc = new Set();
+    let used = MARK;
+    for (const i of picks) {
+      if (used + len(i) > budget) continue;
+      inc.add(i);
+      used += len(i);
+    }
+    // head then tail fill (head gets 60% of what's left)
+    const room = Math.max(0, budget - used);
+    const headRoom = Math.floor(room * 0.6);
+    let a = 0;
+    let acc = 0;
+    while (a < lines.length && !inc.has(a) && acc + len(a) <= headRoom) { inc.add(a); acc += len(a); a++; }
+    let b = lines.length - 1;
+    let acc2 = 0;
+    while (b > a && !inc.has(b) && acc2 + len(b) <= room - acc) { inc.add(b); acc2 += len(b); b--; }
+    // chronological output; one marker per dropped run
+    let out = '';
+    let run = 0;
+    for (let i = 0; i < lines.length; i++) {
+      if (inc.has(i)) {
+        if (run) { out += '… [' + run + ' posts omitted] …\n'; run = 0; }
+        out += lines[i] + '\n';
+      } else run++;
+    }
+    if (run) out += '… [' + run + ' posts omitted] …\n';
+    return out.replace(/\n$/, '');
   }
   // system prompt per language — same contract in both (untrusted-data
   // fence, #N references, no guessing); 'en' is the fallback
@@ -4857,6 +4915,21 @@
     const pct = Math.min(999, Math.round((est / ctxLen) * 100));
     const k = ctxLen >= 1024 ? Math.round(ctxLen / 1024) + 'k' : String(ctxLen);
     return { est: est, pct: pct, ctx: k };
+  }
+  // Effective num_ctx for a send: explicit setting wins, else auto = the
+  // model's window capped at 16k (KV-cache VRAM safety). Never above the
+  // model's real window when known.
+  function aiNumCtx(settingTokens, modelLen) {
+    const s = settingTokens > 0 ? settingTokens | 0 : 0;
+    const auto = Math.min(modelLen > 0 ? modelLen | 0 : 8192, 16384);
+    const n = s > 0 ? s : auto;
+    return modelLen > 0 ? Math.min(n, modelLen | 0) : n;
+  }
+  // Transcript char budget from the window: reserve ~3k tokens for the
+  // system prompt + fence + the answer itself, ~3 chars/token for mixed
+  // VN/EN text (rough — the % line reports the estimate honestly).
+  function aiTranscriptBudget(numCtx) {
+    return Math.max(12000, ((numCtx | 0) - 3072) * 3);
   }
   // Model lists: OpenAI {data:[{id}]} and Ollama-native {models:[{name}]} both accepted.
   function parseAiModels(json) {
@@ -5014,5 +5087,5 @@
   }
 
   // UMD export of the pure functions for node:test (no DOM / GM usage in them).
-  if (typeof module !== 'undefined' && module.exports) module.exports = { parseReactionCount, filterLinks, sortPosts, estimateSize, partitionLinks, extractDomain, groupLinkItems, applyLinkFilters, boilerplateUrls, isSmilieUrl, parseEmbedPoster, embedSignUrl, parseSignResponse, parseSignToken, parseVideoPage, isVideoPageUrl, hqCandidates, sanitizeFileSeg, siteTagFromHost, cleanThreadTitle, zipKindTag, zipFileName, imagePageHref, parseImagePage, parseImageApiResponse, dlBasename, buildDlJobs, dlChunkPlan, dlFailClass, crc32, zipStoreU8, layoutMetrics, windowRange, originBurstingFromHist, hostKey, dosDateTime, fmtSpeed, fmtEta, buildMediaLayout, htmlToText, buildAiTranscript, aiMessages, aiEndpoint, aiOllamaOrigin, aiNativeChatUrl, aiContextStats, parseAiModels, parseAiReply, mdInlineTokens, mdParse, aiSseParser };
+  if (typeof module !== 'undefined' && module.exports) module.exports = { parseReactionCount, filterLinks, sortPosts, estimateSize, partitionLinks, extractDomain, groupLinkItems, applyLinkFilters, boilerplateUrls, isSmilieUrl, parseEmbedPoster, embedSignUrl, parseSignResponse, parseSignToken, parseVideoPage, isVideoPageUrl, hqCandidates, sanitizeFileSeg, siteTagFromHost, cleanThreadTitle, zipKindTag, zipFileName, imagePageHref, parseImagePage, parseImageApiResponse, dlBasename, buildDlJobs, dlChunkPlan, dlFailClass, crc32, zipStoreU8, layoutMetrics, windowRange, originBurstingFromHist, hostKey, dosDateTime, fmtSpeed, fmtEta, buildMediaLayout, htmlToText, buildAiTranscript, aiMessages, aiEndpoint, aiOllamaOrigin, aiNativeChatUrl, aiContextStats, aiNumCtx, aiTranscriptBudget, parseAiModels, parseAiReply, mdInlineTokens, mdParse, aiSseParser };
 })();
