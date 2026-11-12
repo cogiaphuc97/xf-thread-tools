@@ -8,7 +8,7 @@ import path from 'node:path';
 
 const require = createRequire(import.meta.url);
 const userJsPath = path.join(path.dirname(fileURLToPath(import.meta.url)), '..', 'xf-thread-tools.user.js');
-const { htmlToText, buildAiTranscript, aiMessages, aiEndpoint, parseAiModels, parseAiReply, mdInlineTokens, mdParse, aiSseParser } = require(userJsPath);
+const { htmlToText, buildAiTranscript, aiMessages, aiEndpoint, aiOllamaOrigin, aiNativeChatUrl, aiContextStats, aiNumCtx, aiTranscriptBudget, aiQueryTerms, aiScorePost, aiSearchPosts, parseAiModels, parseAiReply, mdInlineTokens, mdParse, aiSseParser } = require(userJsPath);
 
 // ---- htmlToText ----
 test('htmlToText: tags stripped, block tags become newlines, whitespace collapsed', () => {
@@ -40,24 +40,38 @@ test('buildAiTranscript: per-post truncation adds ellipsis; empty input -> empty
   assert.equal(buildAiTranscript([], {}), '');
   assert.equal(buildAiTranscript(null, {}), '');
 });
-test('buildAiTranscript: over budget keeps head+tail with omitted-post count', () => {
-  // 10 posts x ~214-char lines, budget 1000: head ~3 posts, tail ~1 post, middle omitted
+test('buildAiTranscript: over budget keeps opener+head+tail with omitted-run counts', () => {
+  // 10 posts x ~214-char lines, budget 1000: opener + head ~3 posts, tail ~1 post, middle omitted
   const posts = Array.from({ length: 10 }, (_, i) => ({ author: 'u' + i, pageN: 1, reactionCount: 0, text: ('body ' + i + ' ').repeat(30) }));
   const out = buildAiTranscript(posts, { budget: 1000 });
-  assert.match(out, /\[middle truncated, \d+ posts omitted\]/);
-  assert.ok(out.startsWith('[#1] u0'), 'keeps the head');
+  assert.match(out, /\[\d+ posts omitted\]/);
+  assert.ok(out.startsWith('[#1] u0'), 'keeps the opener/head');
   assert.ok(out.indexOf('[#10] u9') > 0, 'keeps the tail');
-  const omitted = parseInt(/\[middle truncated, (\d+) posts omitted\]/.exec(out)[1], 10);
-  assert.ok(omitted > 0 && omitted < 10);
-  // head + tail must not overlap: every post appears at most once
+  const omitted = out.split('\n').filter((l) => /^\[\d+ posts omitted\]/.test(l.replace(/^… /, ''))).length;
+  assert.ok(omitted >= 1, 'at least one omitted-run marker');
+  // every post appears at most once
   for (let i = 1; i <= 10; i++) {
     const c = out.split('[#' + i + ']').length - 1;
     assert.ok(c <= 1, 'post #' + i + ' appears at most once');
   }
+  // omitted counts must account for exactly the missing posts
+  const kept = [1, 10].filter((i) => out.indexOf('[#' + i + ']') >= 0).length;
+  const totalOmitted = (out.match(/\[(\d+) posts omitted\]/g) || []).reduce((a, m) => a + parseInt(m.match(/\d+/)[0], 10), 0);
+  assert.equal(totalOmitted, 10 - (out.match(/\[#\d+\]/g) || []).length);
   // small budgets must still keep a tail when any room exists
   const twoFit = buildAiTranscript(posts, { budget: 700 });
-  assert.match(twoFit, /\[middle truncated, \d+ posts omitted\]/);
+  assert.match(twoFit, /\[\d+ posts omitted\]/);
   assert.ok(twoFit.indexOf('[#10] u9') > 0, 'tail survives a tight budget');
+});
+test('buildAiTranscript: top-reacted middle posts survive the budget; opener always kept', () => {
+  // 20 posts x ~120-char lines; budget fits ~5 lines; #10 is the star post
+  const posts = Array.from({ length: 20 }, (_, i) => ({ author: 'u' + i, pageN: 1, reactionCount: i === 9 ? 999 : 0, text: ('body ' + i + ' ').repeat(15) }));
+  const out = buildAiTranscript(posts, { budget: 700, keepTop: 5 });
+  assert.ok(out.indexOf('[#1] u0') >= 0, 'opener always included');
+  assert.ok(out.indexOf('[#10] u9') >= 0, 'top-reacted middle post kept');
+  assert.ok(out.indexOf('[#11] u10') < 0, 'neighbor without reactions dropped');
+  // output stays chronological: #10 comes after #1
+  assert.ok(out.indexOf('[#10] u9') > out.indexOf('[#1] u0'));
 });
 test('buildAiTranscript: under budget returns everything verbatim', () => {
   const posts = [{ author: 'a', pageN: 1, reactionCount: 0, text: 'tiny' }];
@@ -235,4 +249,154 @@ test('aiMessages: Vietnamese system prompt + fence note; unknown lang falls back
   assert.match(fb[0].content, /UNTRUSTED/); // fallback
   const en = aiMessages('X', 'q', []);
   assert.match(en[0].content, /UNTRUSTED/); // default unchanged
+});
+
+test('aiMessages: direct-answer-first rule present in both languages', () => {
+  assert.match(aiMessages('', 'q', [], 'en')[0].content, /direct answer FIRST/);
+  assert.match(aiMessages('', 'q', [], 'vi')[0].content, /câu trả lời trực tiếp TRƯỚC/);
+});
+
+// ---- Ollama native wire (0.13.0): no-think chat ----
+test('aiNativeChatUrl: strips trailing /v1, appends /api/chat', () => {
+  assert.equal(aiNativeChatUrl('http://localhost:11434/v1'), 'http://localhost:11434/api/chat');
+  assert.equal(aiNativeChatUrl('http://127.0.0.1:9912/v1/'), 'http://127.0.0.1:9912/api/chat');
+  assert.equal(aiNativeChatUrl('http://localhost:11434'), 'http://localhost:11434/api/chat');
+  assert.equal(aiNativeChatUrl('https://x.test/foo/v1'), 'https://x.test/foo/api/chat');
+  assert.equal(aiNativeChatUrl(''), '/api/chat');
+});
+
+test('aiSseParser(ollama): NDJSON lines, done flag, thinking ignored, data: tolerated', () => {
+  const p = aiSseParser('ollama');
+  assert.deepEqual(p.push('{"message":{"role":"assistant","content":""}}\n'), []); // role-only first line
+  assert.deepEqual(p.push('{"message":{"content":"Hel"}}\n'), ['Hel']);
+  assert.deepEqual(p.push('{"message":{"content":"lo","thinking":"secret chain"}}\n'), ['lo']); // thinking never leaks
+  assert.equal(p.isDone(), false);
+  assert.deepEqual(p.push('data: {"message":{"content":"!"}}\n'), ['!']); // data: prefix tolerated
+  assert.deepEqual(p.push('{"done":true,"done_reason":"stop"}\n'), []);
+  assert.equal(p.isDone(), true);
+  assert.deepEqual(p.push('not json\n'), []);
+});
+
+test('aiSseParser(ollama): chunks may split anywhere, including mid-JSON', () => {
+  const full = '{"message":{"content":"abc"}}\n{"message":{"content":"def"}}\n{"done":true}\n';
+  const p = aiSseParser('ollama');
+  const out = [];
+  for (let i = 0; i < full.length; i++) out.push(...p.push(full.slice(i, i + 1)));
+  assert.deepEqual(out, ['abc', 'def']);
+  assert.equal(p.isDone(), true);
+});
+
+test('aiSseParser: default mode unchanged (openai SSE)', () => {
+  const p = aiSseParser();
+  assert.deepEqual(p.push('data: {"choices":[{"delta":{"content":"x"}}]}\n'), ['x']);
+  assert.deepEqual(p.push('{"message":{"content":"native junk"}}\n'), []); // NOT native mode
+});
+
+test('parseAiReply: Ollama native {message:{content}} accepted; native error surfaces', () => {
+  assert.deepEqual(parseAiReply({ message: { role: 'assistant', content: ' the answer  ' } }), { text: 'the answer' });
+  assert.deepEqual(parseAiReply('{"message":{"content":"from string"}}'), { text: 'from string' });
+  assert.deepEqual(parseAiReply({ message: { content: '   ' } }), { error: 'empty response' });
+  assert.deepEqual(parseAiReply({ error: 'model "x" not found' }), { error: 'model "x" not found' });
+});
+
+// ---- 0.14.0: numbered-list repair, citation rule, context percent ----
+test('mdParse: bold-numbered items (every marker "1.") group into ONE ol and renumber', () => {
+  const src = '**1. #1 alice [p1, ♥1]:** first\n\n**1. #10 bob [p2]:** second point\n\n**1.** third\n';
+  const b = mdParse(src);
+  assert.equal(b.length, 1);
+  assert.equal(b[0].t, 'ol');
+  assert.equal(b[0].items.length, 3);
+  assert.equal(b[0].items[0][0].s, '#1 alice [p1, ♥1]: first'); // marker + stray bold gone
+  assert.equal(b[0].items[1][0].s, '#10 bob [p2]: second point');
+  assert.equal(b[0].items[2][0].s, 'third');
+});
+
+test('mdParse: one blank line between plain items keeps the list; two blanks split it', () => {
+  const b = mdParse('1. a\n\n2. b\n\n\n3. c');
+  assert.equal(b.length, 2);
+  assert.equal(b[0].t, 'ol'); assert.equal(b[0].items.length, 2);
+  assert.equal(b[1].t, 'ol'); assert.equal(b[1].items.length, 1);
+  const u = mdParse('- a\n\n- b\n\ntext');
+  assert.equal(u.length, 2);
+  assert.equal(u[0].t, 'ul'); assert.equal(u[0].items.length, 2); // one blank stays in-list
+  assert.equal(u[1].t, 'p');
+});
+
+test('aiMessages: citation rule — never echo (pN, ♥R) markers, both languages', () => {
+  assert.match(aiMessages('', 'q', [], 'en')[0].content, /never copy the \(pN, ♥R\) markers/);
+  assert.match(aiMessages('', 'q', [], 'vi')[0].content, /không bao giờ chép các ký hiệu \(pN, ♥R\)/);
+});
+
+test('aiOllamaOrigin: strips trailing /v1 and slashes', () => {
+  assert.equal(aiOllamaOrigin('http://localhost:11434/v1'), 'http://localhost:11434');
+  assert.equal(aiOllamaOrigin('http://127.0.0.1:9/v1/'), 'http://127.0.0.1:9');
+  assert.equal(aiOllamaOrigin('http://x.test:1'), 'http://x.test:1');
+  assert.equal(aiOllamaOrigin(''), '');
+});
+
+test('aiContextStats: percent of the window; null when unknown; capped for tiny windows', () => {
+  assert.deepEqual(aiContextStats(40000, 131072), { est: 10800, pct: 8, ctx: '128k' });
+  assert.deepEqual(aiContextStats(0, 8192), { est: 800, pct: 10, ctx: '8k' });
+  assert.equal(aiContextStats(40000, 0), null);
+  assert.equal(aiContextStats(40000), null);
+  const tiny = aiContextStats(100000, 1024);
+  assert.equal(tiny.pct, 999);
+  assert.equal(tiny.ctx, '1k');
+});
+
+// ---- 0.15.0: context window scaling ----
+test('aiNumCtx: auto = min(model,16k); explicit setting wins but never exceeds the model', () => {
+  assert.equal(aiNumCtx(0, 131072), 16384);
+  assert.equal(aiNumCtx(0, 8192), 8192);
+  assert.equal(aiNumCtx(0, 0), 8192);
+  assert.equal(aiNumCtx(32768, 131072), 32768);
+  assert.equal(aiNumCtx(131072, 8192), 8192); // clamped to the model's real window
+});
+
+test('aiTranscriptBudget: window minus answer/prompt reserve, 3 chars/token, floor 12k', () => {
+  assert.equal(aiTranscriptBudget(16384), 39936);
+  assert.equal(aiTranscriptBudget(32768), 89088);
+  assert.equal(aiTranscriptBudget(8192), 15360);
+  assert.equal(aiTranscriptBudget(4096), 12000); // floor
+});
+
+// ---- 0.16.0: query-boost + SEARCH protocol ----
+test('aiQueryTerms: lowercase words >=3 chars, EN/VI stopwords dropped, capped at 12', () => {
+  assert.deepEqual(aiQueryTerms('What oil does minhbk91 use for the xe máy?'), ['oil', 'minhbk91', 'use', 'máy']); // 'xe' is 2 chars, dropped
+  assert.deepEqual(aiQueryTerms('là gì nào đâu kobalt wrench'), ['kobalt', 'wrench']);
+  assert.deepEqual(aiQueryTerms('   '), []);
+  const many = aiQueryTerms(Array.from({ length: 30 }, (_, i) => 'tok' + i).join(' '));
+  assert.equal(many.length, 12);
+});
+
+test('aiScorePost: author exact match + term hits capped; aiSearchPosts orders by score then thread order', () => {
+  const posts = [
+    { author: 'alice', text: 'nothing here' },
+    { author: 'bob', text: 'motul 7100 is great, motul forever' },
+    { author: 'carol', text: 'she uses motul occasionally' },
+    { author: 'alice', text: 'alice says shell is fine too' }
+  ];
+  const terms = aiQueryTerms('motul bob');
+  assert.ok(aiScorePost(posts[1], terms) > aiScorePost(posts[2], terms), 'double mention outscores single');
+  assert.equal(aiScorePost(posts[0], terms), 0);
+  assert.equal(aiScorePost({ author: 'bob', text: '' }, terms), 6, 'author exact alone scores');
+  const found = aiSearchPosts(posts, 'motul', 10);
+  assert.equal(found.length, 2);
+  assert.equal(found[0].author, 'bob'); // higher score first
+  assert.equal(found[1].author, 'carol');
+  const capped = aiSearchPosts(posts, 'motul alice', 1);
+  assert.equal(capped.length, 1);
+});
+
+test('buildAiTranscript: query-matching middle posts survive a budget that would drop them', () => {
+  // 20 posts; #12 mentions the exact thing asked about; budget fits ~5 lines
+  const posts = Array.from({ length: 20 }, (_, i) => ({ author: 'u' + i, pageN: 1, reactionCount: 0, text: i === 11 ? 'kobalt torque wrench review' : ('filler body ' + i + ' ' + 'x'.repeat(90)) }));
+  const out = buildAiTranscript(posts, { budget: 800, keepTop: 0, query: 'kobalt wrench' });
+  assert.ok(out.indexOf('[#12] u11') >= 0, 'query-matched post kept');
+  assert.ok(out.indexOf('[#11] u10') < 0, 'unmatched neighbor dropped');
+});
+
+test('aiMessages: SEARCH protocol in both language prompts', () => {
+  assert.match(aiMessages('', 'q', [], 'en')[0].content, /SEARCH: <keywords>/);
+  assert.match(aiMessages('', 'q', [], 'vi')[0].content, /SEARCH: <từ khóa>/);
 });
