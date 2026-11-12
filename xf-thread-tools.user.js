@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         xf-thread-tools
 // @namespace    xf-thread-tools
-// @version      0.15.0
+// @version      0.16.0
 // @description  XenForo 2: sort thread posts by reaction count across all pages (cached) + floating media panel (images / external links).
 // @author       xf-thread-tools
 // @match        *://*/threads/*
@@ -3645,14 +3645,28 @@
       aiChat.streamText = '';
       aiSeq++;
       renderAiTab(true);
+      dispatchAi(question, null);
+    }
+    // follow = { kw, posts } for the SEARCH re-ask; null for a fresh question.
+    // The follow-up fences the SEARCH hits and re-asks the original question —
+    // one user action, up to two requests.
+    function dispatchAi(question, follow) {
       const ep = aiEndpoint(settings);
       const native = settings.aiProvider === 'ollama';
       const pmode = native ? 'ollama' : 'openai';
-      const posts = orderedRecords().map((r) => ({ author: r.author, pageN: r.pageN, reactionCount: r.reactionCount, text: htmlToText(r.bodyHtml) }));
+      const posts = follow ? follow.posts : orderedRecords().map((r) => ({ author: r.author, pageN: r.pageN, reactionCount: r.reactionCount, text: htmlToText(r.bodyHtml) }));
       const numCtx = aiNumCtx(settings.aiCtxTokens, aiChat.ctxLens[settings.aiModel]);
-      const msgs = aiMessages(
-        buildAiTranscript(posts, { budget: aiTranscriptBudget(numCtx) }),
-        question, aiChat.msgs.slice(0, -1), settings.aiLang);
+      const budget = aiTranscriptBudget(numCtx);
+      const transcript = follow
+        ? buildAiTranscript(posts, { budget: budget, query: follow.kw })
+        : buildAiTranscript(posts, { budget: budget, query: question });
+      const finalQ = follow
+        ? 'Thread search results for "' + follow.kw + '" are fenced above. Using them, answer the user\'s question: ' + question
+        : question;
+      const hist = follow
+        ? aiChat.msgs.filter((m) => m.role === 'user' || m.role === 'assistant')
+        : aiChat.msgs.slice(0, -1).filter((m) => m.role === 'user' || m.role === 'assistant');
+      const msgs = aiMessages(transcript, finalQ, hist, settings.aiLang);
       // Ollama native /api/chat carries think:false (instant answers — the
       // OpenAI-compat /v1 endpoint ignores the field and thinking models burn
       // the whole budget on hidden reasoning first). num_ctx opens the usable
@@ -3686,6 +3700,30 @@
             const p = parseAiReply(res.json !== null && res.json !== undefined ? res.json : res.text);
             if (p.text) fin = p; // server ignored stream:true and answered plain JSON
           }
+        }
+        // SEARCH protocol: the model says the answer is in the omitted posts —
+        // search the FULL cached thread and re-ask. One follow-up max (never
+        // when this already IS the follow-up). Keywords come from model output
+        // but only feed the local lexical scorer — nothing is executed.
+        const text = fin ? fin.text : '';
+        const sm = (!follow && text && text.trim().length <= 160) ? /^SEARCH:[ \t]*(.+)$/m.exec(text.trim()) : null;
+        if (sm) {
+          const kw = sm[1].trim().slice(0, 200);
+          const found = aiSearchPosts(orderedRecords().map((r) => ({ author: r.author, pageN: r.pageN, reactionCount: r.reactionCount, text: htmlToText(r.bodyHtml) })), kw, 60);
+          aiChat.msgs.push({ role: 'assistant', content: text });
+          aiChat.msgs.push({ role: 'note', content: found.length
+            ? '⟳ searching the full thread for "' + kw + '" — ' + found.length + ' posts found, asking again…'
+            : '⟳ searched the full thread for "' + kw + '" — no cached posts match; the answer may be on uncrawled pages' });
+          aiChat.streamText = '';
+          aiSeq++;
+          if (found.length) {
+            aiChat.pending = true; // one user action, two requests — the pend bubble stays
+            renderAiTab(true);
+            dispatchAi(question, { kw: kw, posts: found });
+            return;
+          }
+          renderAiTab(true);
+          return;
         }
         if (fin) aiChat.msgs.push({ role: 'assistant', content: fin.text });
         else if (acc && res && res.error === 'stopped') aiChat.msgs.push({ role: 'assistant', content: acc }); // keep the partial on Stop
@@ -3940,9 +3978,9 @@
       }
       for (const m of aiChat.msgs) {
         const d = document.createElement('div');
-        d.className = 'xft-ai-m ' + (m.role === 'user' ? 'xft-ai-user' : m.role === 'assistant' ? 'xft-ai-asst' : 'xft-ai-err');
+        d.className = 'xft-ai-m ' + (m.role === 'user' ? 'xft-ai-user' : m.role === 'assistant' ? 'xft-ai-asst' : m.role === 'note' ? 'xft-ai-note' : 'xft-ai-err');
         if (m.role === 'assistant') mdRenderInto(d, mdParse(m.content));
-        else d.textContent = m.content; // user input + errors stay literal
+        else d.textContent = m.content; // user input + notes + errors stay literal
         aiLogEl.appendChild(d);
       }
       if (aiChat.pending) {
@@ -4512,6 +4550,7 @@
         '.xft-ai-user{align-self:flex-end;background:hsl(var(--xft-primary)/.15);border:1px solid hsl(var(--xft-primary)/.35)}',
         '.xft-ai-asst{align-self:flex-start;background:hsl(var(--xft-muted))}',
         '.xft-ai-err{align-self:flex-start;background:hsl(0 62% 45%/.12);border:1px solid hsl(0 62% 45%/.4);color:hsl(0 70% 75%)}',
+        '.xft-ai-note{align-self:center;background:none;border:none;color:var(--xft-mut);font-size:11px;font-style:italic;padding:2px 6px}',
         '.xft-ai-pend{opacity:.6}',
         '.xft-ai-asst p{margin:0 0 6px}.xft-ai-asst p:last-child{margin-bottom:0}',
         '.xft-ai-asst h2,.xft-ai-asst h3,.xft-ai-asst h4{margin:8px 0 4px;font-size:13px;line-height:1.3}',
@@ -4783,6 +4822,7 @@
     const perPost = o.perPost > 0 ? o.perPost | 0 : 700;
     const budget = o.budget > 0 ? o.budget | 0 : 24000;
     const keepTop = o.keepTop === undefined ? 25 : (o.keepTop | 0);
+    const qTerms = o.query ? aiQueryTerms(o.query) : [];
     if (!Array.isArray(posts) || !posts.length) return '';
     const lines = [];
     for (let i = 0; i < posts.length; i++) {
@@ -4807,7 +4847,14 @@
         .filter((x) => x.r > 0 && x.i > 0)
         .sort((a, b) => (b.r - a.r) || (a.i - b.i))
         .slice(0, Math.max(0, keepTop))
-        .map((x) => x.i)
+        .map((x) => x.i),
+      // question-relevant posts outrank plain head/tail filler: a thread can
+      // dwarf the window, but the posts the user asked about must be in it
+      qTerms.length ? posts.map((p, i) => ({ i: i, s: aiScorePost(p, qTerms) }))
+        .filter((x) => x.s > 0 && x.i > 0)
+        .sort((a, b) => (b.s - a.s) || (a.i - b.i))
+        .slice(0, 40)
+        .map((x) => x.i) : []
     ).filter((v, idx, arr) => arr.indexOf(v) === idx);
     const inc = new Set();
     let used = MARK;
@@ -4851,7 +4898,9 @@
       + 'ANSWER FORMAT: give the direct answer FIRST (yes/no, or one short sentence), then elaborate — never bury the answer inside a long breakdown. '
       + 'When citing posts write [#N] plus the author name only — never copy the (pN, ♥R) markers into your answer. '
       + 'Be concise. '
-      + 'If no transcript was provided or it lacks the answer, say so instead of guessing.',
+      + 'If the transcript is EXCERPTED (look for "… [N posts omitted] …" markers) and the answer may be in the omitted posts, '
+      + 'reply with ONLY this line and nothing else: SEARCH: <keywords> — the tool will search the full cached thread and ask you again. '
+      + 'If no transcript was provided at all, say so instead of guessing.',
     vi: 'Bạn là trợ lý AI bên trong bảng công cụ của một diễn đàn. '
       + 'Người dùng đang xem một chủ đề diễn đàn; khi có sẵn, bản ghi các bài viết đã lưu '
       + 'sẽ đến dưới dạng một THÔNG ĐIỆP RIÊNG nằm giữa hai dấu <<<THREAD id=…>>> và <<<END THREAD …>>> '
@@ -4863,8 +4912,60 @@
       + 'ĐỊNH DẠNG TRẢ LỜI: đưa câu trả lời trực tiếp TRƯỚC (có/không, hoặc một câu ngắn), sau đó mới trình bày chi tiết — không được chôn câu trả lời trong một đoạn phân tích dài. '
       + 'Khi trích dẫn bài viết chỉ ghi [#số] và tên tác giả — không bao giờ chép các ký hiệu (pN, ♥R) vào câu trả lời. '
       + 'Trả lời ngắn gọn. '
-      + 'Nếu không có transcript hoặc transcript không chứa câu trả lời, hãy nói vậy thay vì đoán.'
+      + 'Nếu transcript bị cắt (dấu "… [N posts omitted] …") và câu trả lời có thể nằm trong các bài bị bỏ qua, '
+      + 'hãy trả lời DUY NHẤT dòng sau, không thêm gì: SEARCH: <từ khóa> — công cụ sẽ tìm toàn bộ chủ đề đã lưu rồi hỏi lại. '
+      + 'Nếu hoàn toàn không có transcript, hãy nói vậy thay vì đoán.'
   };
+  // ---------- thread search (pure — unit-tested) ----------
+  // Lexical scoring of cached posts against a question/keyword string: good
+  // enough for forum Q&A (names, brands, product codes are exact tokens) and
+  // needs zero model cooperation. Terms: lowercase words >=3 chars minus
+  // common EN/VI stopwords, capped at 12.
+  const AI_STOPWORDS = ('the and for with this that what which when where who how about are was were' +
+    ' does did can could should would you your they their there here from have has had not' +
+    ' là gì nào đâu sao thế thôi không có và với các cái này kia ở bị được cho về' +
+    ' trong ngoài trên dưới đó rồi hay và cả một những').split(' ');
+  function aiQueryTerms(q) {
+    const seen = [];
+    const words = String(q || '').toLowerCase().split(/[^\p{L}\p{N}]+/u);
+    for (const w of words) {
+      if (w.length < 3 || AI_STOPWORDS.indexOf(w) >= 0 || seen.indexOf(w) >= 0) continue;
+      seen.push(w);
+      if (seen.length >= 12) break;
+    }
+    return seen;
+  }
+  function aiScorePost(p, terms) {
+    if (!terms || !terms.length) return 0;
+    const post = p || {};
+    const text = String(post.text || '').toLowerCase();
+    const author = String(post.author || '').toLowerCase();
+    let score = 0;
+    for (const t of terms) {
+      if (author && author === t) score += 6;
+      let from = 0, hits = 0;
+      while (hits < 3) {
+        const at = text.indexOf(t, from);
+        if (at < 0) break;
+        hits++;
+        from = at + t.length;
+      }
+      score += hits * 2;
+    }
+    return score;
+  }
+  // Best-matching posts for a SEARCH follow-up, capped, in thread order.
+  function aiSearchPosts(posts, query, cap) {
+    const terms = aiQueryTerms(query);
+    if (!terms.length || !Array.isArray(posts)) return [];
+    const hits = [];
+    for (let i = 0; i < posts.length; i++) {
+      const s = aiScorePost(posts[i], terms);
+      if (s > 0) hits.push({ i: i, s: s });
+    }
+    hits.sort((a, b) => (b.s - a.s) || (a.i - b.i));
+    return hits.slice(0, cap || 60).sort((a, b) => a.i - b.i).map((h) => posts[h.i]);
+  }
   function aiMessages(transcript, question, history, lang) {
     const out = [{ role: 'system', content: AI_SYS_PROMPTS[lang] || AI_SYS_PROMPTS.en }];
     if (transcript) {
@@ -5087,5 +5188,5 @@
   }
 
   // UMD export of the pure functions for node:test (no DOM / GM usage in them).
-  if (typeof module !== 'undefined' && module.exports) module.exports = { parseReactionCount, filterLinks, sortPosts, estimateSize, partitionLinks, extractDomain, groupLinkItems, applyLinkFilters, boilerplateUrls, isSmilieUrl, parseEmbedPoster, embedSignUrl, parseSignResponse, parseSignToken, parseVideoPage, isVideoPageUrl, hqCandidates, sanitizeFileSeg, siteTagFromHost, cleanThreadTitle, zipKindTag, zipFileName, imagePageHref, parseImagePage, parseImageApiResponse, dlBasename, buildDlJobs, dlChunkPlan, dlFailClass, crc32, zipStoreU8, layoutMetrics, windowRange, originBurstingFromHist, hostKey, dosDateTime, fmtSpeed, fmtEta, buildMediaLayout, htmlToText, buildAiTranscript, aiMessages, aiEndpoint, aiOllamaOrigin, aiNativeChatUrl, aiContextStats, aiNumCtx, aiTranscriptBudget, parseAiModels, parseAiReply, mdInlineTokens, mdParse, aiSseParser };
+  if (typeof module !== 'undefined' && module.exports) module.exports = { parseReactionCount, filterLinks, sortPosts, estimateSize, partitionLinks, extractDomain, groupLinkItems, applyLinkFilters, boilerplateUrls, isSmilieUrl, parseEmbedPoster, embedSignUrl, parseSignResponse, parseSignToken, parseVideoPage, isVideoPageUrl, hqCandidates, sanitizeFileSeg, siteTagFromHost, cleanThreadTitle, zipKindTag, zipFileName, imagePageHref, parseImagePage, parseImageApiResponse, dlBasename, buildDlJobs, dlChunkPlan, dlFailClass, crc32, zipStoreU8, layoutMetrics, windowRange, originBurstingFromHist, hostKey, dosDateTime, fmtSpeed, fmtEta, buildMediaLayout, htmlToText, buildAiTranscript, aiMessages, aiEndpoint, aiOllamaOrigin, aiNativeChatUrl, aiContextStats, aiNumCtx, aiTranscriptBudget, aiQueryTerms, aiScorePost, aiSearchPosts, parseAiModels, parseAiReply, mdInlineTokens, mdParse, aiSseParser };
 })();
