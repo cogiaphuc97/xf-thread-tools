@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         xf-thread-tools
 // @namespace    xf-thread-tools
-// @version      0.17.3
+// @version      0.17.4
 // @description  XenForo 2: sort thread posts by reaction count across all pages (cached) + floating media panel (images / external links).
 // @author       xf-thread-tools
 // @match        *://*/threads/*
@@ -2984,6 +2984,23 @@
     // extension-based classification cannot know a URL's real bytes (video
     // links without .mp4 extensions exist); if the video also fails, the
     // element is marked .xft-broken.
+    // Fill a video-tile div with a poster <img> once the poster URL is
+    // known (from a landing page's og:image). Shared by embed tiles and
+    // page-backed video tiles. No isConnected gate: the row may be scrolled
+    // out of the window (pooled, detached) when the poster arrives — filling
+    // a detached tile is fine, the image loads and shows on re-insert.
+    function attachTilePoster(tile, poster) {
+      const cell = tile.closest('.xft-cell');
+      if (!poster) { if (cell) cell.classList.remove('xft-loading'); return; }
+      if (tile.querySelector('img')) return;
+      const im = document.createElement('img');
+      im.alt = '';
+      im.addEventListener('error', () => { im.remove(); if (cell) cell.classList.remove('xft-loading'); }, { once: true });
+      im.addEventListener('load', () => { im.classList.add('xft-ok'); if (cell) cell.classList.remove('xft-loading'); }, { once: true });
+      im.src = poster;
+      tile.appendChild(im);
+    }
+
     function buildMediaEl(kind, url, thumb, pageUrl) {
       if (kind === 'embed') {
         // Embed thumbs: base no-fetch tile (hosts rate-limit, some embeds
@@ -2993,23 +3010,9 @@
         if (thumb) {
           const tile = document.createElement('div');
           tile.className = 'xft-vtile';
-          const fill = (poster) => {
-            // no isConnected gate: the row may be scrolled out of the window
-            // (pooled, detached) when the poster arrives — filling a detached
-            // tile is fine, the image loads and shows on re-insert
-            const cell = tile.closest('.xft-cell');
-            if (!poster) { if (cell) cell.classList.remove('xft-loading'); return; }
-            if (tile.querySelector('img')) return;
-            const im = document.createElement('img');
-            im.alt = '';
-            im.addEventListener('error', () => { im.remove(); if (cell) cell.classList.remove('xft-loading'); }, { once: true });
-            im.addEventListener('load', () => { im.classList.add('xft-ok'); if (cell) cell.classList.remove('xft-loading'); }, { once: true });
-            im.src = poster;
-            tile.appendChild(im);
-          };
           // deferred a tick: the cached path resolves synchronously, before
           // renderRange has inserted the row into the document
-          ensureEmbedPoster(url, (p) => setTimeout(() => fill(p), 0));
+          ensureEmbedPoster(url, (p) => setTimeout(() => attachTilePoster(tile, p), 0));
           return tile;
         }
         // native <video> first: hosts exposing a sign endpoint serve the
@@ -3050,13 +3053,17 @@
       }
       if (kind === 'video') {
         if (thumb) {
-          // Video thumbs do NOT fetch: media hosts rate-limit (a video-heavy
-          // thread = hundreds of queued metadata requests stuck LOADING,
-          // rendering black cells that never error). A styled tile + the
-          // cell's ▶ badge is instant and reliable; the viewer streams the
-          // real video on click.
+          // Video thumbs: a styled tile + the cell's ▶ badge is instant and
+          // safe (media hosts rate-limit; a video-heavy thread = hundreds of
+          // queued metadata requests stuck LOADING). PAGE-BACKED videos get
+          // one landing-page GET through the shared poster queue — its
+          // og:image is the preview (bunkr /f/ pages, filester /d/ pages,
+          // moved-CDN directs). Same-host files never hit this.
           const tile = document.createElement('div');
           tile.className = 'xft-vtile';
+          if (isVideoPageUrl(url) || (VID_EXT_RE.test(url) && extractDomain(url) !== hostKey(location.host))) {
+            ensureEmbedPoster(url, (p) => setTimeout(() => attachTilePoster(tile, p), 0));
+          }
           return tile;
         }
         const v = document.createElement('video');
