@@ -8,7 +8,7 @@ import path from 'node:path';
 
 const require = createRequire(import.meta.url);
 const userJsPath = path.join(path.dirname(fileURLToPath(import.meta.url)), '..', 'xf-thread-tools.user.js');
-const { parseReactionCount, filterLinks, sortPosts, estimateSize, partitionLinks, extractDomain, groupLinkItems, applyLinkFilters, boilerplateUrls, isSmilieUrl, parseEmbedPoster, embedSignUrl, parseSignResponse, parseSignToken, parseVideoPage, isVideoPageUrl, hqCandidates, imagePageHref, parseImagePage, parseImageApiResponse, sanitizeFileSeg, siteTagFromHost, cleanThreadTitle, zipKindTag, zipFileName, dlBasename, buildDlJobs, dlChunkPlan, dlFailClass, crc32, zipStoreU8, layoutMetrics, windowRange, originBurstingFromHist } = require(userJsPath);
+const { parseReactionCount, filterLinks, sortPosts, estimateSize, partitionLinks, extractDomain, groupLinkItems, applyLinkFilters, boilerplateUrls, isSmilieUrl, parseEmbedPoster, embedSignUrl, parseSignResponse, parseSignToken, parseVideoPage, isVideoPageUrl, isFileDPageUrl, embedViewApiUrl, parseViewApiResponse, hqCandidates, imagePageHref, parseImagePage, parseImageApiResponse, sanitizeFileSeg, siteTagFromHost, cleanThreadTitle, zipKindTag, zipFileName, dlBasename, buildDlJobs, dlChunkPlan, dlFailClass, crc32, zipStoreU8, layoutMetrics, windowRange, originBurstingFromHist } = require(userJsPath);
 
 test('UMD export exposes the four pure functions', () => {
   assert.equal(typeof parseReactionCount, 'function');
@@ -341,11 +341,62 @@ test('isVideoPageUrl: /v/<name>.mp4 and /f/<x> are pages; direct files and forum
   assert.equal(isVideoPageUrl('https://h.example/v/clip-Ab12.mp4?x=1'), true);
   assert.equal(isVideoPageUrl('https://h.example/f/some-File9Z.mp4'), true);
   assert.equal(isVideoPageUrl('https://h.example/f/aB3xY9'), true);
+  assert.equal(isVideoPageUrl('https://h.example/d/wyFagpq'), true);
   assert.equal(isVideoPageUrl('https://cdn.example/data/attachments/video.mp4'), false);
   assert.equal(isVideoPageUrl('https://h.example/embed/abc123'), false);
   assert.equal(isVideoPageUrl('https://voz.example/threads/some.3871/'), false);
   assert.equal(isVideoPageUrl(''), false);
   assert.equal(isVideoPageUrl(null), false);
+});
+
+// ---- isFileDPageUrl / embedViewApiUrl / parseViewApiResponse (short-slug token route) ----
+test('isFileDPageUrl: /d/<slug> short-slug shape only', () => {
+  // the real shapes (domain rotation gg/me covered by shape, not name)
+  assert.equal(isFileDPageUrl('https://filester-shaped.example/d/wyFagpq'), true);
+  assert.equal(isFileDPageUrl('https://filester-shaped.example/d/wyFagpq?ref=1'), true);
+  assert.equal(isFileDPageUrl('https://filester-shaped.example/d/a_b-C9'), true);
+  // not this shape: longer paths, dots, wrong prefix, non-http
+  assert.equal(isFileDPageUrl('https://h.example/d/wyFagpq/extra'), false);
+  assert.equal(isFileDPageUrl('https://h.example/d/file.mp4'), false);
+  assert.equal(isFileDPageUrl('https://h.example/d/ab'), false); // 2-char slug
+  assert.equal(isFileDPageUrl('https://h.example/download/wyFagpq'), false);
+  assert.equal(isFileDPageUrl('ftp://h.example/d/wyFagpq'), false);
+  assert.equal(isFileDPageUrl(''), false);
+  assert.equal(isFileDPageUrl(null), false);
+});
+
+test('embedViewApiUrl: /d/<slug> -> origin /v2/api/public/view + slug; else null', () => {
+  assert.deepEqual(embedViewApiUrl('https://h.example/d/wyFagpq'),
+    { url: 'https://h.example/v2/api/public/view', slug: 'wyFagpq' });
+  // query string is not part of the slug
+  assert.equal(embedViewApiUrl('https://h.example/d/wyFagpq?x=1').slug, 'wyFagpq');
+  // non-/d/ shapes never build an endpoint (no stray POSTs to other hosts)
+  assert.equal(embedViewApiUrl('https://h.example/embed/abc123'), null);
+  assert.equal(embedViewApiUrl('https://h.example/f/aB3xY9'), null);
+  assert.equal(embedViewApiUrl('https://cdn.example/v/a.mp4'), null);
+  assert.equal(embedViewApiUrl(''), null);
+  assert.equal(embedViewApiUrl(null), null);
+});
+
+test('parseViewApiResponse: {success,server,file,token,expires_in} -> signed url + exp', () => {
+  const j = { success: true, file: '15e21e87-8427-4394-9a5e-8fe19304208b.mp4',
+    server: 'https://fsc3.cdn.example', token: 'deadbeef', expires_in: 1800 };
+  const hit = parseViewApiResponse(JSON.stringify(j), 1000);
+  assert.equal(hit.url, 'https://fsc3.cdn.example/v2/15e21e87-8427-4394-9a5e-8fe19304208b.mp4?token=deadbeef');
+  assert.equal(hit.exp, 2800);
+  // token url-encoded when it carries reserved chars
+  const hit2 = parseViewApiResponse(JSON.stringify({ success: true, file: 'a.mp4', server: 'https://s.cdn', token: 'a+b&c', expires_in: 60 }), 0);
+  assert.equal(hit2.url, 'https://s.cdn/v2/a.mp4?token=a%2Bb%26c');
+  // expires_in missing -> exp = now (treated as immediately stale)
+  assert.equal(parseViewApiResponse(JSON.stringify({ success: true, file: 'a.mp4', server: 'https://s.cdn', token: 't' }), 500).exp, 500);
+  // rejects: not success, missing pieces, file with slashes, relative server
+  assert.equal(parseViewApiResponse(JSON.stringify({ success: false, file: 'a.mp4', server: 'https://s.cdn', token: 't' }), 0), null);
+  assert.equal(parseViewApiResponse(JSON.stringify({ success: true, server: 'https://s.cdn', token: 't' }), 0), null);
+  assert.equal(parseViewApiResponse(JSON.stringify({ success: true, file: '../other/a.mp4', server: 'https://s.cdn', token: 't' }), 0), null);
+  assert.equal(parseViewApiResponse(JSON.stringify({ success: true, file: 'a.mp4', server: 's.cdn', token: 't' }), 0), null);
+  assert.equal(parseViewApiResponse('not json', 0), null);
+  assert.equal(parseViewApiResponse('', 0), null);
+  assert.equal(parseViewApiResponse(null, 0), null);
 });
 
 test('hqCandidates: marker-only and dims-prefixed chains; plain URLs untouched', () => {

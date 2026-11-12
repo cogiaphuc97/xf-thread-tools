@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         xf-thread-tools
 // @namespace    xf-thread-tools
-// @version      0.16.0
+// @version      0.17.0
 // @description  XenForo 2: sort thread posts by reaction count across all pages (cached) + floating media panel (images / external links).
 // @author       xf-thread-tools
 // @match        *://*/threads/*
@@ -469,6 +469,35 @@
     return null;
   }
 
+  // Public-view API builder for short-slug file pages: the page's own player
+  // script POSTs <origin>/v2/api/public/view {file_slug} and receives
+  // {success, server, file, token, expires_in} — a time-limited direct URL.
+  // ''-shaped null when the URL is not that shape.
+  function embedViewApiUrl(u) {
+    try {
+      const url = new URL(String(u || ''), 'https://x.invalid');
+      if (!/^https?:$/.test(url.protocol)) return null;
+      if (!isFileDPageUrl(url.href)) return null;
+      return { url: url.origin + '/v2/api/public/view', slug: url.pathname.split('/').pop() };
+    } catch (e) { return null; }
+  }
+
+  // Public-view API response parser: builds the signed CDN stream url from
+  // {success, server, file, token, expires_in}. `file` is locked to a single
+  // path segment (no slashes) so a hostile page cannot aim the stream URL
+  // elsewhere on the CDN's origin. null on anything else.
+  function parseViewApiResponse(text, now) {
+    try {
+      const j = JSON.parse(String(text || ''));
+      if (j && j.success === true && typeof j.token === 'string' && j.token
+        && typeof j.file === 'string' && /^\w[\w.-]*$/.test(j.file)
+        && typeof j.server === 'string' && /^https?:\/\//.test(j.server)) {
+        return { url: j.server + '/v2/' + j.file + '?token=' + encodeURIComponent(j.token), exp: (now | 0) + (parseInt(j.expires_in, 10) || 0) };
+      }
+    } catch (e) { /* not JSON / error page */ }
+    return null;
+  }
+
   // File-page carrier parser: given the HTML of a host's /v/ or /f/ page,
   // find the direct media. Carriers, in trust order:
   //   1. jsCDN + signUrl vars (bunkr family) — unsigned CDN url + a sign
@@ -495,15 +524,27 @@
     return null;
   }
 
+  // Short-slug file pages (path /d/<slug>, no extension): hosts whose landing
+  // page ships a player script plus a JSON token endpoint instead of any
+  // carrier in the HTML. Slugs are 3-64 url-safe chars; a dot or a second
+  // path segment means a real file path, not this shape.
+  function isFileDPageUrl(u) {
+    const s = String(u || '');
+    if (!/^https?:\/\//i.test(s)) return false;
+    const path = s.replace(/^https?:\/\/[^/]+/i, '').split(/[?#]/)[0];
+    return /^\/d\/[A-Za-z0-9_-]{3,64}$/.test(path);
+  }
+
   // Videos-tab URLs that are actually host file PAGES (the .mp4-looking path
-  // 403s or serves HTML as a direct <video> src) — these resolve through
-  // parseVideoPage before playback. /v/<name>.mp4 and /f/<something> are the
-  // file-page shapes; extension-bearing URLs elsewhere are real direct files.
+  // 403s or serves HTML as a direct <video> src) — these resolve through a
+  // sign endpoint or page parse before playback. /v/<name>.mp4 and
+  // /f/<something> are bunkr-style file pages, /d/<slug> the short-slug
+  // token-endpoint kind; extension-bearing URLs elsewhere are real direct files.
   function isVideoPageUrl(u) {
     const s = String(u || '');
     if (!/^https?:\/\//i.test(s)) return false;
     const path = s.replace(/^https?:\/\/[^/]+/i, '').split(/[?#]/)[0];
-    return /^\/v\/[^/]+\.(mp4|webm|mkv|mov|m4v)$/i.test(path) || /^\/f\/[^/]+$/i.test(path);
+    return /^\/v\/[^/]+\.(mp4|webm|mkv|mov|m4v)$/i.test(path) || /^\/f\/[^/]+$/i.test(path) || isFileDPageUrl(s);
   }
 
   function partitionLinks(hrefList) {
@@ -836,6 +877,16 @@
       const parts = partitionLinks(rawLinks);
       for (const u of parts.imageLinks) images.push(absolutize(u));
       for (const u of parts.videoLinks) videos.push(absolutize(u));
+      // short-slug /d/ file pages (filester-style): extension-less links that
+      // are video landing pages on ANOTHER host — they belong on Videos,
+      // where the resolver streams them direct; same-host /d/ routes are the
+      // forum's own and stay on Links
+      const restLinks = [];
+      for (const u of parts.links) {
+        const abs = absolutize(u);
+        if (isFileDPageUrl(abs) && extractDomain(abs) !== hostKey(location.host)) videos.push(abs);
+        else restLinks.push(u);
+      }
       const imgSet = new Set(images.filter(Boolean));
       const vidSet = new Set(videos.filter(Boolean));
       const embSet = new Set(embeds.filter(Boolean));
@@ -848,7 +899,7 @@
         date: dateEl ? (dateEl.getAttribute('datetime') || '') : '',
         reactionCount: reactionCount,
         bodyHtml: body ? lazyBodyHtml(body) : '',
-        links: filterLinks(parts.links, location.host).filter((u) => !imgSet.has(u) && !vidSet.has(u) && !embSet.has(u)),
+        links: filterLinks(restLinks, location.host).filter((u) => !imgSet.has(u) && !vidSet.has(u) && !embSet.has(u)),
         images: Array.from(new Set(images.filter(Boolean))),
         videos: Array.from(new Set(videos.filter(Boolean))),
         embeds: Array.from(new Set(embeds.filter(Boolean))),
@@ -1786,12 +1837,39 @@
         .then(onOk)
         .catch(onErr);
     }
+    // GM-or-fetch POST with a JSON body, same single-shot shape as gmGetText;
+    // used by token endpoints that only accept POSTed {file_slug}-style bodies
+    function gmPostJson(url, body, onOk, onErr) {
+      const data = JSON.stringify(body || {});
+      if (typeof GM_xmlhttpRequest === 'function') {
+        try {
+          GM_xmlhttpRequest({
+            method: 'POST',
+            url: url,
+            timeout: 10000,
+            headers: { 'Content-Type': 'application/json' },
+            data: data,
+            onload: (r) => onOk(r && r.responseText || ''),
+            onerror: onErr,
+            ontimeout: onErr
+          });
+          return;
+        } catch (e) { /* fall through to fetch */ }
+      }
+      const ctl = (typeof AbortController !== 'undefined') ? new AbortController() : null;
+      if (ctl) setTimeout(() => { try { ctl.abort(); } catch (e) {} }, 10000);
+      fetch(url, { method: 'POST', credentials: 'omit', headers: { 'Content-Type': 'application/json' }, body: data, signal: ctl ? ctl.signal : undefined })
+        .then((r) => r.text())
+        .then(onOk)
+        .catch(onErr);
+    }
     function resolveEmbedStream(url, cb) {
       const now = Math.floor(Date.now() / 1000);
       const c = embedStreams[url];
       if (c && c.exp - now > 60) { cb(c.url); return; }
       const sign = embedSignUrl(url);
-      if (!sign && !isVideoPageUrl(url)) { cb(''); return; }
+      const view = embedViewApiUrl(url);
+      if (!sign && !view && !isVideoPageUrl(url)) { cb(''); return; }
       if (embedStreamInflight.has(url)) { embedStreamInflight.get(url).push(cb); return; }
       const queue = [cb];
       embedStreamInflight.set(url, queue);
@@ -1830,6 +1908,12 @@
       const ok = (text) => finish(parseSignResponse(text));
       if (sign) {
         gmGetText(sign, ok, () => finish(null));
+      } else if (view) {
+        // route 1b: short-slug file pages whose token endpoint wants a POSTed
+        // {file_slug} (filester-style) — the answer already IS the signed
+        // stream URL, no page fetch needed
+        gmPostJson(view.url, { file_slug: view.slug },
+          (t) => finish(parseViewApiResponse(t, now)), () => finish(null));
       } else {
         resolveViaPage();
       }
@@ -2507,10 +2591,11 @@
         }, true); // user-initiated single — force past any failure cooldown
         return;
       }
-      if (job.kind === 'embed') {
-        // player tiles: resolve to the direct stream (sign endpoint or
-        // file-page carrier), then fetch the bytes. Resolution shares the
-        // same job so the caps also throttle sign hits.
+      if (job.kind === 'embed' || isVideoPageUrl(job.cands[ci])) {
+        // player tiles AND file-page URLs (sign endpoint, page carrier, or
+        // POSTed token endpoint): resolve to the direct stream, then fetch
+        // the bytes. Resolution shares the same job so the caps also throttle
+        // sign hits. Raw page URLs would download landing-page HTML.
         job.badge = '…';
         resolveEmbedStream(job.cands[ci], (src) => {
           if (dlRun.cancel || ctx.killed || ctx.released) { release(); return; }
@@ -5188,5 +5273,5 @@
   }
 
   // UMD export of the pure functions for node:test (no DOM / GM usage in them).
-  if (typeof module !== 'undefined' && module.exports) module.exports = { parseReactionCount, filterLinks, sortPosts, estimateSize, partitionLinks, extractDomain, groupLinkItems, applyLinkFilters, boilerplateUrls, isSmilieUrl, parseEmbedPoster, embedSignUrl, parseSignResponse, parseSignToken, parseVideoPage, isVideoPageUrl, hqCandidates, sanitizeFileSeg, siteTagFromHost, cleanThreadTitle, zipKindTag, zipFileName, imagePageHref, parseImagePage, parseImageApiResponse, dlBasename, buildDlJobs, dlChunkPlan, dlFailClass, crc32, zipStoreU8, layoutMetrics, windowRange, originBurstingFromHist, hostKey, dosDateTime, fmtSpeed, fmtEta, buildMediaLayout, htmlToText, buildAiTranscript, aiMessages, aiEndpoint, aiOllamaOrigin, aiNativeChatUrl, aiContextStats, aiNumCtx, aiTranscriptBudget, aiQueryTerms, aiScorePost, aiSearchPosts, parseAiModels, parseAiReply, mdInlineTokens, mdParse, aiSseParser };
+  if (typeof module !== 'undefined' && module.exports) module.exports = { parseReactionCount, filterLinks, sortPosts, estimateSize, partitionLinks, extractDomain, groupLinkItems, applyLinkFilters, boilerplateUrls, isSmilieUrl, parseEmbedPoster, embedSignUrl, parseSignResponse, parseSignToken, parseVideoPage, isVideoPageUrl, isFileDPageUrl, embedViewApiUrl, parseViewApiResponse, hqCandidates, sanitizeFileSeg, siteTagFromHost, cleanThreadTitle, zipKindTag, zipFileName, imagePageHref, parseImagePage, parseImageApiResponse, dlBasename, buildDlJobs, dlChunkPlan, dlFailClass, crc32, zipStoreU8, layoutMetrics, windowRange, originBurstingFromHist, hostKey, dosDateTime, fmtSpeed, fmtEta, buildMediaLayout, htmlToText, buildAiTranscript, aiMessages, aiEndpoint, aiOllamaOrigin, aiNativeChatUrl, aiContextStats, aiNumCtx, aiTranscriptBudget, aiQueryTerms, aiScorePost, aiSearchPosts, parseAiModels, parseAiReply, mdInlineTokens, mdParse, aiSseParser };
 })();
