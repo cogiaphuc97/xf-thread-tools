@@ -444,12 +444,13 @@ test('zipFileName: Vietnamese + spaces kept, [tag] groups and forum suffix strip
   assert.equal(zipFileName('', ''), 'thread.zip');
 });
 
-test('imagePageHref: /img/<short-id> landing shape only', () => {
+test('imagePageHref: /img/<id> landing shape only', () => {
   assert.equal(imagePageHref('https://host.test/img/t5kZz2y'), 'https://host.test/img/t5kZz2y');
   assert.equal(imagePageHref('/img/abc12'), 'https://x.invalid/img/abc12'); // resolved against base
   assert.equal(imagePageHref('https://host.test/img/has-extension.jpg'), ''); // direct file, not a page
   assert.equal(imagePageHref('https://host.test/gallery/t5kZz2y'), '');
-  assert.equal(imagePageHref('https://host.test/img/' + 'x'.repeat(13)), ''); // too long = not the shape
+  assert.equal(imagePageHref('https://host.test/img/' + 'x'.repeat(13)), 'https://host.test/img/' + 'x'.repeat(13)); // id gate matches the album pageId matcher ({3,64})
+  assert.equal(imagePageHref('https://host.test/img/xx'), ''); // under 3 = not the shape
   assert.equal(imagePageHref(''), '');
 });
 

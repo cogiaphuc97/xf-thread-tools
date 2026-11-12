@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         xf-thread-tools
 // @namespace    xf-thread-tools
-// @version      0.18.0
+// @version      0.18.1
 // @description  XenForo 2: sort thread posts by reaction count across all pages (cached) + floating media panel (images / external links).
 // @author       xf-thread-tools
 // @match        *://*/threads/*
@@ -211,7 +211,7 @@
     try {
       const u = new URL(String(href || ''), 'https://x.invalid');
       if (!/^https?:$/.test(u.protocol)) return '';
-      if (!/^\/img\/[A-Za-z0-9_-]{3,12}$/.test(u.pathname)) return '';
+      if (!/^\/img\/[A-Za-z0-9_-]{3,64}$/.test(u.pathname)) return '';
       return u.origin + u.pathname;
     } catch (e) { return ''; }
   }
@@ -2140,11 +2140,16 @@
       }
       writeStore(ALBUMS_KEY, albumStore);
     }
-    function albumDone(url, children) {
+    function albumDone(url, children, persist) {
       if (children && children.length) {
         albumChildren.set(url, children);
-        albumStore[url] = { children: children, at: Date.now() };
-        saveAlbumStore();
+        // partial walks (a mid-walk page error) populate the SESSION view
+        // but never persist — a transient page-2 failure must not pin a
+        // truncated album for the whole 6h TTL
+        if (persist !== false) {
+          albumStore[url] = { children: children, at: Date.now() };
+          saveAlbumStore();
+        }
       } else {
         albumCooldown.set(url, Date.now() + 60000);
       }
@@ -2172,26 +2177,39 @@
       // item grid) or a fetch error falls through to the JSON album API.
       imgPageGet(url, (text) => {
         const kids = parseAlbumPage(text, url);
-        if (kids.length) { albumDone(url, kids); return; }
+        if (kids.length) { albumDone(url, kids, true); return; }
         const acc = [];
         const seen = new Set();
         const step = (page) => {
-          if (page > ALBUM_MAX_PAGES) { albumDone(url, acc); return; }
+          if (page > ALBUM_MAX_PAGES) { albumDone(url, acc, true); return; }
           fetchAlbumApiPage(url, page, (t) => {
             const p = parseAlbumApiResponse(t);
             if (p) for (const c of p.children) { if (!seen.has(c.url)) { seen.add(c.url); acc.push(c); } }
             if (p && page < p.lastPage) step(page + 1);
-            else albumDone(url, acc);
-          }, () => albumDone(url, acc));
+            else albumDone(url, acc, true); // walked to the last page
+          }, () => albumDone(url, acc, false)); // mid-walk error: session-only
         };
         step(1);
       }, () => {
         // page GET failed outright — still try the API before giving up
         fetchAlbumApiPage(url, 1, (t) => {
           const p = parseAlbumApiResponse(t);
-          albumDone(url, p ? p.children : null);
-        }, () => albumDone(url, null));
+          albumDone(url, p ? p.children : null, true);
+        }, () => albumDone(url, null, true));
       });
+    }
+    // warm-cache hits must also surface children: the first collect pass runs
+    // BEFORE any tile exists, so a store hit has to schedule one deferred
+    // re-render (deferred = never re-entrant with the render that is calling
+    // buildMediaCell; coalesced = N cached albums cost one rebuild, not N)
+    let albumPrimeQueued = false;
+    function albumPrimeRender() {
+      if (albumPrimeQueued) return;
+      albumPrimeQueued = true;
+      setTimeout(() => {
+        albumPrimeQueued = false;
+        if (panelIsOpen() && panelTab === 'media') { lastPanelSignature = ''; renderPanelBody(); }
+      }, 0);
     }
     function ensureAlbum(url, cb) {
       if (albumChildren.has(url)) { cb(albumChildren.get(url)); return; }
@@ -2199,6 +2217,7 @@
       if (st && Array.isArray(st.children) && st.children.length && Date.now() - (st.at || 0) < ALBUM_TTL_MS) {
         albumChildren.set(url, st.children);
         cb(st.children);
+        albumPrimeRender();
         return;
       }
       if (Date.now() < (albumCooldown.get(url) || 0)) { cb(null); return; }
