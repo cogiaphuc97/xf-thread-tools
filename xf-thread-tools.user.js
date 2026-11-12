@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         xf-thread-tools
 // @namespace    xf-thread-tools
-// @version      0.18.2
+// @version      0.18.3
 // @description  XenForo 2: sort thread posts by reaction count across all pages (cached) + floating media panel (images / external links).
 // @author       xf-thread-tools
 // @match        *://*/threads/*
@@ -3216,13 +3216,17 @@
     // out of the window (pooled, detached) when the poster arrives — filling
     // a detached tile is fine, the image loads and shows on re-insert.
     function attachTilePoster(tile, poster) {
-      const cell = tile.closest('.xft-cell');
-      if (!poster) { if (cell) cell.classList.remove('xft-loading'); return; }
+      // resolve the cell at EVENT time, not call time: album-child tiles are
+      // filled BEFORE cell.append() — a call-time closest() captures null and
+      // the load handler then never clears .xft-loading (eternal shimmer on a
+      // fully loaded image)
+      const cellOf = () => tile.closest('.xft-cell');
+      if (!poster) { const c = cellOf(); if (c) c.classList.remove('xft-loading'); return; }
       if (tile.querySelector('img')) return;
       const im = document.createElement('img');
       im.alt = '';
-      im.addEventListener('error', () => { im.remove(); if (cell) cell.classList.remove('xft-loading'); }, { once: true });
-      im.addEventListener('load', () => { im.classList.add('xft-ok'); if (cell) cell.classList.remove('xft-loading'); }, { once: true });
+      im.addEventListener('error', () => { im.remove(); const c = cellOf(); if (c) c.classList.remove('xft-loading'); }, { once: true });
+      im.addEventListener('load', () => { im.classList.add('xft-ok'); const c = cellOf(); if (c) c.classList.remove('xft-loading'); }, { once: true });
       im.src = poster;
       tile.appendChild(im);
     }
