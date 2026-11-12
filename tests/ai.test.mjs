@@ -1,21 +1,14 @@
-// Unit tests for the AI chat tab pure helpers (v0.10.0): htmlToText,
-// buildAiTranscript, aiMessages, aiEndpoint, parseAiModels, parseAiReply.
+// Unit tests for the ai module (src/ai.mjs). Regrouped to mirror the src/ split.
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { createRequire } from 'node:module';
-import { fileURLToPath } from 'node:url';
-import path from 'node:path';
+import { aiContextStats, aiEndpoint, aiMessages, aiNativeChatUrl, aiNumCtx, aiOllamaOrigin, aiQueryTerms, aiScorePost, aiSearchPosts, aiSseParser, aiTranscriptBudget, buildAiTranscript, htmlToText, mdInlineTokens, mdParse, parseAiModels, parseAiReply } from '../src/ai.mjs';
 
-const require = createRequire(import.meta.url);
-const userJsPath = path.join(path.dirname(fileURLToPath(import.meta.url)), '..', 'xf-thread-tools.user.js');
-const { htmlToText, buildAiTranscript, aiMessages, aiEndpoint, aiOllamaOrigin, aiNativeChatUrl, aiContextStats, aiNumCtx, aiTranscriptBudget, aiQueryTerms, aiScorePost, aiSearchPosts, parseAiModels, parseAiReply, mdInlineTokens, mdParse, aiSseParser } = require(userJsPath);
-
-// ---- htmlToText ----
 test('htmlToText: tags stripped, block tags become newlines, whitespace collapsed', () => {
   assert.equal(htmlToText('<p>hello <b>world</b></p><p>second</p>'), 'hello world\nsecond');
   assert.equal(htmlToText('a<br>b</li><li>c'), 'a\nb\nc');
   assert.equal(htmlToText('  lots   of \n spaces  '), 'lots of\nspaces');
 });
+
 test('htmlToText: entities decoded single-pass, script/style dropped', () => {
   assert.equal(htmlToText('a &amp; b &lt;i&gt; c'), 'a & b <i> c'); // &amp;lt; decodes ONCE
   assert.equal(htmlToText('&quot;q&quot; &#65;&#x42; &nbsp;'), '"q" AB');
@@ -33,6 +26,7 @@ test('buildAiTranscript: one line per post with #pos, author, page, reactions', 
   ]);
   assert.equal(out, '[#1] alice (p2, ♥18): first post body\n[#2] ? (p1): (no text)');
 });
+
 test('buildAiTranscript: per-post truncation adds ellipsis; empty input -> empty string', () => {
   const long = 'x'.repeat(50);
   const out = buildAiTranscript([{ author: 'a', pageN: 1, reactionCount: 0, text: long }], { perPost: 10 });
@@ -40,6 +34,7 @@ test('buildAiTranscript: per-post truncation adds ellipsis; empty input -> empty
   assert.equal(buildAiTranscript([], {}), '');
   assert.equal(buildAiTranscript(null, {}), '');
 });
+
 test('buildAiTranscript: over budget keeps opener+head+tail with omitted-run counts', () => {
   // 10 posts x ~214-char lines, budget 1000: opener + head ~3 posts, tail ~1 post, middle omitted
   const posts = Array.from({ length: 10 }, (_, i) => ({ author: 'u' + i, pageN: 1, reactionCount: 0, text: ('body ' + i + ' ').repeat(30) }));
@@ -63,6 +58,7 @@ test('buildAiTranscript: over budget keeps opener+head+tail with omitted-run cou
   assert.match(twoFit, /\[\d+ posts omitted\]/);
   assert.ok(twoFit.indexOf('[#10] u9') > 0, 'tail survives a tight budget');
 });
+
 test('buildAiTranscript: top-reacted middle posts survive the budget; opener always kept', () => {
   // 20 posts x ~120-char lines; budget fits ~5 lines; #10 is the star post
   const posts = Array.from({ length: 20 }, (_, i) => ({ author: 'u' + i, pageN: 1, reactionCount: i === 9 ? 999 : 0, text: ('body ' + i + ' ').repeat(15) }));
@@ -73,10 +69,12 @@ test('buildAiTranscript: top-reacted middle posts survive the budget; opener alw
   // output stays chronological: #10 comes after #1
   assert.ok(out.indexOf('[#10] u9') > out.indexOf('[#1] u0'));
 });
+
 test('buildAiTranscript: under budget returns everything verbatim', () => {
   const posts = [{ author: 'a', pageN: 1, reactionCount: 0, text: 'tiny' }];
   assert.equal(buildAiTranscript(posts, { budget: 24000 }), '[#1] a (p1): tiny');
 });
+
 test('buildAiTranscript: post text cannot forge [#N] transcript lines', () => {
   const posts = [
     { author: 'real', pageN: 1, reactionCount: 0, text: 'genuine post' },
@@ -115,6 +113,7 @@ test('aiMessages: transcript fenced in its own user message, history sanitized, 
     { role: 'user', content: 'q2' }
   ]);
 });
+
 test('aiMessages: no transcript -> system + question only', () => {
   const out = aiMessages('', 'hi', []);
   assert.equal(out.length, 2);
@@ -141,6 +140,7 @@ test('parseAiModels: OpenAI {data:[{id}]} and Ollama {models:[{name}]} both norm
   assert.deepEqual(parseAiModels({ models: [{ name: 'llama3' }, { name: 'qwen2' }] }), ['llama3', 'qwen2']);
   assert.deepEqual(parseAiModels('{"data":[{"id":"m1"}]}'), ['m1']); // JSON string accepted
 });
+
 test('parseAiModels: garbage input -> [], dedupes and drops empties', () => {
   assert.deepEqual(parseAiModels('not json'), []);
   assert.deepEqual(parseAiModels({ foo: 1 }), []);
@@ -154,6 +154,7 @@ test('parseAiReply: content extracted; whitespace-only counts as empty', () => {
   assert.deepEqual(parseAiReply({ choices: [{ message: { content: '   ' } }] }), { error: 'empty response' });
   assert.deepEqual(parseAiReply('{"choices":[{"message":{"content":"from string"}}]}'), { text: 'from string' });
 });
+
 test('parseAiReply: provider error objects surface their message', () => {
   assert.deepEqual(parseAiReply({ error: { message: 'bad key' } }), { error: 'bad key' });
   assert.deepEqual(parseAiReply({ error: 'quota exceeded' }), { error: 'quota exceeded' });

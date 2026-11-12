@@ -1,9 +1,10 @@
 {
   "name": "xf-thread-tools",
-  "version": "0.18.4",
+  "version": "0.19.0",
   "private": true,
-  "description": "XenForo 2 userscript: thread reaction-sort + media panel (dev scaffolding; the deliverable is xf-thread-tools.user.js)",
+  "description": "XenForo 2 userscript: thread reaction-sort + media panel (dev scaffolding; the deliverable is the built xf-thread-tools.user.js)",
   "scripts": {
+    "build": "node scripts/build.mjs",
     "test": "node --test tests/*.test.mjs"
   }
 }

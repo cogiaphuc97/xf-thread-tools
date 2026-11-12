@@ -1,54 +1,63 @@
-// Unit tests for the remaining pure feature helpers (v0.9.1 export pass):
-// hostKey / cleanThreadTitle / dosDateTime (previously only covered
-// indirectly), fmtSpeed / fmtEta (dashboard formatting), buildMediaLayout
-// (media grouping + dense 4-packing). Same load path as parse.test.mjs.
+// Unit tests for the layout module (src/layout.mjs). Regrouped to mirror the src/ split.
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { createRequire } from 'node:module';
-import { fileURLToPath } from 'node:url';
-import path from 'node:path';
+import { buildMediaLayout, fmtEta, fmtSpeed, layoutMetrics, windowRange } from '../src/layout.mjs';
 
-const require = createRequire(import.meta.url);
-const userJsPath = path.join(path.dirname(fileURLToPath(import.meta.url)), '..', 'xf-thread-tools.user.js');
-const { hostKey, cleanThreadTitle, dosDateTime, fmtSpeed, fmtEta, buildMediaLayout } = require(userJsPath);
+const row = (...idxs) => ({ idxs: idxs });
+const head = (label) => ({ hdr: 'main', label: label, postId: 'p1' });
+const sub = (label) => ({ hdr: 'sub', label: label, postId: 'p1' });
+const RH = 140, HH = 30, SH = 24, G = 6;
 
-// ---- hostKey (same-host detection core for filterLinks) ----
-test('hostKey: lowercases and strips ONLY the leading www.', () => {
-  assert.equal(hostKey('www.Example.COM'), 'example.com');
-  assert.equal(hostKey('www.forum.example.org'), 'forum.example.org');
-  assert.equal(hostKey('a.b.example.org'), 'a.b.example.org');
-});
-test('hostKey: port kept, garbage coerced to empty string', () => {
-  assert.equal(hostKey('example.com:8443'), 'example.com:8443');
-  assert.equal(hostKey(''), '');
-  assert.equal(hostKey(null), '');
-  assert.equal(hostKey(undefined), '');
-  assert.equal(hostKey('www.'), '');
+
+test('layoutMetrics: flat rows advance by rowH+gap, total has no trailing gap', () => {
+  const m = layoutMetrics([row(0,1,2,3), row(4,5,6,7), row(8)], RH, HH, SH, G);
+  assert.equal(m.top[0], 0);
+  assert.equal(m.top[1], RH + G);
+  assert.equal(m.top[2], 2 * (RH + G));
+  assert.equal(m.h[0], RH);
+  assert.equal(m.total, 3 * RH + 2 * G);
 });
 
-// ---- cleanThreadTitle (zip outer name source) ----
-test('cleanThreadTitle: leading [tag] groups and trailing " | Forum" suffix stripped', () => {
-  assert.equal(cleanThreadTitle('[NSFW] [4K] Real Title'), 'Real Title');
-  assert.equal(cleanThreadTitle('My Thread | Some Forum'), 'My Thread');
-  assert.equal(cleanThreadTitle('[Only]'), '');
-});
-test('cleanThreadTitle: Windows-illegal chars removed, control chars collapsed, Unicode kept', () => {
-  assert.equal(cleanThreadTitle('What: A *Question?'), 'What A Question');
-  assert.equal(cleanThreadTitle('a\x01\x02b'), 'a b');
-  assert.equal(cleanThreadTitle('Tiêu Đề Đẹp 4K'), 'Tiêu Đề Đẹp 4K');
-  assert.equal(cleanThreadTitle(null), '');
-  assert.equal(cleanThreadTitle('   '), '');
+test('layoutMetrics: interleaved headers use their own heights', () => {
+  const m = layoutMetrics([head('Page 1'), row(0), sub('#1'), row(1)], RH, HH, SH, G);
+  assert.equal(m.top[0], 0);
+  assert.equal(m.top[1], HH + G);
+  assert.equal(m.top[2], HH + G + RH + G);
+  assert.equal(m.top[3], HH + G + RH + G + SH + G);
+  assert.equal(m.total, HH + RH + SH + RH + 3 * G);
 });
 
-// ---- dosDateTime (zip local/central header timestamps, DOS format) ----
-test('dosDateTime: exact DOS bit-packing for a known date', () => {
-  // 2026-11-09 20:46:30 local
-  assert.deepEqual(dosDateTime(new Date(2026, 10, 9, 20, 46, 30)), { time: (20 << 11) | (46 << 5) | (30 >> 1), date: (46 << 9) | (11 << 5) | 9 });
-  // seconds floor to 2s resolution (>> 1)
-  assert.deepEqual(dosDateTime(new Date(2020, 0, 1, 0, 0, 59)).time, 29);
+test('layoutMetrics: empty layout totals 0', () => {
+  const m = layoutMetrics([], RH, HH, SH, G);
+  assert.equal(m.total, 0);
+  assert.deepEqual(m.top, []);
 });
-test('dosDateTime: pre-1980 dates clamp to the DOS epoch 1980-01-01', () => {
-  assert.deepEqual(dosDateTime(new Date(1970, 0, 1, 0, 0, 0)), { time: 0, date: 33 }); // (0<<9)|(1<<5)|1
+
+test('windowRange: viewport over middle entries', () => {
+  const es = [row(0), row(1), row(2), row(3), row(4)];
+  const m = layoutMetrics(es, RH, HH, SH, G);
+  // view covering entry 2 exactly (top 292..432+)
+  assert.deepEqual(windowRange(m.top, m.h, 292, 432), [2, 2]);
+  // view covering entries 1..3
+  assert.deepEqual(windowRange(m.top, m.h, 146, 578), [1, 3]);
+});
+
+test('windowRange: viewTop inside the gap after entry e starts at e+1', () => {
+  const es = [row(0), row(1), row(2)];
+  const m = layoutMetrics(es, RH, HH, SH, G);
+  // bottom of entry 0 = 140; 141..145 is the gap before entry 1 (top 146)
+  assert.deepEqual(windowRange(m.top, m.h, 143, 200), [1, 1]);
+  // straddler: viewTop 100 cuts through entry 0 — it stays in
+  assert.deepEqual(windowRange(m.top, m.h, 100, 200), [0, 1]);
+});
+
+test('windowRange: clamps at both ends, empty layout, past-the-end window', () => {
+  const es = [row(0), row(1), row(2)];
+  const m = layoutMetrics(es, RH, HH, SH, G);
+  assert.deepEqual(windowRange(m.top, m.h, -500, 0), [0, 0]);
+  assert.deepEqual(windowRange(m.top, m.h, 0, 99999), [0, 2]);
+  assert.deepEqual(windowRange(m.top, m.h, m.total + 100, m.total + 200), [3, -1]);
+  assert.deepEqual(windowRange([], [], 0, 100), [0, -1]);
 });
 
 // ---- fmtSpeed (dashboard speed column) ----
@@ -71,6 +80,7 @@ test('fmtEta: hidden under 2s, seconds below 90s', () => {
   assert.equal(fmtEta(2), '≈ 2s');
   assert.equal(fmtEta(44.4), '≈ 44s');
 });
+
 test('fmtEta: minutes from 90s, saturates at 90m+', () => {
   assert.equal(fmtEta(90), '≈ 2m'); // 90s lands in the minute branch, rounds up
   assert.equal(fmtEta(3600), '≈ 60m');
@@ -87,10 +97,12 @@ test('buildMediaLayout: flat mode = pure sequential 4-packs, no headers, ragged 
   assert.deepEqual(lay, [{ idxs: [0, 1, 2, 3] }, { idxs: [4, 5, 6, 7] }, { idxs: [8] }]);
   assert.equal(buildMediaLayout([], 'flat').length, 0);
 });
+
 test('buildMediaLayout: unknown mode string falls back to flat packing', () => {
   const items = Array.from({ length: 4 }, (_, i) => mk('p', 'a', 1, i));
   assert.deepEqual(buildMediaLayout(items, 'weird'), [{ idxs: [0, 1, 2, 3] }]);
 });
+
 test('buildMediaLayout: post mode regathers scattered posts, no sub-headers', () => {
   // items of p1 appear, then p2, then MORE p1 — grouping must reunite them
   const items = [mk('p1', 'Alice', 1, 3), mk('p1', 'Alice', 1, 3), mk('p2', 'Bob', 1, 4), mk('p1', 'Alice', 1, 3), mk('p1', 'Alice', 1, 3)];
@@ -102,6 +114,7 @@ test('buildMediaLayout: post mode regathers scattered posts, no sub-headers', ()
     { idxs: [2] },
   ]);
 });
+
 test('buildMediaLayout: page mode groups by pageN with #pos - author sub-headers', () => {
   const items = [mk('b', 'Bob', 2, 5), mk('a', 'Alice', 1, 1), mk('b', 'Bob', 2, 5)];
   const lay = buildMediaLayout(items, 'page');
@@ -114,6 +127,7 @@ test('buildMediaLayout: page mode groups by pageN with #pos - author sub-headers
     { idxs: [1] },
   ]);
 });
+
 test('buildMediaLayout: user mode labels groups by author, sub-header shows only #pos; missing author -> ?', () => {
   const items = [mk('a', 'Alice', 1, 7), mk('b', '', 2, 8), mk('a', 'Alice', 1, 7)];
   const lay = buildMediaLayout(items, 'user');
@@ -126,6 +140,7 @@ test('buildMediaLayout: user mode labels groups by author, sub-header shows only
     { idxs: [1] },
   ]);
 });
+
 test('buildMediaLayout: grouped rows pack densely (5 items -> 4+1 inside the group)', () => {
   const items = Array.from({ length: 5 }, () => mk('p1', 'A', 1, 1));
   const lay = buildMediaLayout(items, 'post');
@@ -135,6 +150,7 @@ test('buildMediaLayout: grouped rows pack densely (5 items -> 4+1 inside the gro
     { idxs: [4] },
   ]);
 });
+
 test('buildMediaLayout: missing pageN defaults to page 1', () => {
   const items = [mk('a', 'A', 0, 1)];
   const lay = buildMediaLayout(items, 'page');

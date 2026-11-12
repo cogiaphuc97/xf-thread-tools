@@ -1,0 +1,77 @@
+{
+  "bundle": "xf-thread-tools.user.js",
+  "description": "Module graph for the xf-thread-tools build: pure ESM modules (importable, unit-tested) and order-preserving runtime fragments (slices of main()'s body sharing its scope). scripts/build.mjs consumes this manifest; scripts/split.mjs used it for the one-time split from the single-file script. docs/MODULES.md is generated from this file.",
+  "pureModules": [
+    {
+      "name": "config",
+      "file": "src/config.mjs",
+      "desc": "Storage keys, default settings (delays, caps, AI opts), BASE_SEL selector defaults. No functions, no DOM.",
+      "symbols": ["SETTINGS_KEY", "AI_KEY", "DEFAULT_CAP_BYTES", "DEFAULT_SETTINGS", "BASE_SEL"]
+    },
+    {
+      "name": "parse",
+      "file": "src/parse.mjs",
+      "desc": "Pure parsing/classification: reaction-count text (EN/VI), link filtering, link partition/group/filter, post sorting, size estimation.",
+      "symbols": ["OTHERS_RE", "NAME_SEP_RE", "parseReactionCount", "hostKey", "filterLinks", "partitionLinks", "extractDomain", "groupLinkItems", "applyLinkFilters", "sortPosts", "estimateSize"]
+    },
+    {
+      "name": "media",
+      "file": "src/media.mjs",
+      "desc": "Pure media classification and resolution helpers: image/video extension gates, smilie + boilerplate fingerprint, image landing-page parse, HQ .md/.th candidate chain, album page/API parse.",
+      "symbols": ["IMG_EXT_RE", "VID_EXT_RE", "boilerplateUrls", "isSmilieUrl", "imagePageHref", "parseImagePage", "parseImageApiResponse", "HQ_IMG_RE", "hqCandidates", "isAlbumPageUrl", "parseAlbumPage", "parseAlbumApiResponse"]
+    },
+    {
+      "name": "embed",
+      "file": "src/embed.mjs",
+      "desc": "Pure video-host carriers: embed poster parse, sign-endpoint URL/response shapes, view-API parse, video file-page carrier parse, /v/ /f/ /d/ URL shapes.",
+      "symbols": ["parseEmbedPoster", "embedSignUrl", "parseSignResponse", "parseSignToken", "embedViewApiUrl", "parseViewApiResponse", "parseVideoPage", "isFileDPageUrl", "isVideoPageUrl"]
+    },
+    {
+      "name": "zip",
+      "file": "src/zip.mjs",
+      "desc": "Pure zip writer (STORE method, hand-rolled, CRC32, LE helpers, headers, EOCD) + naming: segment sanitize, site tag, thread title cleaning, kind tag, outer/entry file names.",
+      "symbols": ["sanitizeFileSeg", "siteTagFromHost", "cleanThreadTitle", "zipKindTag", "zipFileName", "dlBasename", "CRC_TABLE", "crc32", "dosDateTime", "u16le", "u32le", "concatU8", "zipLocalHeader", "zipCentralEntry", "zipEocd", "zipStoreU8"]
+    },
+    {
+      "name": "dlplan",
+      "file": "src/dlplan.mjs",
+      "desc": "Pure download planning: job list from media items (dedup, seq-prefixed names, kind routing), chunk plans for Range parts, failure classification, per-origin burst verdict from rolling history.",
+      "symbols": ["buildDlJobs", "dlChunkPlan", "dlFailClass", "originBurstingFromHist"]
+    },
+    {
+      "name": "layout",
+      "file": "src/layout.mjs",
+      "desc": "Pure grid math: exact spacer metrics, window binary search, speed/ETA formatting, media layout entries (grouping headers + 4-cell rows).",
+      "symbols": ["layoutMetrics", "windowRange", "fmtSpeed", "fmtEta", "buildMediaLayout"]
+    },
+    {
+      "name": "ai",
+      "file": "src/ai.mjs",
+      "desc": "Pure AI helpers: htmlToText, transcript builder (query-boosted, budgeted), system prompts (en/vi), endpoint/base/native-chat URL math, context stats, model/reply parsers, markdown tokenizer/renderer core, SSE+NDJSON stream parser.",
+      "symbols": ["htmlToText", "buildAiTranscript", "AI_SYS_PROMPTS", "AI_STOPWORDS", "aiQueryTerms", "aiScorePost", "aiSearchPosts", "aiMessages", "AI_BASES", "aiEndpoint", "aiOllamaOrigin", "aiNativeChatUrl", "aiContextStats", "aiNumCtx", "aiTranscriptBudget", "parseAiModels", "parseAiReply", "mdInlineTokens", "mdParse", "aiSseParser"]
+    }
+  ],
+  "runtimeFragments": [
+    { "name": "rt-settings", "file": "src/rt-settings.js", "anchor": "readStore", "desc": "GM storage read/write, AI key storage (GM-only), settings load/merge, selector merge (SEL), sleep/route/threadId/threadKey helpers, page-number readers." },
+    { "name": "rt-hub", "file": "src/rt-hub.js", "anchor": "hub", "desc": "Shared thread state hub (meta, fetch progress) + record version/pos-map/sorter-pending state." },
+    { "name": "rt-extract", "file": "src/rt-extract.js", "anchor": "orderedRecords", "desc": "Record ordering/positions, URL absolutize, lazy body HTML, extractPost (media/links/imgPages/albums, quote+signature skip), doc extraction, live-page seed, size measurement." },
+    { "name": "rt-cache", "file": "src/rt-cache.js", "anchor": "cache", "desc": "IndexedDB wrapper (posts/threads stores, cap handling, fallback), cachePutPosts, threadUrl builder." },
+    { "name": "rt-fetch", "file": "src/rt-fetch.js", "anchor": "runFetch", "desc": "Sequential page fetch engine with retries/leash, partial resume set, ensure/ensureForSort paths." },
+    { "name": "rt-sorter", "file": "src/rt-sorter.js", "anchor": "notify", "desc": "Sort button state, post clone builder, reaction sorter (reorder, chunked Show more, restore)." },
+    { "name": "rt-grid", "file": "src/rt-grid.js", "anchor": "panel", "desc": "Panel element handles, virtualizer (pool, sig rows, reconcile, renderSlice, mount, clearVRows), tiny/broken media state, pop suppress + broken-rerender debounce. NOTE: 'panel' here is the first `let panel` handle declaration; fragment spans through scheduleBrokenRerender." },
+    { "name": "rt-posters", "file": "src/rt-posters.js", "anchor": "EMBED_POSTERS_KEY", "desc": "Embed poster cache (GM storage), queued poster fetch net (2/350ms, backoff, cooldown), ensureEmbedPoster." },
+    { "name": "rt-embednet", "file": "src/rt-embednet.js", "anchor": "EMBED_STREAMS_KEY", "desc": "Embed stream cache, gmGetText/gmPostJson (GM XHR + fetch fallback), resolveEmbedStream (sign endpoint / view API / file-page carriers)." },
+    { "name": "rt-imgpage", "file": "src/rt-imgpage.js", "anchor": "imgPageCache", "desc": "Image landing-page HQ resolution: session cache, cooldown, queued net (2/350ms), inflight dedup, force path for viewer/downloads." },
+    { "name": "rt-albums", "file": "src/rt-albums.js", "anchor": "ALBUMS_KEY", "desc": "Album expansion runtime: GM-storage store (TTL, prune), HTML/API walk, albumDone rerender, ensureAlbum lazy trigger." },
+    { "name": "rt-viewstate", "file": "src/rt-viewstate.js", "anchor": "settingsView", "desc": "View state (tab/subtab/scroll memory per view), viewer state vars, render queue flag, mkBtn button helper." },
+    { "name": "rt-failpolicy", "file": "src/rt-failpolicy.js", "anchor": "markMediaBroken", "desc": "Failure policy: origin stats/verdicts, stall state + ladder + recovery queue, retire, animate-out, mark loaded, viewer img slot sizing, HQ stage/retry memory." },
+    { "name": "rt-download", "file": "src/rt-download.js", "anchor": "dlRun", "desc": "Download engine: run state, two-level net pools (files/connections), chunked transfers, retries/leashes/watchdog, zip assembly + save, dashboard UI, startBulkDownload." },
+    { "name": "rt-media", "file": "src/rt-media.js", "anchor": "attachTilePoster", "desc": "Media element builders: tile poster attach (event-time cell resolve), loadSwapImg (referer policy + cache-bust retry), buildMediaEl (loading gate, HQ swap, album thumbs)." },
+    { "name": "rt-chrome", "file": "src/rt-chrome.js", "anchor": "updateProgressText", "desc": "Panel chrome updates: progress text, render scheduling, tab/subtab switching + counts, viewer open/close, jumpTo." },
+    { "name": "rt-render", "file": "src/rt-render.js", "anchor": "lastPanelSignature", "desc": "Panel data pipeline: render signature, panelData/collectMediaItems (dedup, album children, badges), renderPanelBody (all tabs, virtualized grid mount, links rows, scroll memory)." },
+    { "name": "rt-settingsview", "file": "src/rt-settingsview.js", "anchor": "buildSettingsView", "desc": "Settings form (numeric fields, base path, animations toggle)." },
+    { "name": "rt-aitab", "file": "src/rt-aitab.js", "anchor": "aiViewEl", "desc": "AI tab runtime: chat state (aiSeq rebuild guard), aiRequest (GM stream + fallback), send/dispatch (SEARCH protocol), test connection, markdown DOM renderer, renderAiTab." },
+    { "name": "rt-panel", "file": "src/rt-panel.js", "anchor": "applyAnimOverride", "desc": "Panel shell: anim override, open/close, count-only updates, scroll/resize watches, filter controls, links bar, edge button, settings toggle, buildPanel." },
+    { "name": "rt-boot", "file": "src/rt-boot.js", "anchor": "injectToolbar", "desc": "Toolbar injection, embedded CSS (token system), boot IIFE (progress init, autoFetch kick)." }
+  ]
+}

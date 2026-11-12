@@ -52,8 +52,11 @@ Sorting = downloading every page of the thread. Requests are strictly sequential
 
 ## Development
 
+Source is split by function under `src/` (pure ESM modules + order-preserving runtime fragments, mapped in `scripts/modules.json`); the single-file deliverable is assembled by a zero-dependency build:
+
 ```
-npm test
+npm run build   # src/ -> xf-thread-tools.user.js (syntax-checked)
+npm test        # node:test, one suite per src module + bundle smoke
 ```
 
-`node:test` suite against the pure functions exported via the userscript's UMD tail. The runtime guard (`<html id="XF" data-template="thread_view">`) keeps all DOM/GM code inert under Node, so the same file is both deliverable and test target — and inert (no buttons, no console output, no network) on non-thread pages.
+Never edit `xf-thread-tools.user.js` directly — edit `src/` and rebuild. The runtime guard (`<html id="XF" data-template="thread_view">`) keeps all DOM/GM code inert under Node and on non-thread pages (no buttons, no console output, no network).
