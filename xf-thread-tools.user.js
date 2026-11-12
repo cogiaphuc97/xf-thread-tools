@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         xf-thread-tools
 // @namespace    xf-thread-tools
-// @version      0.17.1
+// @version      0.17.2
 // @description  XenForo 2: sort thread posts by reaction count across all pages (cached) + floating media panel (images / external links).
 // @author       xf-thread-tools
 // @match        *://*/threads/*
@@ -1885,7 +1885,7 @@
       if (c && c.exp - now > 60) { cb(c.url); return; }
       const sign = embedSignUrl(url);
       const view = embedViewApiUrl(url);
-      if (!sign && !view && !isVideoPageUrl(url)) { cb(''); return; }
+      if (!sign && !view && !isVideoPageUrl(url) && !VID_EXT_RE.test(url)) { cb(''); return; }
       if (embedStreamInflight.has(url)) { embedStreamInflight.get(url).push(cb); return; }
       const queue = [cb];
       embedStreamInflight.set(url, queue);
@@ -1899,27 +1899,24 @@
         }
         embedStreamInflight.delete(url);
       };
+      // carrier -> direct stream: sign when the page says so (bunkr-style
+      // {token, ex} appended by the caller), plain src otherwise
+      const finishCarrier = (carrier) => {
+        if (!carrier) { finish(null); return; }
+        if (!carrier.sign) { finish({ url: carrier.src, exp: 0 }); return; }
+        let path = '';
+        try { path = new URL(carrier.src).pathname; } catch (e) { finish(null); return; }
+        gmGetText(carrier.sign + '?path=' + encodeURIComponent(path), (st) => {
+          const tok = parseSignToken(st);
+          if (!tok) { finish(null); return; }
+          finish({ url: carrier.src + (carrier.src.indexOf('?') === -1 ? '?' : '&')
+            + 'token=' + encodeURIComponent(tok.token) + '&ex=' + tok.exp, exp: tok.exp });
+        }, () => finish(null));
+      };
       // route 2: file-page hosts (bunkr-style /v/ or /f/ pages) — fetch the
       // page, extract the carrier, sign it if the page says so
       const resolveViaPage = () => {
-        const pageDone = (text) => {
-          const carrier = parseVideoPage(text);
-          if (!carrier) { finish(null); return; }
-          if (carrier.sign) {
-            let path = '';
-            try { path = new URL(carrier.src).pathname; } catch (e) { finish(null); return; }
-            const signDone = (st) => {
-              const tok = parseSignToken(st);
-              if (!tok) { finish(null); return; }
-              finish({ url: carrier.src + (carrier.src.indexOf('?') === -1 ? '?' : '&')
-                + 'token=' + encodeURIComponent(tok.token) + '&ex=' + tok.exp, exp: tok.exp });
-            };
-            gmGetText(carrier.sign + '?path=' + encodeURIComponent(path), signDone, () => finish(null));
-          } else {
-            finish({ url: carrier.src, exp: 0 });
-          }
-        };
-        gmGetText(url, pageDone, () => finish(null));
+        gmGetText(url, (text) => finishCarrier(parseVideoPage(text)), () => finish(null));
       };
       const ok = (text) => finish(parseSignResponse(text));
       if (sign) {
@@ -1930,6 +1927,11 @@
         // stream URL, no page fetch needed
         gmPostJson(view.url, { file_slug: view.slug },
           (t) => finish(parseViewApiResponse(t, now)), () => finish(null));
+      } else if (VID_EXT_RE.test(url)) {
+        // route 3: DIRECT file URLs that 301 to an HTML page (bunkr moved
+        // cdn/<file>.mp4 -> /f/<file>.mp4): <video> gets HTML and dies. Fetch,
+        // and if the answer parses as a file page, resolve through it
+        gmGetText(url, (text) => finishCarrier(parseVideoPage(text)), () => finish(null));
       } else {
         resolveViaPage();
       }
@@ -2582,16 +2584,34 @@
         dlStream(job, ctx, url, (r) => {
           if (dlRun.cancel || ctx.killed || ctx.released) { release(); return; }
           if (r.blob) {
-            job.state = 'done';
-            job.badge = '';
-            dlRun.done++;
-            dlRun.bytes += r.blob.size;
-            job.blob = r.blob;
-            if (dlRun.bytes > DL_BYTE_CAP) { // stop scheduling; keep what's fetched
-              dlRun.lastErr = 'size cap reached — zip truncated';
-              dlNet.queue.length = 0;
-            }
-            dlAfter(release);
+            // a "file" that is really an HTML page (direct URL 301'd to a
+            // landing page, e.g. bunkr cdn -> /f/): re-resolve through the
+            // page carrier ONCE instead of zipping HTML as media
+            dlSniffHtml(r.blob).then((isHtml) => {
+              if (dlRun.cancel || ctx.killed || ctx.released) { release(); return; }
+              if (isHtml && !job.movedPage) {
+                job.movedPage = true;
+                job.badge = '…';
+                resolveEmbedStream(job.cands[ci], (src) => {
+                  job.badge = '';
+                  if (dlRun.cancel || ctx.killed || ctx.released) { release(); return; }
+                  if (!src) { failWith('moved page unresolved', 0, 0, 'trans'); return; }
+                  stream(src);
+                });
+                return;
+              }
+              if (isHtml) { failWith('moved page unresolved', 0, 0, 'trans'); return; }
+              job.state = 'done';
+              job.badge = '';
+              dlRun.done++;
+              dlRun.bytes += r.blob.size;
+              job.blob = r.blob;
+              if (dlRun.bytes > DL_BYTE_CAP) { // stop scheduling; keep what's fetched
+                dlRun.lastErr = 'size cap reached — zip truncated';
+                dlNet.queue.length = 0;
+              }
+              dlAfter(release);
+            });
             return;
           }
           failWith(r.why || 'failed', r.status | 0, r.retryAfter | 0, r.cls);
@@ -2623,6 +2643,14 @@
       }
       stream(job.cands[ci]);
     }
+    // HTML-page sniff for downloaded blobs: redirect-following fetches can
+    // hand back a landing page where a media file was expected (moved CDNs).
+    // Promise<boolean>; never throws.
+    function dlSniffHtml(blob) {
+      if (!blob || typeof blob.slice !== 'function' || blob.size === 0) return Promise.resolve(false);
+      return blob.slice(0, 64).text().then((t) => /^\s*</.test(t)).catch(() => false);
+    }
+
     // One file → bytes. GM path probes with a Range request: a 206 answer
     // with a Content-Range total ≥ DL_CHUNK_MIN switches to parallel ranged
     // parts (the probe body IS part 0); a 200 answer means the server
@@ -3046,7 +3074,20 @@
         } else {
           v.src = url;
         }
-        v.addEventListener('error', () => markMediaBroken(v, url));
+        v.addEventListener('error', function onErr() {
+          // a direct CDN file that 301'd to an HTML page (bunkr cdn -> /f/)
+          // errors on first load — resolve through the page carrier once,
+          // then give up as broken
+          if (!v.dataset.xftMoved) {
+            v.dataset.xftMoved = '1';
+            resolveEmbedStream(url, (src) => {
+              if (src) { v.referrerPolicy = 'no-referrer'; v.src = src; return; }
+              markMediaBroken(v, url);
+            });
+            return;
+          }
+          markMediaBroken(v, url);
+        });
         v.addEventListener('loadeddata', () => markMediaLoaded(v), { once: true });
         // cached failures never fire events — probe after a moment
         setTimeout(() => {
