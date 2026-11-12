@@ -1541,14 +1541,14 @@
       const isVideo = it.kind === 'video' || it.kind === 'embed';
       // album children with a known thumbnail display it directly — no per-
       // file page fetch for the tile (the album page already carried it)
-      const thumb = (it.album && it.thumb)
-        ? (() => {
-            const tile = document.createElement('div');
-            tile.className = 'xft-vtile';
-            attachTilePoster(tile, it.thumb);
-            return tile;
-          })()
-        : buildMediaEl(it.kind, it.url, true, (it.r.imgPages || {})[it.url] || '');
+      let thumb = null;
+      if (it.album && it.thumb) {
+        thumb = document.createElement('div');
+        thumb.className = 'xft-vtile';
+        attachTilePoster(thumb, it.thumb);
+      } else {
+        thumb = buildMediaEl(it.kind, it.url, true, (it.r.imgPages || {})[it.url] || '');
+      }
       // shimmer while the media loads (cached-complete images come back
       // already ok'd — no flash for them)
       if ((it.kind === 'image' || it.kind === 'embed')
