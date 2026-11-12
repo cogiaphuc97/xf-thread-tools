@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         xf-thread-tools
 // @namespace    xf-thread-tools
-// @version      0.18.1
+// @version      0.18.2
 // @description  XenForo 2: sort thread posts by reaction count across all pages (cached) + floating media panel (images / external links).
 // @author       xf-thread-tools
 // @match        *://*/threads/*
@@ -3000,12 +3000,18 @@
       ttfbT = setTimeout(() => { if (!firstByte) finish({ why: 'no first byte', status: 0, cls: 'trans' }); }, DL_TTFB);
       if (typeof GM_xmlhttpRequest === 'function') {
         try {
+          // cross-host media CDNs split on referers: the 2026-11 cuckcapital
+          // wall 403s no-referer downloads of originals; every known family
+          // accepts the FORUM referer — send it (GM may set Referer, fetch
+          // cannot). Range rides the same header set.
+          const dlHdrs = Object.assign({}, opts.range ? { Range: 'bytes=' + opts.range[0] + '-' + opts.range[1] } : null);
+          if (extractDomain(url) !== hostKey(location.host)) dlHdrs.Referer = location.origin + '/';
           const gmRq = GM_xmlhttpRequest({
             method: 'GET',
             url: url,
             responseType: 'blob',
             timeout: DL_READ,
-            headers: opts.range ? { Range: 'bytes=' + opts.range[0] + '-' + opts.range[1] } : undefined,
+            headers: Object.keys(dlHdrs).length ? dlHdrs : undefined,
             onprogress: (r) => { if (r && r.loaded) prog(r.loaded, (r && r.total) | 0); },
             onload: (r) => {
               const st = r ? (r.status | 0) : 0;
@@ -3031,7 +3037,9 @@
       }
       const ctl = (typeof AbortController !== 'undefined') ? new AbortController() : null;
       leash = ctl ? setTimeout(() => { try { ctl.abort(); } catch (e) {} }, DL_READ) : 0;
-      fetch(url, { referrerPolicy: 'no-referrer', signal: ctl ? ctl.signal : undefined })
+      // fetch cannot set the Referer header, but the spec-legal `referrer`
+      // init option sends the forum origin — the policy cuckcapital requires
+      fetch(url, { referrer: location.origin + '/', signal: ctl ? ctl.signal : undefined })
         .then(async (r) => {
           if (!r.ok) {
             const ra = parseInt(r.headers.get('retry-after') || '0', 10) || 0;
@@ -3217,6 +3225,44 @@
       im.addEventListener('load', () => { im.classList.add('xft-ok'); if (cell) cell.classList.remove('xft-loading'); }, { once: true });
       im.src = poster;
       tile.appendChild(im);
+    }
+
+    // Swap-image loader with an error-driven referer fallback. Referer rules
+    // are CDN-specific and unknowable up front: the 2026-11 cuckcapital
+    // hotlink wall serves originals ONLY with the forum referer (403
+    // no-referer — verified live), while the older scdn-family CDNs 403
+    // foreign referers and serve no-referer. Page-default policy (this page
+    // IS the forum) goes first; one no-referrer retry on error or on a
+    // loaded ≤1px block pixel; then cb(null). onload(el, noRef) reports the
+    // policy that worked so the final src swap can copy it.
+    function loadSwapImg(src, onload, onfail) {
+      const el = new Image();
+      el.decoding = 'async';
+      let usedNoRef = false;
+      let done = false;
+      let tryUrl = src;
+      // listeners must survive the block-pixel attempt: a `load` of a ≤1px
+      // hotlink pixel is a FAILURE that retries with no-referrer — the
+      // retry's real load then fires this same listener. The retry ALSO
+      // cache-busts: the image cache is keyed by URL only, so re-requesting
+      // the same src under a new referer policy replays the poisoned entry
+      // without a network fetch
+      const fail = () => {
+        if (done) return;
+        if (usedNoRef) { done = true; onfail(null); return; }
+        usedNoRef = true;
+        tryUrl = src + (src.indexOf('?') === -1 ? '?' : '&') + 'xftref=1';
+        el.referrerPolicy = 'no-referrer';
+        el.src = tryUrl;
+      };
+      el.addEventListener('load', () => {
+        if (done) return;
+        if (el.naturalWidth > 1) { done = true; onload(el, usedNoRef); return; }
+        fail(); // hotlink block pixels "load" as ≤1px — treat as failure
+      });
+      el.addEventListener('error', fail);
+      el.src = tryUrl;
+      return el;
     }
 
     function buildMediaEl(kind, url, thumb, pageUrl) {
@@ -3427,34 +3473,21 @@
             return;
           }
           if (im.src === full) return;
-          // decode the original OFFSCREEN first: swapping src on the live img
-          // paints the progressive stream part-by-part. Preload + decode()
-          // means the swap shows a complete frame, then a short crossfade
-          // (old frame on the bottom layer) makes the replace smooth.
-          const pre = new Image();
-          pre.decoding = 'async';
-          pre.referrerPolicy = 'no-referrer'; // CDNs in this family 403 foreign referers
-          pre.src = full;
-          const show = () => {
+          // load the original through the referer-fallback loader (forum
+          // referer first, no-referrer once) and crossfade it in — the
+          // loaded probe element IS the swap layer, so the frame is already
+          // decoded when it lands (no progressive paint-through)
+          loadSwapImg(full, (top, noRef) => {
             const host = im.parentNode;
-            if (!host || im.src === full) return;
-            const top = document.createElement('img');
-            top.src = full;
+            const src2 = top.src; // the URL that actually loaded (cache-busted on the fallback path)
+            if (!host || im.src === src2) return;
             top.alt = '';
-            top.referrerPolicy = 'no-referrer';
-            top.className = 'xft-hq-top';
-            top.addEventListener('load', () => {
-              top.classList.add('xft-ok'); // reveal gate: cell imgs are blur-gated until ok
-              requestAnimationFrame(() => top.classList.add('xft-hq-on'));
-              setTimeout(() => { im.src = full; top.remove(); }, 450); // swap beneath, then drop the layer
-            }, { once: true });
-            // the swap layer must never linger invisible on a dead original
-            top.addEventListener('error', () => { top.remove(); }, { once: true });
+            top.className = 'xft-hq-top xft-ok'; // reveal gate passes at once — frame is decoded
+            if (noRef) im.referrerPolicy = 'no-referrer'; // the final swap must reuse the policy that worked
             host.appendChild(top);
-            if (top.complete && top.naturalWidth) top.dispatchEvent(new Event('load'));
-          };
-          if (pre.decode) pre.decode().then(show, show);
-          else pre.addEventListener('load', show, { once: true });
+            requestAnimationFrame(() => top.classList.add('xft-hq-on'));
+            setTimeout(() => { im.src = src2; top.remove(); }, 450); // swap beneath, then drop the layer
+          }, () => { /* both policies failed — embedded copy stays */ });
         }, force2 || !thumb);
         wantHq();
       }
