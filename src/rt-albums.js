@@ -39,8 +39,10 @@
       const q = albumInflight.get(url) || [];
       albumInflight.delete(url);
       // children arriving changes the grid item list — re-render the media
-      // tab once (signature reset forces it even when counts alone collide)
-      if (panelIsOpen() && panelTab === 'media') { lastPanelSignature = ''; renderPanelBody(); }
+      // tab once (signature reset forces it even when counts alone collide),
+      // behind the scroll-idle gate: an expansion landing mid-scroll must
+      // not yank the grid under the user
+      if (panelIsOpen() && panelTab === 'media') { lastPanelSignature = ''; deferGridRebuild(); }
       for (const fn of q) fn(children && children.length ? children : null);
     }
     function fetchAlbumApiPage(url, page, onOk, onErr) {
@@ -91,7 +93,7 @@
       albumPrimeQueued = true;
       setTimeout(() => {
         albumPrimeQueued = false;
-        if (panelIsOpen() && panelTab === 'media') { lastPanelSignature = ''; renderPanelBody(); }
+        if (panelIsOpen() && panelTab === 'media') { lastPanelSignature = ''; deferGridRebuild(); }
       }, 0);
     }
     function ensureAlbum(url, cb) {

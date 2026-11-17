@@ -1,7 +1,7 @@
 // Unit tests for the layout module (src/layout.mjs). Regrouped to mirror the src/ split.
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { buildMediaLayout, fmtEta, fmtSpeed, layoutMetrics, windowRange } from '../src/layout.mjs';
+import { buildMediaLayout, fmtEta, fmtSpeed, layoutMetrics, probeHeightsValid, scrollIdleHeld, windowRange } from '../src/layout.mjs';
 
 const row = (...idxs) => ({ idxs: idxs });
 const head = (label) => ({ hdr: 'main', label: label, postId: 'p1' });
@@ -155,4 +155,19 @@ test('buildMediaLayout: missing pageN defaults to page 1', () => {
   const items = [mk('a', 'A', 0, 1)];
   const lay = buildMediaLayout(items, 'page');
   assert.equal(lay[0].label, 'Page 1');
+});
+
+test('scrollIdleHeld: boundary math at the 150ms gate', () => {
+  assert.equal(scrollIdleHeld(1000, 1000 + 149, 150), true);   // still scrolling
+  assert.equal(scrollIdleHeld(1000, 1000 + 150, 150), false);  // exactly idle -> not held
+  assert.equal(scrollIdleHeld(1000, 1000 + 999, 150), false);
+  assert.equal(scrollIdleHeld(0, 0, 150), true);               // epoch start reads as just-scrolled (boot defers one beat, then applies)
+  assert.equal(scrollIdleHeld(500, 1000, 150), false);
+});
+
+test('probeHeightsValid: generation + non-empty heights gate reuse', () => {
+  assert.equal(probeHeightsValid({ rowH: 146, headH: 30, subH: 24, gen: 3 }, 3), true);
+  assert.equal(probeHeightsValid({ rowH: 146, headH: 30, subH: 24, gen: 3 }, 4), false); // resize bumped
+  assert.equal(probeHeightsValid({ rowH: 0, headH: 30, subH: 24, gen: 3 }, 3), false);   // never probed
+  assert.equal(probeHeightsValid(null, 1), false);
 });

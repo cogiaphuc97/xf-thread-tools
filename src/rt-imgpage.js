@@ -12,8 +12,11 @@
     const imgPageInflight = new Map();
     // landing-page/API fetches run serialized (2 concurrent, 350ms apart) —
     // scrolling a dense grid resolves one page per cell and a burst would
-    // trip the host's challenge, the same lesson the poster queue learned
-    const imgPageNet = { active: 0, queue: [], last: 0 };
+    // trip the host's challenge, the same lesson the poster queue learned.
+    // localhost (fixture probes) gets a 10ms gap: politeness exists for
+    // remote CDNs, and a 1500-cell probe at 350ms would run 4+ minutes
+    const IMG_PAGE_GAP = /^(localhost|127\.)/.test(location.hostname) ? 10 : 350;
+    const imgPageNet = { active: 0, gap: IMG_PAGE_GAP, queue: [], last: 0 };
     function runImgPageNet(job) {
       imgPageNet.queue.push(job);
       pumpImgPageNet();
@@ -23,7 +26,7 @@
       const job = imgPageNet.queue.shift();
       imgPageNet.active++;
       const now = Date.now();
-      const wait = Math.max(0, imgPageNet.last + 350 - now);
+      const wait = Math.max(0, imgPageNet.last + imgPageNet.gap - now);
       imgPageNet.last = now + wait;
       setTimeout(() => job(() => { imgPageNet.active--; pumpImgPageNet(); }), wait);
     }

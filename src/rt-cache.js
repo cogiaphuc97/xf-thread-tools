@@ -12,7 +12,9 @@
       open() {
         return new Promise((resolve, reject) => {
           let req;
-          try { req = indexedDB.open('xf-thread-tools', 1); } catch (e) { reject(e); return; }
+          // v2 adds the preview-thumb stores (0.20.0); v1 databases upgrade
+          // in place — onupgradeneeded creates only what is missing
+          try { req = indexedDB.open('xf-thread-tools', 2); } catch (e) { reject(e); return; }
           // A pending open that never settles would hang boot forever with no
           // error anywhere — bail to the in-memory cache instead
           const bail = setTimeout(() => { try { req.transaction ? null : null; } catch (e) {} reject(new Error('open timeout')); }, 3000);
@@ -23,6 +25,12 @@
             }
             if (!db.objectStoreNames.contains('threads')) {
               db.createObjectStore('threads', { keyPath: 'threadKey' });
+            }
+            if (!db.objectStoreNames.contains('thumbs')) {
+              db.createObjectStore('thumbs', { keyPath: 'key' });
+            }
+            if (!db.objectStoreNames.contains('thumbsMeta')) {
+              db.createObjectStore('thumbsMeta', { keyPath: 'key' });
             }
           };
           req.onblocked = () => { clearTimeout(bail); reject(new Error('blocked by another connection')); };

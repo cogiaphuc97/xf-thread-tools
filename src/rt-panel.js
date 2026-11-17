@@ -24,6 +24,11 @@
         if (performance.now() - programmaticScrollAt > 40) lastUserScrollAt = performance.now();
         queueRenderSlice();
       }, { passive: true });
+      // wheel/touch input is UNAMBIGUOUSLY the user: rebuilds restore scroll
+      // positions (refreshing programmaticScrollAt), and a scroll event
+      // landing inside that 40ms guard would otherwise read as programmatic
+      // too — the idle gate would then apply rebuilds mid-fling (0.20.0)
+      panelBodyEl.addEventListener('wheel', () => { lastUserScrollAt = performance.now(); }, { passive: true });
     }
     // drawer/window resizes change the row width → the uniform row height
     // changes → every offset changes. Debounced re-mount of the metrics
@@ -41,6 +46,7 @@
         t = setTimeout(() => {
           if (panelTab !== 'media' || !vRowsEl || !vRowsEl.isConnected || !vMetrics) return;
           const st = panelBodyEl.scrollTop;
+          vProbeGen++; // width changed -> row height changed -> re-probe once
           mountVirtualGrid(vRowsEl, vLayout, { prevTotal: vMetrics.total, st: st }, null);
         }, 150);
       }).observe(panelBodyEl);
@@ -205,6 +211,7 @@
         tinyMediaUrls.clear();
         hqStage.clear();
         hqTriedRetry.clear();
+        thumbNeg.clear(); // session thumb-fetch negatives ride with the rest of the failure state; the BYTES survive
         clearStalls();
         clearVRows();
         ensure(true);

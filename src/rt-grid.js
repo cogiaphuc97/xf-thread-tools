@@ -31,7 +31,7 @@
     // reconcileRowCells so surviving imgs never refetch (0.7.47 fix kept).
     const vPool = new Map();      // sig -> detached row el (insertion order = LRU)
     const vUrlIndex = new Map();  // cell url -> pool sig (URL-overlap recycle)
-    const VPOOL_MAX = 120;        // detached rows kept: bounded DOM + decoded memory
+    const VPOOL_MAX = 360;        // detached rows kept: bounded DOM + decoded memory (thumbs are capped ≤512px since 0.20.0, so rows are cheap)
     const V_OVER_ABOVE = 900;     // px rendered above the viewport
     const V_OVER_BELOW = 1400;    // px rendered below (≈ the old IO margin)
     const V_GAP = 6;
@@ -265,7 +265,13 @@
     // (re)mount the grid: stamp entry sigs, probe the uniform heights in
     // place, compute metrics, set the EXACT spacer height, restore the
     // anchor/target scroll, render the first slice. One synchronous pass —
-    // nothing paints mid-way.
+    // nothing paints mid-way. Probed heights are CSS-fixed, so they cache
+    // per resize GENERATION (0.20.0): a cache hit skips the probe append +
+    // 3 forced-reflow getBoundingClientRect calls entirely — on a long host
+    // page each forced reflow cost 10-100ms+, and rebuilds fire constantly
+    // during background fetches.
+    const vProbeCache = { rowH: 0, headH: 0, subH: 0, gen: 0 };
+    let vProbeGen = 0;
     function mountVirtualGrid(vrows, entries, anchorInfo, scrollTarget) {
       vRowsEl = vrows;
       vLayout = entries;
@@ -278,30 +284,40 @@
           ? 'r:' + en.idxs.map((i) => (gridItems[i] || {}).url || '').join('|')
           : 'h:' + en.hdr + ':' + en.label + ':' + (en.postId || '');
       }
-      // probe: one real row (4 aspect-1:1 cells) + one header of each kind,
-      // appended, measured, removed in the same tick — heights must match
-      // the CSS truth (borders, rounding), never a formula guess.
-      // A fresh spacer has no height → the body drops its vertical scrollbar
-      // → the probe row measures ~8px too wide → every offset drifts ~2.5px
-      // and the scroll range overshoots the real content bottom by hundreds
-      // of px. Force the scrollbar FIRST, then measure.
-      vrows.style.height = (panelBodyEl.clientHeight + 1) + 'px';
-      const probe = document.createElement('div');
-      probe.className = 'xft-vrow';
-      for (let k = 0; k < 4; k++) {
-        const c = document.createElement('div');
-        c.className = 'xft-cell';
-        probe.appendChild(c);
+      if (probeHeightsValid(vProbeCache, vProbeGen)) {
+        vRowH = vProbeCache.rowH;
+        vHeadH = vProbeCache.headH;
+        vSubH = vProbeCache.subH;
+      } else {
+        // probe: one real row (4 aspect-1:1 cells) + one header of each kind,
+        // appended, measured, removed in the same tick — heights must match
+        // the CSS truth (borders, rounding), never a formula guess.
+        // A fresh spacer has no height → the body drops its vertical scrollbar
+        // → the probe row measures ~8px too wide → every offset drifts ~2.5px
+        // and the scroll range overshoots the real content bottom by hundreds
+        // of px. Force the scrollbar FIRST, then measure.
+        vrows.style.height = (panelBodyEl.clientHeight + 1) + 'px';
+        const probe = document.createElement('div');
+        probe.className = 'xft-vrow';
+        for (let k = 0; k < 4; k++) {
+          const c = document.createElement('div');
+          c.className = 'xft-cell';
+          probe.appendChild(c);
+        }
+        const ph = document.createElement('div');
+        ph.className = 'xft-ghead';
+        const ps = document.createElement('div');
+        ps.className = 'xft-ghead xft-gsub';
+        vrows.append(probe, ph, ps);
+        vRowH = probe.getBoundingClientRect().height || 140;
+        vHeadH = ph.getBoundingClientRect().height || 30;
+        vSubH = ps.getBoundingClientRect().height || 24;
+        probe.remove(); ph.remove(); ps.remove();
+        vProbeCache.rowH = vRowH;
+        vProbeCache.headH = vHeadH;
+        vProbeCache.subH = vSubH;
+        vProbeCache.gen = vProbeGen;
       }
-      const ph = document.createElement('div');
-      ph.className = 'xft-ghead';
-      const ps = document.createElement('div');
-      ps.className = 'xft-ghead xft-gsub';
-      vrows.append(probe, ph, ps);
-      vRowH = probe.getBoundingClientRect().height || 140;
-      vHeadH = ph.getBoundingClientRect().height || 30;
-      vSubH = ps.getBoundingClientRect().height || 24;
-      probe.remove(); ph.remove(); ps.remove();
       vMetrics = layoutMetrics(entries, vRowH, vHeadH, vSubH, V_GAP);
       vVersion++;
       vrows.style.height = vMetrics.total + 'px';
@@ -364,18 +380,36 @@
     // pop-in (the whole grid would flash). Rows built inside this window
     // carry .xft-nopop.
     let popSuppressUntil = 0;
+    // ---------- scroll-idle rebuild gate (0.20.0) ----------
+    // While the user is actively scrolling, grid-affecting rebuilds are HELD:
+    // scrolling always wins over data freshness. Held rebuilds apply on the
+    // first idle moment (~150ms after the last scroll event). Panel chrome
+    // (progress text, counts, note, buttons) bypasses the gate and stays
+    // live. Replaces the old 80ms broken-rerender scroll-hold — one
+    // mechanism, no double gating.
+    const SCROLL_IDLE_MS = 150;
+    let gridRebuildTimer = 0;
+    function deferGridRebuild() {
+      if (panelTab !== 'media' || !panelIsOpen() || !panelBodyEl) { renderPanelBody(); return; }
+      clearTimeout(gridRebuildTimer);
+      gridRebuildTimer = setTimeout(function apply() {
+        if (scrollIdleHeld(lastUserScrollAt, performance.now(), SCROLL_IDLE_MS)) {
+          gridRebuildTimer = setTimeout(apply, 60);
+          return;
+        }
+        renderPanelBody();
+      }, Math.max(30, SCROLL_IDLE_MS - (performance.now() - lastUserScrollAt)));
+    }
     function scheduleBrokenRerender() {
       if (brokenRerenderTimer) return;
       brokenRerenderTimer = setTimeout(() => {
         brokenRerenderTimer = null;
-        // hold the removal wave only a beat while the user is mid-scroll —
-        // the 0.8.0 relayout is windowed + content-anchored (cheap, steady),
-        // so holes close fast instead of lingering through a scroll session
-        if (performance.now() - lastUserScrollAt < 80) { scheduleBrokenRerender(); return; }
-        // no teardown: reset the signature and let renderPanelBody rebuild —
-        // sig-matching rows are reused as-is (imgs never reload), removed
-        // items' rows rebuild, and the row anchor keeps the viewport steady
+        // no teardown: reset the signature and let the idle-gated rebuild
+        // run — sig-matching rows are reused as-is (imgs never reload),
+        // removed items' rows rebuild, and the row anchor keeps the viewport
+        // steady. The 180ms debounce batches a wave of dead links into ONE
+        // layout pass.
         lastPanelSignature = '';
-        schedulePanelRender();
+        deferGridRebuild();
       }, 180);
     }

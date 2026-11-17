@@ -1,5 +1,19 @@
 // rt-media: Media element builders: tile poster attach (event-time cell resolve), loadSwapImg (referer policy + cache-bust retry), buildMediaEl (loading gate, HQ swap, album thumbs).
 // Order-preserving slice of main()'s body — shares main() scope; no imports.
+    // shared sticker-gate check for every media lane (thumb-cache cells,
+    // direct fallback, viewer): 2..140px both axes = smilie/sticker (no URL
+    // marker exists) — retire the item. Animate out first, then the
+    // debounced rerender drops it in one batched pass.
+    function checkTinyMedia(im, url) {
+      if (im.naturalWidth > 1 && im.naturalWidth <= TINY_MEDIA_MAX
+        && im.naturalHeight > 1 && im.naturalHeight <= TINY_MEDIA_MAX
+        && !tinyMediaUrls.has(url)) {
+        tinyMediaUrls.add(url);
+        animateOutCells(url);
+        scheduleBrokenRerender();
+      }
+    }
+
     // Build the <img>/<video> element for a grid cell, viewer, or filmstrip
     // thumb. An <img> that fails to load is retried once as <video> —
     // extension-based classification cannot know a URL's real bytes (video
@@ -20,9 +34,14 @@
       if (tile.querySelector('img')) return;
       const im = document.createElement('img');
       im.alt = '';
+      im.decoding = 'async';
       im.addEventListener('error', () => { im.remove(); const c = cellOf(); if (c) c.classList.remove('xft-loading'); }, { once: true });
       im.addEventListener('load', () => { im.classList.add('xft-ok'); const c = cellOf(); if (c) c.classList.remove('xft-loading'); }, { once: true });
-      im.src = poster;
+      // posters ride the thumb cache too (same one-fetch/byte-bounded rule);
+      // a failed poster fetch falls back to the direct URL — the error
+      // listener above then drops it exactly as before
+      const hit = thumbFor(poster, (u) => { im.src = u || poster; });
+      if (hit) im.src = hit; // sync hit: set before attach, no shimmer; miss keeps src empty until the cb
       tile.appendChild(im);
     }
 
@@ -180,16 +199,111 @@
         }, 800);
         return v;
       }
+      // ---------- CELLS (thumb=true): cached capped thumbs only ----------
+      // One fetch per URL through the byte cache, decode bounded at
+      // THUMB_MAX_SIDE, instant re-entry after pool eviction (memory layer
+      // hit fires synchronously — src set before the element is even
+      // attached, no shimmer flash). The legacy direct-URL path below runs
+      // ONLY as the failure fallback: a URL the thumb fetch cannot serve
+      // keeps today's error policy (HQ chain, moved-page resolve, stall,
+      // video retry) minus the in-cell landing-page HQ swap — cells never
+      // pull full-res originals anymore; the viewer and downloads do.
+      if (thumb) {
+        const im = document.createElement('img');
+        im.alt = '';
+        im.loading = 'lazy';
+        im.decoding = 'async';
+        let still = null;            // the cached still's objectURL (hover restores it)
+        let settled = false;         // thumb lane finished (either way)
+        const wireFallback = () => {
+          if (settled) return;
+          settled = true;
+          const cands = hqCandidates(url);
+          let ci = Math.min(hqStage.get(url) || 0, cands.length - 1);
+          const isHqStage = (i) => cands.length > 1 && i < cands.length - 1;
+          const setStage = (i) => {
+            ci = i;
+            hqStage.set(url, i);
+            im.src = cands[i];
+          };
+          im.addEventListener('error', function onErr() {
+            noteOriginResult(cands[ci], false);
+            if (isHqStage(ci)) {
+              if (ci === 0 && !hqTriedRetry.has(url) && originBursting(cands[ci])) {
+                hqTriedRetry.add(url);
+                im.removeAttribute('src');
+                setTimeout(() => { if (ci === 0) setStage(0); }, 1500);
+                return;
+              }
+              setStage(ci + 1);
+              return;
+            }
+            im.removeEventListener('error', onErr);
+            if (!im.dataset.xftMoved) {
+              im.dataset.xftMoved = '1';
+              resolveEmbedStream(url, (src) => {
+                im.dataset.xftMoved = '';
+                if (src) {
+                  brokenMediaUrls.delete(url);
+                  const host = im.closest('.xft-cell, .xft-vslot, .xft-vthumb');
+                  if (host) host.classList.remove('xft-broken');
+                  im.referrerPolicy = 'no-referrer';
+                  im.src = src;
+                  return;
+                }
+                markMediaBroken(im, url);
+              });
+              return;
+            }
+            if (originBursting(url)) { enterStall(im, url); return; }
+            const v = document.createElement('video');
+            v.preload = 'metadata';
+            v.muted = true;
+            v.src = url;
+            v.addEventListener('error', () => markMediaBroken(v, url));
+            v.addEventListener('loadedmetadata', () => { if (im.parentNode) im.replaceWith(v); markMediaLoaded(v); });
+            v.load();
+            setTimeout(() => { if (v.readyState === 0) markMediaBroken(v, url); }, 6000);
+          });
+          setStage(ci);
+          const checkDead = () => { if (!im.dataset.xftMoved && im.getAttribute('src') && im.complete && im.naturalWidth <= 1 && !stallState.has(url)) markMediaBroken(im, url); };
+          if (im.getAttribute('src') && im.complete) { checkDead(); checkTinyMedia(im, url); if (im.naturalWidth > 1) markMediaLoaded(im); }
+          else {
+            im.addEventListener('load', () => { checkDead(); checkTinyMedia(im, url); markMediaLoaded(im); });
+            setTimeout(() => { checkDead(); checkTinyMedia(im, url); }, 800);
+          }
+        };
+        const applyStill = (u, sync) => {
+          if (settled || !u) return;
+          settled = true;
+          still = u;
+          im.src = u;
+          // reveal gate: sync hits pass it pre-attach (nothing painted yet);
+          // async arrivals pass it on load, after decode
+          if (sync) im.classList.add('xft-ok');
+          im.addEventListener('load', () => { im.classList.add('xft-ok'); checkTinyMedia(im, url); markMediaLoaded(im); }, { once: true });
+        };
+        const hit = thumbFor(url, (u) => { if (u) applyStill(u, false); else wireFallback(); });
+        if (hit) applyStill(hit, true);
+        // animated gifs: the cell holds the still frame; hover swaps in the
+        // original bytes (memory LRU), leaving restores the still
+        if (isGifUrl(url) || thumbIsGif(url)) {
+          const play = () => {
+            const u = gifOriginalUrl(url, (u2) => { if (u2 && im.matches(':hover') && still) im.src = u2; });
+            if (u && still) im.src = u;
+          };
+          const stop = () => { if (still && im.src !== still) im.src = still; };
+          im.addEventListener('pointerenter', play);
+          im.addEventListener('pointerleave', stop);
+        }
+        return im;
+      }
+      // ---------- VIEWER / filmstrip (thumb=false): full-res, unchanged ----------
       const im = document.createElement('img');
-      // ALL images lazy + async: the grid keeps every row in the DOM, so
-      // the browser's viewport distance decides when bytes move — that IS
-      // the CDN-burst throttle the old HQ queue provided, without a queue
-      // that offscreen rows would wedge for minutes.
       im.loading = 'lazy';
       im.decoding = 'async';
       const cands = hqCandidates(url);
       let ci = Math.min(hqStage.get(url) || 0, cands.length - 1);
-      const isHqStage = (i) => cands.length > 1 && i < cands.length - 1;
       const setStage = (i) => {
         ci = i;
         hqStage.set(url, i);
@@ -197,26 +311,8 @@
       };
       im.addEventListener('error', function onErr() {
         noteOriginResult(cands[ci], false);
-        // HQ candidates first. The one delayed retry is for RATE-LIMIT
-        // BURSTS (bursting origin): the gate keeps a src-less/failed img
-        // invisible, so the retry hides inside the shimmer. On a HEALTHY
-        // origin an isolated failure is a dead file — skip the wait and
-        // walk straight down the chain. Only the post URL itself failing
-        // starts the video retry.
-        if (isHqStage(ci)) {
-          if (ci === 0 && !hqTriedRetry.has(url) && originBursting(cands[ci])) {
-            hqTriedRetry.add(url);
-            im.removeAttribute('src');
-            setTimeout(() => { if (ci === 0) setStage(0); }, 1500);
-            return;
-          }
-          setStage(ci + 1);
-          return;
-        }
+        if (cands.length > 1 && ci < cands.length - 1) { setStage(ci + 1); return; }
         im.removeEventListener('error', onErr);
-        // moved-page resolve (bunkr-style): a direct IMAGE url can 301 to an
-        // HTML landing page just like the video kind — resolve through the
-        // page carrier once, swap the src; only a real failure falls through
         if (!im.dataset.xftMoved) {
           im.dataset.xftMoved = '1';
           resolveEmbedStream(url, (src) => {
@@ -233,88 +329,36 @@
           });
           return;
         }
-        // burst-failing origin: the file may be fine, the CDN is choking —
-        // HOLD the slot and recheck in the background (no hole, no reflow)
-        if (originBursting(url)) { enterStall(im, url); return; }
-        const v = document.createElement('video');
-        v.preload = 'metadata';
-        v.muted = true;
-        v.src = url;
-        v.addEventListener('error', () => markMediaBroken(v, url));
-        v.addEventListener('loadedmetadata', () => { if (im.parentNode) im.replaceWith(v); markMediaLoaded(v); });
-        v.load();
-        // some 404s stall as networkState=LOADING forever (no error event,
-        // no metadata) — a stalled cell must still retire, or it shimmers
-        // for the rest of the session
-        setTimeout(() => { if (v.readyState === 0) markMediaBroken(v, url); }, 6000);
+        markMediaBroken(im, url);
       });
       setStage(ci);
-      // full-quality upgrade for CELLS and the VIEWER: the embedded copy
-      // renders instantly, then swaps to the original once the landing page
-      // resolves. The browser keeps the old pixels until the new image
-      // decodes, so the swap is seamless. Must run AFTER setStage — a cache
-      // hit fires synchronously and setStage's src write would overwrite it.
-      // Skipped when a static marker chain exists (.md/.th win, cheaper).
       if (pageUrl && cands.length === 1) {
-        // the VIEWER (thumb=false) forces past any failure cooldown — a
-        // user-initiated single is worth a fresh attempt. Grid cells wait
-        // the cooldown out (they are many, and bursts are what trip the
-        // host in the first place), but a failed cell gets ONE delayed
-        // retry landing right as the cooldown expires — attached cells
-        // must not stay at embedded quality forever.
         let retriedHq = false;
         const wantHq = (force2) => resolveImagePage(pageUrl, url, (full) => {
           if (!full) {
-            // retry FORCED: any later failure (a download's resolve, another
-            // cell) can have REFRESHED the cooldown past this retry — one
-            // fresh single request 31s out is burst-safe
             if (!retriedHq && im.isConnected) { retriedHq = true; setTimeout(() => wantHq(true), 31000); }
             return;
           }
           if (im.src === full) return;
-          // load the original through the referer-fallback loader (forum
-          // referer first, no-referrer once) and crossfade it in — the
-          // loaded probe element IS the swap layer, so the frame is already
-          // decoded when it lands (no progressive paint-through)
           loadSwapImg(full, (top, noRef) => {
             const host = im.parentNode;
-            const src2 = top.src; // the URL that actually loaded (cache-busted on the fallback path)
+            const src2 = top.src;
             if (!host || im.src === src2) return;
             top.alt = '';
-            top.className = 'xft-hq-top xft-ok'; // reveal gate passes at once — frame is decoded
-            if (noRef) im.referrerPolicy = 'no-referrer'; // the final swap must reuse the policy that worked
+            top.className = 'xft-hq-top xft-ok';
+            if (noRef) im.referrerPolicy = 'no-referrer';
             host.appendChild(top);
             requestAnimationFrame(() => top.classList.add('xft-hq-on'));
-            setTimeout(() => { im.src = src2; top.remove(); }, 450); // swap beneath, then drop the layer
-          }, () => { /* both policies failed — embedded copy stays */ });
+            setTimeout(() => { im.src = src2; top.remove(); }, 450);
+          }, () => {});
         }, force2 || !thumb);
         wantHq();
       }
-      // A failure cached by Chrome replays instantly with NO error event, and
-      // 1×1 placeholders (svg data-URIs, hotlink-block pixels) "load" as a
-      // single stretched pixel = a blank cell. nw<=1 + complete = dead either
-      // way — probe for both, or the cell renders blank forever. A src-LESS
-      // img (waiting in the HQ queue, or mid-retry) is complete with nw=0
-      // but NOT dead — probing it retired whole ranges of healthy cells.
-      // xftMoved = a moved-page resolve is IN FLIGHT for this element — the
-      // error/complete/nw<=1 state it sees is the OLD url's, not a verdict
-      const checkDead = () => { if (!im.dataset.xftMoved && im.getAttribute('src') && im.complete && im.naturalWidth <= 1 && !stallState.has(url)) markMediaBroken(im, url); };
-      const checkTiny = () => {
-        // 2..140px square-ish = smilie/sticker (no URL marker exists) —
-        // retire the item. Animate the cell out first, then the debounced
-        // rerender (same one broken media uses) drops it in one batched pass.
-        if (im.naturalWidth > 1 && im.naturalWidth <= TINY_MEDIA_MAX
-          && im.naturalHeight > 1 && im.naturalHeight <= TINY_MEDIA_MAX
-          && !tinyMediaUrls.has(url)) {
-          tinyMediaUrls.add(url);
-          animateOutCells(url);
-          scheduleBrokenRerender();
-        }
-      };
-      if (im.getAttribute('src') && im.complete) { checkDead(); checkTiny(); if (im.naturalWidth > 1) markMediaLoaded(im); }
+      const checkDeadV = () => { if (!im.dataset.xftMoved && im.getAttribute('src') && im.complete && im.naturalWidth <= 1 && !stallState.has(url)) markMediaBroken(im, url); };
+      if (im.getAttribute('src') && im.complete) { checkDeadV(); checkTinyMedia(im, url); if (im.naturalWidth > 1) markMediaLoaded(im); }
       else {
-        im.addEventListener('load', () => { checkDead(); checkTiny(); markMediaLoaded(im); });
-        setTimeout(() => { checkDead(); checkTiny(); }, 800);
+        im.addEventListener('load', () => { checkDeadV(); checkTinyMedia(im, url); markMediaLoaded(im); });
+        setTimeout(() => { checkDeadV(); checkTinyMedia(im, url); }, 800);
       }
       return im;
     }

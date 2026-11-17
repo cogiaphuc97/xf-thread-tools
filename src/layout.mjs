@@ -45,6 +45,19 @@ export function windowRange(top, h, viewTop, viewBot) {
   return last < first ? [first, -1] : [first, last];
 }
 
+// ---------- scroll-idle rebuild gate (0.20.0, pure — unit-tested) ----------
+// A grid-affecting rebuild is HELD while the user scrolled within the idle
+// window: scrolling always wins over data freshness. Boundary: exactly
+// idleMs since the last scroll = idle (not held).
+export function scrollIdleHeld(lastScrollAt, now, idleMs) {
+  return now - lastScrollAt < idleMs;
+}
+// Probe-height cache validity: probed row/header heights are CSS-fixed, so
+// they survive rebuilds and only a generation bump (resize) invalidates.
+export function probeHeightsValid(cache, gen) {
+  return !!(cache && cache.rowH > 0 && cache.gen === gen);
+}
+
 // ---------- dashboard formatting (pure — unit-tested, no DOM) ----------
 export function fmtSpeed(bps) {
   if (bps >= 1048576) return (bps / 1048576).toFixed(1) + ' MB/s';

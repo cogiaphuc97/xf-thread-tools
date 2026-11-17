@@ -2,11 +2,15 @@
 // Order-preserving slice of main()'s body — shares main() scope; no imports.
     function notify() {
       updateProgressText();
+      // fetch ticks keep chrome live but hold GRID rebuilds behind the
+      // scroll-idle gate (0.20.0): progress + counts update every page, the
+      // grid itself only rebuilds when the user is not actively scrolling
+      scheduleCountsOnly();
+      deferGridRebuild();
       if (sorterPending && !hub.fetchRunning) {
         sorterPending = false;
         sorter.start();
       }
-      schedulePanelRender();
     }
 
     // ---------- step 7: sorter (clone rendering, chunked) ----------

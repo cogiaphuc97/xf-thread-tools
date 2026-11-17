@@ -97,6 +97,8 @@ try {
   const cdp = await connect(await pageWs());
   await cdp.send('Page.enable');
 
+
+
   // 1. Load the live page
   const navP = cdp.waitEvent('Page.loadEventFired', 45000);
   await cdp.send('Page.navigate', { url: URL });
@@ -111,6 +113,14 @@ try {
   const inj = await cdp.send('Runtime.evaluate', { expression: readFileSync(INJECT, 'utf8') });
   if (inj.exceptionDetails) console.log('INJECT EXCEPTION:', JSON.stringify((inj.exceptionDetails.exception || {}).description || inj.exceptionDetails.text).slice(0, 800));
   await sleep(4500); // cache.open() bails to memory mode at 3s when IndexedDB stalls
+  // page-side ledgers for the scroll-session spot check (structure-only):
+  // preview fetch counts per URL + longtasks. Resource entries count BOTH
+  // native <img> loads and the stub-GM fetches (all fetch()/XHR appear).
+  // Installed AFTER inject: the navigation context is the one that survives.
+  await ev(cdp, `window.__pv = new Map(); window.__lt = [];
+    new PerformanceObserver((l) => { for (const e of l.getEntries()) { const u = e.name.split('#')[0]; if (/\\.(jpe?g|png|gif|webp|avif|bmp)(\\?|$)/i.test(u)) __pv.set(u, (__pv.get(u) || 0) + 1); } }).observe({ type: 'resource', buffered: true });
+    new PerformanceObserver((l) => { for (const e of l.getEntries()) window.__lt.push(Math.round(e.duration)); }).observe({ entryTypes: ['longtask'] });
+    true`);
 
   const boot = await ev(cdp, `({
     sortBtn: !!document.getElementById('xft-sort-btn'),
@@ -154,7 +164,9 @@ try {
       }))
       .filter((o) => o.url),
     quotedSrcs: Array.from(document.querySelectorAll('article blockquote.bbCodeBlock--quote img.bbImage')).map((i) => i.src),
-    cellSrcs: Array.from(document.querySelectorAll('#xft-panel .xft-cell img, #xft-panel .xft-cell video')).map((el) => el.src)
+    // 0.20.0: cell IMGS render from blob: objectURLs — identity is the cell's
+    // dataset URL (the original), never img.src
+    cellSrcs: Array.from(document.querySelectorAll('#xft-panel .xft-cell')).filter((c) => c.querySelector('img, video')).map((c) => c.dataset.xftUrl || '').filter(Boolean)
   })`);
   check('panel opens', panel.open === true);
   check('sub-tabs All/Image/Video present', panel.subtabs.length === 3 && panel.subtabs.every((t) => /^(All|Image|Video) \d+$/.test(t)), panel.subtabs.join(' | '));
@@ -179,6 +191,29 @@ try {
   // 3b. the "Show more rows" button is gone entirely (Links auto-loads)
   check('Show more rows button removed',
     await ev(cdp, `!Array.from(document.querySelectorAll('#xft-panel')).length || !Array.from(document.querySelectorAll('#xft-panel *')).some((el) => el.textContent === 'Show more rows')`));
+
+  // 3c. scroll-session spot check (0.20.0): a multi-screen pass must not
+  // re-fetch any preview URL and must not longtask on rebuild application.
+  // Stub caveat: cross-host GM fetches are CORS-blocked under the probe stub
+  // (real Tampermonkey is not), so those previews fall back to native <img>
+  // loads — bound is 2 (thumb attempt + native fallback); same-host previews
+  // ride the thumb cache and must be exactly 1.
+  {
+    const body = 'document.querySelector("#xft-panel .xft-body")';
+    const sh = await ev(cdp, body + '.scrollHeight');
+    for (let p = 0; p <= sh; p += Math.max(400, Math.floor(sh / 6))) {
+      await ev(cdp, body + '.scrollTop = ' + p + '; true');
+      await sleep(700);
+    }
+    await sleep(1200);
+    const pv = await ev(cdp, `(() => { const o = {}; for (const [u, n] of window.__pv) o[u] = n;
+      return { max: Math.max(0, ...Object.values(o)), over: Object.entries(o).filter(([u, n]) => n > 2).length,
+        sameHostOver1: Object.entries(o).filter(([u, n]) => n > 1 && u.includes(location.host)).length, urls: Object.keys(o).length }; })()`);
+    check('scroll session: no preview URL fetched more than twice', pv.over === 0, JSON.stringify(pv).slice(0, 220));
+    check('scroll session: same-host previews fetched exactly once', pv.sameHostOver1 === 0, 'over1=' + pv.sameHostOver1 + ' of ' + pv.urls);
+    const lts = await ev(cdp, `window.__lt`);
+    check('scroll session: zero >50ms longtasks on rebuild application', (lts || []).filter((d) => d > 50).length === 0, 'longtasks=' + JSON.stringify((lts || []).slice(0, 10)));
+  }
 
   // 4. Sort on partial cache. Two paths, both valid ends:
   //    (a) fetch keeps running → second click aborts → partial sort;

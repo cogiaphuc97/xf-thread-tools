@@ -41,14 +41,20 @@
     {
       "name": "layout",
       "file": "src/layout.mjs",
-      "desc": "Pure grid math: exact spacer metrics, window binary search, speed/ETA formatting, media layout entries (grouping headers + 4-cell rows).",
-      "symbols": ["layoutMetrics", "windowRange", "fmtSpeed", "fmtEta", "buildMediaLayout"]
+      "desc": "Pure grid math: exact spacer metrics, window binary search, scroll-idle rebuild gate decision, probe-height cache validity, speed/ETA formatting, media layout entries (grouping headers + 4-cell rows).",
+      "symbols": ["layoutMetrics", "windowRange", "scrollIdleHeld", "probeHeightsValid", "fmtSpeed", "fmtEta", "buildMediaLayout"]
     },
     {
       "name": "ai",
       "file": "src/ai.mjs",
       "desc": "Pure AI helpers: htmlToText, transcript builder (query-boosted, budgeted), system prompts (en/vi), endpoint/base/native-chat URL math, context stats, model/reply parsers, markdown tokenizer/renderer core, SSE+NDJSON stream parser.",
       "symbols": ["htmlToText", "buildAiTranscript", "AI_SYS_PROMPTS", "AI_STOPWORDS", "aiQueryTerms", "aiScorePost", "aiSearchPosts", "aiMessages", "AI_BASES", "aiEndpoint", "aiOllamaOrigin", "aiNativeChatUrl", "aiContextStats", "aiNumCtx", "aiTranscriptBudget", "parseAiModels", "parseAiReply", "mdInlineTokens", "mdParse", "aiSseParser"]
+    },
+    {
+      "name": "thumb",
+      "file": "src/thumb.mjs",
+      "desc": "Pure preview-thumb cache math: identity key (hash-stripped, query kept), LRU prune plan (hits-then-ts), downscale target (never upscale, aspect kept), gif detection, byte caps.",
+      "symbols": ["THUMB_MAX_SIDE", "THUMB_STORE_CAP", "THUMB_MEM_CAP", "GIF_MEM_CAP", "GIF_RE", "thumbKey", "isGifUrl", "downscaleTarget", "prunePlan"]
     }
   ],
   "runtimeFragments": [
@@ -62,6 +68,7 @@
     { "name": "rt-posters", "file": "src/rt-posters.js", "anchor": "EMBED_POSTERS_KEY", "desc": "Embed poster cache (GM storage), queued poster fetch net (2/350ms, backoff, cooldown), ensureEmbedPoster." },
     { "name": "rt-embednet", "file": "src/rt-embednet.js", "anchor": "EMBED_STREAMS_KEY", "desc": "Embed stream cache, gmGetText/gmPostJson (GM XHR + fetch fallback), resolveEmbedStream (sign endpoint / view API / file-page carriers)." },
     { "name": "rt-imgpage", "file": "src/rt-imgpage.js", "anchor": "imgPageCache", "desc": "Image landing-page HQ resolution: session cache, cooldown, queued net (2/350ms), inflight dedup, force path for viewer/downloads." },
+    { "name": "rt-thumbcache", "file": "src/rt-thumbcache.js", "anchor": "thumbMem", "desc": "Preview thumb cache: memory objectURL layer (LRU, revoke on evict) over IDB thumbs/thumbsMeta (LRU at cap), GM blob fetch with referer ladder through imgPageNet, createImageBitmap downscale to capped webp stills, gif still/original split (hover/viewer playback)." },
     { "name": "rt-albums", "file": "src/rt-albums.js", "anchor": "ALBUMS_KEY", "desc": "Album expansion runtime: GM-storage store (TTL, prune), HTML/API walk, albumDone rerender, ensureAlbum lazy trigger." },
     { "name": "rt-viewstate", "file": "src/rt-viewstate.js", "anchor": "settingsView", "desc": "View state (tab/subtab/scroll memory per view), viewer state vars, render queue flag, mkBtn button helper." },
     { "name": "rt-failpolicy", "file": "src/rt-failpolicy.js", "anchor": "markMediaBroken", "desc": "Failure policy: origin stats/verdicts, stall state + ladder + recovery queue, retire, animate-out, mark loaded, viewer img slot sizing, HQ stage/retry memory." },

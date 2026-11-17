@@ -292,6 +292,7 @@
     (async function init() {
       injectStyles();
       await cache.init();
+      thumbScan(); // warm the thumb-cache LRU table once the DB handle exists
       const savedMeta = await cache.getThreadMeta(threadKey);
       if (savedMeta) {
         // load complete AND partial caches — partial data stays usable (resume)

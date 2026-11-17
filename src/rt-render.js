@@ -98,6 +98,23 @@
       return { all: all, items: items, mediaCounts: mediaCounts };
     }
 
+    // count-only fast path for fetch ticks while the grid rebuild is held:
+    // the item counter + sub-tab counts climb live without touching grid DOM
+    // (collectMediaItems is pure CPU ~1-2ms at 1500 items; the mount +
+    // replaceChildren + cell-build work is what the gate exists to defer)
+    let countsQueued = false;
+    function scheduleCountsOnly() {
+      if (countsQueued || !panelIsOpen() || panelTab !== 'media') return;
+      countsQueued = true;
+      requestAnimationFrame(() => {
+        countsQueued = false;
+        if (!panelIsOpen() || panelTab !== 'media') return;
+        const m = collectMediaItems(panelData());
+        updateSubTabCounts(m.mediaCounts);
+        updateCountOnly(m.items.length);
+      });
+    }
+
     function renderPanelBody() {
       if (!panelIsOpen() || !panelBodyEl) return;
       if (panelTab === 'ai') { renderAiTab(); return; }

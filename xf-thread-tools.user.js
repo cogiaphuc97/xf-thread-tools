@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         xf-thread-tools
 // @namespace    xf-thread-tools
-// @version      0.19.0
+// @version      0.20.0
 // @description  XenForo 2: sort thread posts by reaction count across all pages (cached) + floating media panel (images / external links).
 // @author       xf-thread-tools
 // @match        *://*/threads/*
@@ -753,6 +753,19 @@
     return last < first ? [first, -1] : [first, last];
   }
   
+  // ---------- scroll-idle rebuild gate (0.20.0, pure — unit-tested) ----------
+  // A grid-affecting rebuild is HELD while the user scrolled within the idle
+  // window: scrolling always wins over data freshness. Boundary: exactly
+  // idleMs since the last scroll = idle (not held).
+  function scrollIdleHeld(lastScrollAt, now, idleMs) {
+    return now - lastScrollAt < idleMs;
+  }
+  // Probe-height cache validity: probed row/header heights are CSS-fixed, so
+  // they survive rebuilds and only a generation bump (resize) invalidates.
+  function probeHeightsValid(cache, gen) {
+    return !!(cache && cache.rowH > 0 && cache.gen === gen);
+  }
+  
   // ---------- dashboard formatting (pure — unit-tested, no DOM) ----------
   function fmtSpeed(bps) {
     if (bps >= 1048576) return (bps / 1048576).toFixed(1) + ' MB/s';
@@ -1198,6 +1211,56 @@
       isDone() { return done; }
     };
   }
+  /* ==== pure module: thumb ==== */
+  // thumb: Pure preview-thumb cache math: identity key, LRU prune plan (hits-then-ts), downscale target (never upscale, aspect kept), gif detection, byte caps. No DOM, no GM_*. (split-era module for the 0.20.0 preview lifecycle; see scripts/modules.json)
+  const THUMB_MAX_SIDE = 512;                    // px, longest side of a cached cell thumb
+  const THUMB_STORE_CAP = 512 * 1024 * 1024;     // IDB bytes cap (LRU-pruned)
+  const THUMB_MEM_CAP = 128 * 1024 * 1024;       // in-memory objectURL layer cap
+  const GIF_MEM_CAP = 64 * 1024 * 1024;          // animated-original layer cap (hover/viewer)
+  const GIF_RE = /\.gif([?#]|$)/i;
+  
+  // Cache identity: the URL minus its fragment (video #t=0.1 hashes must not
+  // split one media into two keys), query KEPT verbatim (signed URLs die when
+  // reordered). data:/blob: inputs never key a fetch (caller guards).
+  function thumbKey(url) {
+    const s = String(url || '');
+    if (!s) return '';
+    const h = s.indexOf('#');
+    return h === -1 ? s : s.slice(0, h);
+  }
+  
+  // Best-effort animated detection by URL; the runtime also sniffs the blob's
+  // MIME (CDNs serve gifs under extensionless URLs).
+  function isGifUrl(url) {
+    return GIF_RE.test(String(url || ''));
+  }
+  
+  // Downscale target for a nw x nh bitmap: longest side capped at maxSide,
+  // aspect preserved, never an upscale. null = already within the cap — the
+  // caller keeps the original bytes (no needless re-encode).
+  function downscaleTarget(nw, nh, maxSide) {
+    const w = Math.max(0, nw | 0), h = Math.max(0, nh | 0);
+    if (!w || !h) return null;
+    if (w <= maxSide && h <= maxSide) return null;
+    const scale = maxSide / Math.max(w, h);
+    return { w: Math.max(1, Math.round(w * scale)), h: Math.max(1, Math.round(h * scale)) };
+  }
+  
+  // LRU prune plan: which entries to drop so bytesTotal comes back under cap.
+  // Order = least-valuable first: fewer hits, then older ts. Entries are
+  // {key, bytes, hits, ts}. Returns the keys to delete (possibly empty).
+  function prunePlan(bytesTotal, cap, entries) {
+    if (!(bytesTotal > cap)) return [];
+    const sorted = (entries || []).slice().sort((a, b) => (a.hits - b.hits) || (a.ts - b.ts));
+    let total = bytesTotal;
+    const drop = [];
+    for (const e of sorted) {
+      if (!(total > cap)) break;
+      drop.push(e.key);
+      total -= e.bytes;
+    }
+    return drop;
+  }
   /* ==== runtime guard ==== */
 // Runtime guard: silent exit on non-XF / non-thread pages; under Node
 // (tests) document is undefined and nothing below ever runs.
@@ -1507,7 +1570,9 @@
         open() {
           return new Promise((resolve, reject) => {
             let req;
-            try { req = indexedDB.open('xf-thread-tools', 1); } catch (e) { reject(e); return; }
+            // v2 adds the preview-thumb stores (0.20.0); v1 databases upgrade
+            // in place — onupgradeneeded creates only what is missing
+            try { req = indexedDB.open('xf-thread-tools', 2); } catch (e) { reject(e); return; }
             // A pending open that never settles would hang boot forever with no
             // error anywhere — bail to the in-memory cache instead
             const bail = setTimeout(() => { try { req.transaction ? null : null; } catch (e) {} reject(new Error('open timeout')); }, 3000);
@@ -1518,6 +1583,12 @@
               }
               if (!db.objectStoreNames.contains('threads')) {
                 db.createObjectStore('threads', { keyPath: 'threadKey' });
+              }
+              if (!db.objectStoreNames.contains('thumbs')) {
+                db.createObjectStore('thumbs', { keyPath: 'key' });
+              }
+              if (!db.objectStoreNames.contains('thumbsMeta')) {
+                db.createObjectStore('thumbsMeta', { keyPath: 'key' });
               }
             };
             req.onblocked = () => { clearTimeout(bail); reject(new Error('blocked by another connection')); };
@@ -1779,11 +1850,15 @@
       }
       function notify() {
         updateProgressText();
+        // fetch ticks keep chrome live but hold GRID rebuilds behind the
+        // scroll-idle gate (0.20.0): progress + counts update every page, the
+        // grid itself only rebuilds when the user is not actively scrolling
+        scheduleCountsOnly();
+        deferGridRebuild();
         if (sorterPending && !hub.fetchRunning) {
           sorterPending = false;
           sorter.start();
         }
-        schedulePanelRender();
       }
 
       // ---------- step 7: sorter (clone rendering, chunked) ----------
@@ -1954,7 +2029,7 @@
       // reconcileRowCells so surviving imgs never refetch (0.7.47 fix kept).
       const vPool = new Map();      // sig -> detached row el (insertion order = LRU)
       const vUrlIndex = new Map();  // cell url -> pool sig (URL-overlap recycle)
-      const VPOOL_MAX = 120;        // detached rows kept: bounded DOM + decoded memory
+      const VPOOL_MAX = 360;        // detached rows kept: bounded DOM + decoded memory (thumbs are capped ≤512px since 0.20.0, so rows are cheap)
       const V_OVER_ABOVE = 900;     // px rendered above the viewport
       const V_OVER_BELOW = 1400;    // px rendered below (≈ the old IO margin)
       const V_GAP = 6;
@@ -2188,7 +2263,13 @@
       // (re)mount the grid: stamp entry sigs, probe the uniform heights in
       // place, compute metrics, set the EXACT spacer height, restore the
       // anchor/target scroll, render the first slice. One synchronous pass —
-      // nothing paints mid-way.
+      // nothing paints mid-way. Probed heights are CSS-fixed, so they cache
+      // per resize GENERATION (0.20.0): a cache hit skips the probe append +
+      // 3 forced-reflow getBoundingClientRect calls entirely — on a long host
+      // page each forced reflow cost 10-100ms+, and rebuilds fire constantly
+      // during background fetches.
+      const vProbeCache = { rowH: 0, headH: 0, subH: 0, gen: 0 };
+      let vProbeGen = 0;
       function mountVirtualGrid(vrows, entries, anchorInfo, scrollTarget) {
         vRowsEl = vrows;
         vLayout = entries;
@@ -2201,30 +2282,40 @@
             ? 'r:' + en.idxs.map((i) => (gridItems[i] || {}).url || '').join('|')
             : 'h:' + en.hdr + ':' + en.label + ':' + (en.postId || '');
         }
-        // probe: one real row (4 aspect-1:1 cells) + one header of each kind,
-        // appended, measured, removed in the same tick — heights must match
-        // the CSS truth (borders, rounding), never a formula guess.
-        // A fresh spacer has no height → the body drops its vertical scrollbar
-        // → the probe row measures ~8px too wide → every offset drifts ~2.5px
-        // and the scroll range overshoots the real content bottom by hundreds
-        // of px. Force the scrollbar FIRST, then measure.
-        vrows.style.height = (panelBodyEl.clientHeight + 1) + 'px';
-        const probe = document.createElement('div');
-        probe.className = 'xft-vrow';
-        for (let k = 0; k < 4; k++) {
-          const c = document.createElement('div');
-          c.className = 'xft-cell';
-          probe.appendChild(c);
+        if (probeHeightsValid(vProbeCache, vProbeGen)) {
+          vRowH = vProbeCache.rowH;
+          vHeadH = vProbeCache.headH;
+          vSubH = vProbeCache.subH;
+        } else {
+          // probe: one real row (4 aspect-1:1 cells) + one header of each kind,
+          // appended, measured, removed in the same tick — heights must match
+          // the CSS truth (borders, rounding), never a formula guess.
+          // A fresh spacer has no height → the body drops its vertical scrollbar
+          // → the probe row measures ~8px too wide → every offset drifts ~2.5px
+          // and the scroll range overshoots the real content bottom by hundreds
+          // of px. Force the scrollbar FIRST, then measure.
+          vrows.style.height = (panelBodyEl.clientHeight + 1) + 'px';
+          const probe = document.createElement('div');
+          probe.className = 'xft-vrow';
+          for (let k = 0; k < 4; k++) {
+            const c = document.createElement('div');
+            c.className = 'xft-cell';
+            probe.appendChild(c);
+          }
+          const ph = document.createElement('div');
+          ph.className = 'xft-ghead';
+          const ps = document.createElement('div');
+          ps.className = 'xft-ghead xft-gsub';
+          vrows.append(probe, ph, ps);
+          vRowH = probe.getBoundingClientRect().height || 140;
+          vHeadH = ph.getBoundingClientRect().height || 30;
+          vSubH = ps.getBoundingClientRect().height || 24;
+          probe.remove(); ph.remove(); ps.remove();
+          vProbeCache.rowH = vRowH;
+          vProbeCache.headH = vHeadH;
+          vProbeCache.subH = vSubH;
+          vProbeCache.gen = vProbeGen;
         }
-        const ph = document.createElement('div');
-        ph.className = 'xft-ghead';
-        const ps = document.createElement('div');
-        ps.className = 'xft-ghead xft-gsub';
-        vrows.append(probe, ph, ps);
-        vRowH = probe.getBoundingClientRect().height || 140;
-        vHeadH = ph.getBoundingClientRect().height || 30;
-        vSubH = ps.getBoundingClientRect().height || 24;
-        probe.remove(); ph.remove(); ps.remove();
         vMetrics = layoutMetrics(entries, vRowH, vHeadH, vSubH, V_GAP);
         vVersion++;
         vrows.style.height = vMetrics.total + 'px';
@@ -2287,19 +2378,37 @@
       // pop-in (the whole grid would flash). Rows built inside this window
       // carry .xft-nopop.
       let popSuppressUntil = 0;
+      // ---------- scroll-idle rebuild gate (0.20.0) ----------
+      // While the user is actively scrolling, grid-affecting rebuilds are HELD:
+      // scrolling always wins over data freshness. Held rebuilds apply on the
+      // first idle moment (~150ms after the last scroll event). Panel chrome
+      // (progress text, counts, note, buttons) bypasses the gate and stays
+      // live. Replaces the old 80ms broken-rerender scroll-hold — one
+      // mechanism, no double gating.
+      const SCROLL_IDLE_MS = 150;
+      let gridRebuildTimer = 0;
+      function deferGridRebuild() {
+        if (panelTab !== 'media' || !panelIsOpen() || !panelBodyEl) { renderPanelBody(); return; }
+        clearTimeout(gridRebuildTimer);
+        gridRebuildTimer = setTimeout(function apply() {
+          if (scrollIdleHeld(lastUserScrollAt, performance.now(), SCROLL_IDLE_MS)) {
+            gridRebuildTimer = setTimeout(apply, 60);
+            return;
+          }
+          renderPanelBody();
+        }, Math.max(30, SCROLL_IDLE_MS - (performance.now() - lastUserScrollAt)));
+      }
       function scheduleBrokenRerender() {
         if (brokenRerenderTimer) return;
         brokenRerenderTimer = setTimeout(() => {
           brokenRerenderTimer = null;
-          // hold the removal wave only a beat while the user is mid-scroll —
-          // the 0.8.0 relayout is windowed + content-anchored (cheap, steady),
-          // so holes close fast instead of lingering through a scroll session
-          if (performance.now() - lastUserScrollAt < 80) { scheduleBrokenRerender(); return; }
-          // no teardown: reset the signature and let renderPanelBody rebuild —
-          // sig-matching rows are reused as-is (imgs never reload), removed
-          // items' rows rebuild, and the row anchor keeps the viewport steady
+          // no teardown: reset the signature and let the idle-gated rebuild
+          // run — sig-matching rows are reused as-is (imgs never reload),
+          // removed items' rows rebuild, and the row anchor keeps the viewport
+          // steady. The 180ms debounce batches a wave of dead links into ONE
+          // layout pass.
           lastPanelSignature = '';
-          schedulePanelRender();
+          deferGridRebuild();
         }, 180);
       }
       // Embed posters: thumbnail URL per embed URL, parsed from the embed page's
@@ -2549,8 +2658,11 @@
       const imgPageInflight = new Map();
       // landing-page/API fetches run serialized (2 concurrent, 350ms apart) —
       // scrolling a dense grid resolves one page per cell and a burst would
-      // trip the host's challenge, the same lesson the poster queue learned
-      const imgPageNet = { active: 0, queue: [], last: 0 };
+      // trip the host's challenge, the same lesson the poster queue learned.
+      // localhost (fixture probes) gets a 10ms gap: politeness exists for
+      // remote CDNs, and a 1500-cell probe at 350ms would run 4+ minutes
+      const IMG_PAGE_GAP = /^(localhost|127\.)/.test(location.hostname) ? 10 : 350;
+      const imgPageNet = { active: 0, gap: IMG_PAGE_GAP, queue: [], last: 0 };
       function runImgPageNet(job) {
         imgPageNet.queue.push(job);
         pumpImgPageNet();
@@ -2560,7 +2672,7 @@
         const job = imgPageNet.queue.shift();
         imgPageNet.active++;
         const now = Date.now();
-        const wait = Math.max(0, imgPageNet.last + 350 - now);
+        const wait = Math.max(0, imgPageNet.last + imgPageNet.gap - now);
         imgPageNet.last = now + wait;
         setTimeout(() => job(() => { imgPageNet.active--; pumpImgPageNet(); }), wait);
       }
@@ -2606,6 +2718,283 @@
           }, viaPage);
         } else viaPage();
       }
+  // rt-thumbcache: Preview thumb cache: memory objectURL layer (LRU, revoke on evict) over IDB thumbs/thumbsMeta stores (LRU at cap), GM blob fetch with the referer ladder through the shared imgPageNet queue, createImageBitmap downscale to THUMB_MAX_SIDE webp, animated-gif split (still thumb + original-bytes memory LRU for hover/viewer). Cells fetch a preview exactly once; re-entry after pool eviction is a memory hit.
+  // Order-preserving fragment of main()'s body — shares main() scope; no imports. Pure math lives in src/thumb.mjs.
+      const thumbMem = new Map();      // key -> {url: objectURL, bytes}
+      const thumbGifMem = new Map();   // key -> {url: objectURL, bytes} animated originals
+      const thumbInflight = new Map(); // key -> [cbs] (coalesced fetches)
+      const thumbNeg = new Set();      // session negatives: never re-fetch, never persist
+      const thumbIdbMeta = new Map();  // key -> {bytes, hits, ts} (mirror of thumbsMeta)
+      let thumbMemTotal = 0;
+      let thumbGifTotal = 0;
+      let thumbIdbTotal = 0;
+      let thumbIdbOk = true;           // false after quota/error -> memory-only thumbs
+      let thumbScanned = false;
+      let thumbScanP = null;
+      let thumbPruneQueued = false;
+
+      function thumbIdbStores() {
+        const db = cache.db;
+        if (!db || cache.mode !== 'idb' || !thumbIdbOk) return null;
+        if (!db.objectStoreNames.contains('thumbs') || !db.objectStoreNames.contains('thumbsMeta')) return null;
+        return db;
+      }
+      // one-time meta scan (totals + LRU table). Gets never wait on it — a
+      // direct key get is correct regardless of scan state; a put landing
+      // mid-scan double-counts its bytes in the total until the next prune
+      // reconciles (bounded, self-correcting).
+      function thumbScan() {
+        if (thumbScanned || thumbScanP) return thumbScanP;
+        const db = thumbIdbStores();
+        if (!db) { thumbScanned = true; return Promise.resolve(); }
+        thumbScanP = new Promise((resolve) => {
+          let tx;
+          try { tx = db.transaction('thumbsMeta', 'readonly'); } catch (e) { thumbScanned = true; resolve(); return; }
+          const req = tx.objectStore('thumbsMeta').openCursor();
+          req.onsuccess = () => {
+            const cur = req.result;
+            if (!cur) return;
+            const v = cur.value;
+            if (v && v.key) { thumbIdbMeta.set(v.key, v); thumbIdbTotal += v.bytes | 0; }
+            cur.continue();
+          };
+          req.onerror = () => {};
+          tx.oncomplete = () => { thumbScanned = true; resolve(); };
+          tx.onerror = () => { thumbScanned = true; resolve(); };
+          tx.onabort = () => { thumbScanned = true; resolve(); };
+        });
+        return thumbScanP;
+      }
+      function thumbDbPut(key, blob, bytes) {
+        const db = thumbIdbStores();
+        if (!db) return;
+        const finish = () => {
+          const prev = thumbIdbMeta.get(key);
+          thumbIdbTotal += bytes - (prev ? prev.bytes : 0);
+          thumbIdbMeta.set(key, { key: key, bytes: bytes, hits: prev ? prev.hits + 1 : 0, ts: Date.now() });
+          if (thumbIdbTotal > THUMB_STORE_CAP && !thumbPruneQueued) {
+            thumbPruneQueued = true;
+            setTimeout(() => {
+              thumbPruneQueued = false;
+              thumbDbPrune();
+            }, 2000);
+          }
+        };
+        try {
+          const tx = db.transaction(['thumbs', 'thumbsMeta'], 'readwrite');
+          tx.objectStore('thumbs').put({ key: key, blob: blob });
+          tx.objectStore('thumbsMeta').put({ key: key, bytes: bytes, hits: (thumbIdbMeta.get(key) || { hits: 0 }).hits, ts: Date.now() });
+          tx.oncomplete = finish;
+          tx.onerror = () => { if (tx.error && /quota/i.test(String(tx.error && tx.error.name))) thumbIdbOk = false; };
+          tx.onabort = () => { if (tx.error && /quota/i.test(String(tx.error && tx.error.name))) thumbIdbOk = false; };
+        } catch (e) { /* degraded mode — memory layer still serves */ }
+      }
+      function thumbDbPrune() {
+        const db = thumbIdbStores();
+        if (!db || !(thumbIdbTotal > THUMB_STORE_CAP)) return;
+        const drop = prunePlan(thumbIdbTotal, THUMB_STORE_CAP, Array.from(thumbIdbMeta.values()));
+        if (!drop.length) return;
+        try {
+          const tx = db.transaction(['thumbs', 'thumbsMeta'], 'readwrite');
+          for (const k of drop) {
+            tx.objectStore('thumbs').delete(k);
+            tx.objectStore('thumbsMeta').delete(k);
+          }
+          tx.oncomplete = () => {
+            for (const k of drop) {
+              const m = thumbIdbMeta.get(k);
+              if (m) { thumbIdbTotal -= m.bytes; thumbIdbMeta.delete(k); }
+            }
+          };
+          tx.onerror = () => {};
+        } catch (e) { /* keep serving; next put re-queues */ }
+      }
+      // ---- memory layers --------------------------------------------------
+      function thumbMemPut(key, blob) {
+        const url = URL.createObjectURL(blob);
+        const bytes = blob.size || 0;
+        const old = thumbMem.get(key);
+        if (old) { thumbMemTotal -= old.bytes; URL.revokeObjectURL(old.url); }
+        thumbMem.delete(key);
+        thumbMem.set(key, { url: url, bytes: bytes });
+        thumbMemTotal += bytes;
+        if (thumbMemTotal > THUMB_MEM_CAP) {
+          for (const k of prunePlan(thumbMemTotal, THUMB_MEM_CAP, Array.from(thumbMem.entries()).map(([k2, v]) => ({ key: k2, bytes: v.bytes, hits: 1, ts: 0 })))) {
+            const e = thumbMem.get(k);
+            if (e) { URL.revokeObjectURL(e.url); thumbMemTotal -= e.bytes; thumbMem.delete(k); }
+          }
+        }
+        return url;
+      }
+      function gifMemPut(key, blob) {
+        const bytes = blob.size || 0;
+        if (bytes > GIF_MEM_CAP) return null; // one gif larger than the whole layer helps nobody
+        const url = URL.createObjectURL(blob);
+        const old = thumbGifMem.get(key);
+        if (old) { thumbGifTotal -= old.bytes; URL.revokeObjectURL(old.url); }
+        thumbGifMem.delete(key);
+        thumbGifMem.set(key, { url: url, bytes: bytes });
+        thumbGifTotal += bytes;
+        while (thumbGifTotal > GIF_MEM_CAP && thumbGifMem.size > 1) {
+          const [k, e] = thumbGifMem.entries().next().value; // insertion order = oldest use
+          URL.revokeObjectURL(e.url);
+          thumbGifTotal -= e.bytes;
+          thumbGifMem.delete(k);
+        }
+        return url;
+      }
+      // ---- fetch + decode ---------------------------------------------------
+      // GM blob GET with the 0.18.2 referer ladder: page-default policy is the
+      // forum referer (GM may set it; the fetch fallback uses the spec-legal
+      // referrer init), one no-referrer retry on transport/HTTP failure. No
+      // cache-bust param needed: GM/fetch results never poison the byte cache
+      // we build here — a ≤1px decode is discarded, not stored.
+      function gmThumbBytes(url, noRef, cb) {
+        const ok = (b) => cb(b || null);
+        const fail = () => cb(null);
+        if (typeof GM_xmlhttpRequest === 'function') {
+          try {
+            const hdrs = {};
+            if (!noRef && extractDomain(url) !== hostKey(location.host)) hdrs.Referer = location.origin + '/';
+            GM_xmlhttpRequest({
+              method: 'GET',
+              url: url,
+              responseType: 'blob',
+              timeout: 12000,
+              headers: Object.keys(hdrs).length ? hdrs : undefined,
+              onload: (r) => {
+                const st = r ? (r.status | 0) : 0;
+                if (r && r.response && (st === 200 || st === 0)) ok(r.response);
+                else fail();
+              },
+              onerror: fail,
+              ontimeout: fail
+            });
+            return;
+          } catch (e) { /* fall through to fetch */ }
+        }
+        const opts = { credentials: 'omit' };
+        if (!noRef && extractDomain(url) !== hostKey(location.host)) opts.referrer = location.origin + '/';
+        else if (noRef) opts.referrerPolicy = 'no-referrer';
+        // a hung fetch would hold an imgPageNet slot (2 max) and leak the
+        // inflight entry forever — same leash lesson as gmGetText (0.18 era)
+        const ctl = (typeof AbortController !== 'undefined') ? new AbortController() : null;
+        if (ctl) {
+          opts.signal = ctl.signal;
+          setTimeout(() => { try { ctl.abort(); } catch (e) {} }, 12000);
+        }
+        fetch(url, opts).then((r) => (r.ok ? r.blob() : null)).then(ok, fail);
+      }
+      function thumbEncode(bmp, blob, forceStill) {
+        // still-frame webp at the capped size; for already-small STATIC images
+        // the original bytes are the thumb (no needless re-encode). Animated
+        // sources always re-encode — the cell must hold frame 0, not the
+        // animation, even when the source is already tiny.
+        const t = downscaleTarget(bmp.width, bmp.height, THUMB_MAX_SIDE)
+          || (forceStill ? { w: bmp.width, h: bmp.height } : null);
+        if (!t) return Promise.resolve(blob);
+        const cv = typeof OffscreenCanvas !== 'undefined' ? new OffscreenCanvas(t.w, t.h) : Object.assign(document.createElement('canvas'), { width: t.w, height: t.h });
+        const ctx = cv.getContext('2d');
+        ctx.drawImage(bmp, 0, 0, t.w, t.h);
+        if (typeof cv.convertToBlob === 'function') return cv.convertToBlob({ type: 'image/webp', quality: 0.82 });
+        return new Promise((res) => cv.toBlob((b) => res(b), 'image/webp', 0.82));
+      }
+      function thumbFetch(key, url, cbs) {
+        const attempt = (noRef) => gmThumbBytes(url, noRef, (blob) => {
+          if (blob === null) {
+            if (!noRef) { attempt(true); return; }
+            thumbNeg.add(key);
+            for (const cb of cbs) cb(null);
+            return;
+          }
+          createImageBitmap(blob).then((bmp) => {
+            if (bmp.width <= 1 || bmp.height <= 1) { // hotlink block pixel: valid 1x1 bytes, dead preview
+              bmp.close();
+              if (!noRef) { attempt(true); return; }
+              thumbNeg.add(key);
+              for (const cb of cbs) cb(null);
+              return;
+            }
+            const animated = blob.type === 'image/gif' || isGifUrl(url);
+            thumbEncode(bmp, blob, animated).then((thumb) => {
+              bmp.close();
+              if (animated) gifMemPut(key, blob); // hover/viewer play the original bytes
+              const memUrl = thumbMemPut(key, thumb);
+              thumbDbPut(key, thumb, thumb.size | 0);
+              for (const cb of cbs) cb(memUrl);
+            }, () => { bmp.close(); for (const cb of cbs) cb(null); }); // the bitmap outlives a failed encode — close it (≈48MB at 4000px)
+          }, () => {
+            // undecodable bytes (HTML challenge page mid-queue): not worth a
+            // no-referrer retry ladder round — the cell fallback handles it
+            thumbNeg.add(key);
+            for (const cb of cbs) cb(null);
+          });
+        });
+        attempt(false);
+      }
+      // ---- public API --------------------------------------------------------
+      // Sync return: the objectURL when the memory layer already holds the
+      // thumb (cells set src before paint — no flash). Otherwise null; cb then
+      // fires ASYNC exactly once with the objectURL (fetched/loaded) or null
+      // (failed — caller falls back to the direct-URL img path and its failure
+      // policy). data:/blob: URLs never enter the cache.
+      function thumbFor(url, cb) {
+        const s = String(url || '');
+        if (!s || /^(data|blob):/i.test(s)) { if (cb) setTimeout(() => cb(null), 0); return null; }
+        const key = thumbKey(s);
+        const hit = thumbMem.get(key);
+        if (hit) {
+          thumbMem.delete(key); thumbMem.set(key, hit); // LRU touch
+          return hit.url;
+        }
+        if (thumbNeg.has(key)) { if (cb) setTimeout(() => cb(null), 0); return null; }
+        let cbs = thumbInflight.get(key);
+        if (cbs) { if (cb) cbs.push(cb); return null; }
+        cbs = cb ? [cb] : [];
+        thumbInflight.set(key, cbs);
+        const settle = (u) => {
+          thumbInflight.delete(key);
+          for (const fn of cbs) fn(u);
+        };
+        const db = thumbIdbStores();
+        if (db) {
+          try {
+            const req = db.transaction('thumbs', 'readonly').objectStore('thumbs').get(key);
+            req.onsuccess = () => {
+              const rec = req.result;
+              if (rec && rec.blob) {
+                const m = thumbIdbMeta.get(key);
+                if (m) { m.hits = (m.hits | 0) + 1; }
+                settle(thumbMemPut(key, rec.blob));
+              } else {
+                runImgPageNet((done) => thumbFetch(key, url, [(u) => { settle(u); done(); }]));
+              }
+            };
+            req.onerror = () => runImgPageNet((done) => thumbFetch(key, url, [(u) => { settle(u); done(); }]));
+            return null;
+          } catch (e) { /* fall through to fetch */ }
+        }
+        runImgPageNet((done) => thumbFetch(key, url, [(u) => { settle(u); done(); }]));
+        return null;
+      }
+      // Animated-original accessor for hover-play / viewer: sync hit when the
+      // original bytes are still in the gif LRU, else async fetch (rare: only
+      // after LRU eviction or an IDB-hydrated still). null = give up on anim.
+      function gifOriginalUrl(url, cb) {
+        const key = thumbKey(String(url || ''));
+        const hit = thumbGifMem.get(key);
+        if (hit) { thumbGifMem.delete(key); thumbGifMem.set(key, hit); return hit.url; }
+        gmThumbBytes(url, false, (blob) => {
+          if (blob === null || (blob.type !== 'image/gif' && !isGifUrl(url))) { if (cb) cb(null); return; }
+          if (cb) cb(gifMemPut(key, blob));
+        });
+        return null;
+      }
+      // cell hint: is this URL an animated original we can hover-play?
+      function thumbIsGif(url) { return thumbGifMem.has(thumbKey(String(url || ''))); }
+      // NOTE: thumbScan() runs from the boot IIFE right after cache.init() —
+      // calling it at fragment-init time would run before the DB opens and
+      // permanently mark the scan done against a null handle.
       // ---------- album expansion (0.18) ----------
       // /a/<id> album links expand into per-file grid children. Server-rendered
       // hosts answer the page HTML itself (item grid inline); SPA hosts answer
@@ -2645,8 +3034,10 @@
         const q = albumInflight.get(url) || [];
         albumInflight.delete(url);
         // children arriving changes the grid item list — re-render the media
-        // tab once (signature reset forces it even when counts alone collide)
-        if (panelIsOpen() && panelTab === 'media') { lastPanelSignature = ''; renderPanelBody(); }
+        // tab once (signature reset forces it even when counts alone collide),
+        // behind the scroll-idle gate: an expansion landing mid-scroll must
+        // not yank the grid under the user
+        if (panelIsOpen() && panelTab === 'media') { lastPanelSignature = ''; deferGridRebuild(); }
         for (const fn of q) fn(children && children.length ? children : null);
       }
       function fetchAlbumApiPage(url, page, onOk, onErr) {
@@ -2697,7 +3088,7 @@
         albumPrimeQueued = true;
         setTimeout(() => {
           albumPrimeQueued = false;
-          if (panelIsOpen() && panelTab === 'media') { lastPanelSignature = ''; renderPanelBody(); }
+          if (panelIsOpen() && panelTab === 'media') { lastPanelSignature = ''; deferGridRebuild(); }
         }, 0);
       }
       function ensureAlbum(url, cb) {
@@ -3691,6 +4082,20 @@
         updateDlDash();
         dlPump();
       }
+      // shared sticker-gate check for every media lane (thumb-cache cells,
+      // direct fallback, viewer): 2..140px both axes = smilie/sticker (no URL
+      // marker exists) — retire the item. Animate out first, then the
+      // debounced rerender drops it in one batched pass.
+      function checkTinyMedia(im, url) {
+        if (im.naturalWidth > 1 && im.naturalWidth <= TINY_MEDIA_MAX
+          && im.naturalHeight > 1 && im.naturalHeight <= TINY_MEDIA_MAX
+          && !tinyMediaUrls.has(url)) {
+          tinyMediaUrls.add(url);
+          animateOutCells(url);
+          scheduleBrokenRerender();
+        }
+      }
+
       // Build the <img>/<video> element for a grid cell, viewer, or filmstrip
       // thumb. An <img> that fails to load is retried once as <video> —
       // extension-based classification cannot know a URL's real bytes (video
@@ -3711,9 +4116,14 @@
         if (tile.querySelector('img')) return;
         const im = document.createElement('img');
         im.alt = '';
+        im.decoding = 'async';
         im.addEventListener('error', () => { im.remove(); const c = cellOf(); if (c) c.classList.remove('xft-loading'); }, { once: true });
         im.addEventListener('load', () => { im.classList.add('xft-ok'); const c = cellOf(); if (c) c.classList.remove('xft-loading'); }, { once: true });
-        im.src = poster;
+        // posters ride the thumb cache too (same one-fetch/byte-bounded rule);
+        // a failed poster fetch falls back to the direct URL — the error
+        // listener above then drops it exactly as before
+        const hit = thumbFor(poster, (u) => { im.src = u || poster; });
+        if (hit) im.src = hit; // sync hit: set before attach, no shimmer; miss keeps src empty until the cb
         tile.appendChild(im);
       }
 
@@ -3871,16 +4281,111 @@
           }, 800);
           return v;
         }
+        // ---------- CELLS (thumb=true): cached capped thumbs only ----------
+        // One fetch per URL through the byte cache, decode bounded at
+        // THUMB_MAX_SIDE, instant re-entry after pool eviction (memory layer
+        // hit fires synchronously — src set before the element is even
+        // attached, no shimmer flash). The legacy direct-URL path below runs
+        // ONLY as the failure fallback: a URL the thumb fetch cannot serve
+        // keeps today's error policy (HQ chain, moved-page resolve, stall,
+        // video retry) minus the in-cell landing-page HQ swap — cells never
+        // pull full-res originals anymore; the viewer and downloads do.
+        if (thumb) {
+          const im = document.createElement('img');
+          im.alt = '';
+          im.loading = 'lazy';
+          im.decoding = 'async';
+          let still = null;            // the cached still's objectURL (hover restores it)
+          let settled = false;         // thumb lane finished (either way)
+          const wireFallback = () => {
+            if (settled) return;
+            settled = true;
+            const cands = hqCandidates(url);
+            let ci = Math.min(hqStage.get(url) || 0, cands.length - 1);
+            const isHqStage = (i) => cands.length > 1 && i < cands.length - 1;
+            const setStage = (i) => {
+              ci = i;
+              hqStage.set(url, i);
+              im.src = cands[i];
+            };
+            im.addEventListener('error', function onErr() {
+              noteOriginResult(cands[ci], false);
+              if (isHqStage(ci)) {
+                if (ci === 0 && !hqTriedRetry.has(url) && originBursting(cands[ci])) {
+                  hqTriedRetry.add(url);
+                  im.removeAttribute('src');
+                  setTimeout(() => { if (ci === 0) setStage(0); }, 1500);
+                  return;
+                }
+                setStage(ci + 1);
+                return;
+              }
+              im.removeEventListener('error', onErr);
+              if (!im.dataset.xftMoved) {
+                im.dataset.xftMoved = '1';
+                resolveEmbedStream(url, (src) => {
+                  im.dataset.xftMoved = '';
+                  if (src) {
+                    brokenMediaUrls.delete(url);
+                    const host = im.closest('.xft-cell, .xft-vslot, .xft-vthumb');
+                    if (host) host.classList.remove('xft-broken');
+                    im.referrerPolicy = 'no-referrer';
+                    im.src = src;
+                    return;
+                  }
+                  markMediaBroken(im, url);
+                });
+                return;
+              }
+              if (originBursting(url)) { enterStall(im, url); return; }
+              const v = document.createElement('video');
+              v.preload = 'metadata';
+              v.muted = true;
+              v.src = url;
+              v.addEventListener('error', () => markMediaBroken(v, url));
+              v.addEventListener('loadedmetadata', () => { if (im.parentNode) im.replaceWith(v); markMediaLoaded(v); });
+              v.load();
+              setTimeout(() => { if (v.readyState === 0) markMediaBroken(v, url); }, 6000);
+            });
+            setStage(ci);
+            const checkDead = () => { if (!im.dataset.xftMoved && im.getAttribute('src') && im.complete && im.naturalWidth <= 1 && !stallState.has(url)) markMediaBroken(im, url); };
+            if (im.getAttribute('src') && im.complete) { checkDead(); checkTinyMedia(im, url); if (im.naturalWidth > 1) markMediaLoaded(im); }
+            else {
+              im.addEventListener('load', () => { checkDead(); checkTinyMedia(im, url); markMediaLoaded(im); });
+              setTimeout(() => { checkDead(); checkTinyMedia(im, url); }, 800);
+            }
+          };
+          const applyStill = (u, sync) => {
+            if (settled || !u) return;
+            settled = true;
+            still = u;
+            im.src = u;
+            // reveal gate: sync hits pass it pre-attach (nothing painted yet);
+            // async arrivals pass it on load, after decode
+            if (sync) im.classList.add('xft-ok');
+            im.addEventListener('load', () => { im.classList.add('xft-ok'); checkTinyMedia(im, url); markMediaLoaded(im); }, { once: true });
+          };
+          const hit = thumbFor(url, (u) => { if (u) applyStill(u, false); else wireFallback(); });
+          if (hit) applyStill(hit, true);
+          // animated gifs: the cell holds the still frame; hover swaps in the
+          // original bytes (memory LRU), leaving restores the still
+          if (isGifUrl(url) || thumbIsGif(url)) {
+            const play = () => {
+              const u = gifOriginalUrl(url, (u2) => { if (u2 && im.matches(':hover') && still) im.src = u2; });
+              if (u && still) im.src = u;
+            };
+            const stop = () => { if (still && im.src !== still) im.src = still; };
+            im.addEventListener('pointerenter', play);
+            im.addEventListener('pointerleave', stop);
+          }
+          return im;
+        }
+        // ---------- VIEWER / filmstrip (thumb=false): full-res, unchanged ----------
         const im = document.createElement('img');
-        // ALL images lazy + async: the grid keeps every row in the DOM, so
-        // the browser's viewport distance decides when bytes move — that IS
-        // the CDN-burst throttle the old HQ queue provided, without a queue
-        // that offscreen rows would wedge for minutes.
         im.loading = 'lazy';
         im.decoding = 'async';
         const cands = hqCandidates(url);
         let ci = Math.min(hqStage.get(url) || 0, cands.length - 1);
-        const isHqStage = (i) => cands.length > 1 && i < cands.length - 1;
         const setStage = (i) => {
           ci = i;
           hqStage.set(url, i);
@@ -3888,26 +4393,8 @@
         };
         im.addEventListener('error', function onErr() {
           noteOriginResult(cands[ci], false);
-          // HQ candidates first. The one delayed retry is for RATE-LIMIT
-          // BURSTS (bursting origin): the gate keeps a src-less/failed img
-          // invisible, so the retry hides inside the shimmer. On a HEALTHY
-          // origin an isolated failure is a dead file — skip the wait and
-          // walk straight down the chain. Only the post URL itself failing
-          // starts the video retry.
-          if (isHqStage(ci)) {
-            if (ci === 0 && !hqTriedRetry.has(url) && originBursting(cands[ci])) {
-              hqTriedRetry.add(url);
-              im.removeAttribute('src');
-              setTimeout(() => { if (ci === 0) setStage(0); }, 1500);
-              return;
-            }
-            setStage(ci + 1);
-            return;
-          }
+          if (cands.length > 1 && ci < cands.length - 1) { setStage(ci + 1); return; }
           im.removeEventListener('error', onErr);
-          // moved-page resolve (bunkr-style): a direct IMAGE url can 301 to an
-          // HTML landing page just like the video kind — resolve through the
-          // page carrier once, swap the src; only a real failure falls through
           if (!im.dataset.xftMoved) {
             im.dataset.xftMoved = '1';
             resolveEmbedStream(url, (src) => {
@@ -3924,88 +4411,36 @@
             });
             return;
           }
-          // burst-failing origin: the file may be fine, the CDN is choking —
-          // HOLD the slot and recheck in the background (no hole, no reflow)
-          if (originBursting(url)) { enterStall(im, url); return; }
-          const v = document.createElement('video');
-          v.preload = 'metadata';
-          v.muted = true;
-          v.src = url;
-          v.addEventListener('error', () => markMediaBroken(v, url));
-          v.addEventListener('loadedmetadata', () => { if (im.parentNode) im.replaceWith(v); markMediaLoaded(v); });
-          v.load();
-          // some 404s stall as networkState=LOADING forever (no error event,
-          // no metadata) — a stalled cell must still retire, or it shimmers
-          // for the rest of the session
-          setTimeout(() => { if (v.readyState === 0) markMediaBroken(v, url); }, 6000);
+          markMediaBroken(im, url);
         });
         setStage(ci);
-        // full-quality upgrade for CELLS and the VIEWER: the embedded copy
-        // renders instantly, then swaps to the original once the landing page
-        // resolves. The browser keeps the old pixels until the new image
-        // decodes, so the swap is seamless. Must run AFTER setStage — a cache
-        // hit fires synchronously and setStage's src write would overwrite it.
-        // Skipped when a static marker chain exists (.md/.th win, cheaper).
         if (pageUrl && cands.length === 1) {
-          // the VIEWER (thumb=false) forces past any failure cooldown — a
-          // user-initiated single is worth a fresh attempt. Grid cells wait
-          // the cooldown out (they are many, and bursts are what trip the
-          // host in the first place), but a failed cell gets ONE delayed
-          // retry landing right as the cooldown expires — attached cells
-          // must not stay at embedded quality forever.
           let retriedHq = false;
           const wantHq = (force2) => resolveImagePage(pageUrl, url, (full) => {
             if (!full) {
-              // retry FORCED: any later failure (a download's resolve, another
-              // cell) can have REFRESHED the cooldown past this retry — one
-              // fresh single request 31s out is burst-safe
               if (!retriedHq && im.isConnected) { retriedHq = true; setTimeout(() => wantHq(true), 31000); }
               return;
             }
             if (im.src === full) return;
-            // load the original through the referer-fallback loader (forum
-            // referer first, no-referrer once) and crossfade it in — the
-            // loaded probe element IS the swap layer, so the frame is already
-            // decoded when it lands (no progressive paint-through)
             loadSwapImg(full, (top, noRef) => {
               const host = im.parentNode;
-              const src2 = top.src; // the URL that actually loaded (cache-busted on the fallback path)
+              const src2 = top.src;
               if (!host || im.src === src2) return;
               top.alt = '';
-              top.className = 'xft-hq-top xft-ok'; // reveal gate passes at once — frame is decoded
-              if (noRef) im.referrerPolicy = 'no-referrer'; // the final swap must reuse the policy that worked
+              top.className = 'xft-hq-top xft-ok';
+              if (noRef) im.referrerPolicy = 'no-referrer';
               host.appendChild(top);
               requestAnimationFrame(() => top.classList.add('xft-hq-on'));
-              setTimeout(() => { im.src = src2; top.remove(); }, 450); // swap beneath, then drop the layer
-            }, () => { /* both policies failed — embedded copy stays */ });
+              setTimeout(() => { im.src = src2; top.remove(); }, 450);
+            }, () => {});
           }, force2 || !thumb);
           wantHq();
         }
-        // A failure cached by Chrome replays instantly with NO error event, and
-        // 1×1 placeholders (svg data-URIs, hotlink-block pixels) "load" as a
-        // single stretched pixel = a blank cell. nw<=1 + complete = dead either
-        // way — probe for both, or the cell renders blank forever. A src-LESS
-        // img (waiting in the HQ queue, or mid-retry) is complete with nw=0
-        // but NOT dead — probing it retired whole ranges of healthy cells.
-        // xftMoved = a moved-page resolve is IN FLIGHT for this element — the
-        // error/complete/nw<=1 state it sees is the OLD url's, not a verdict
-        const checkDead = () => { if (!im.dataset.xftMoved && im.getAttribute('src') && im.complete && im.naturalWidth <= 1 && !stallState.has(url)) markMediaBroken(im, url); };
-        const checkTiny = () => {
-          // 2..140px square-ish = smilie/sticker (no URL marker exists) —
-          // retire the item. Animate the cell out first, then the debounced
-          // rerender (same one broken media uses) drops it in one batched pass.
-          if (im.naturalWidth > 1 && im.naturalWidth <= TINY_MEDIA_MAX
-            && im.naturalHeight > 1 && im.naturalHeight <= TINY_MEDIA_MAX
-            && !tinyMediaUrls.has(url)) {
-            tinyMediaUrls.add(url);
-            animateOutCells(url);
-            scheduleBrokenRerender();
-          }
-        };
-        if (im.getAttribute('src') && im.complete) { checkDead(); checkTiny(); if (im.naturalWidth > 1) markMediaLoaded(im); }
+        const checkDeadV = () => { if (!im.dataset.xftMoved && im.getAttribute('src') && im.complete && im.naturalWidth <= 1 && !stallState.has(url)) markMediaBroken(im, url); };
+        if (im.getAttribute('src') && im.complete) { checkDeadV(); checkTinyMedia(im, url); if (im.naturalWidth > 1) markMediaLoaded(im); }
         else {
-          im.addEventListener('load', () => { checkDead(); checkTiny(); markMediaLoaded(im); });
-          setTimeout(() => { checkDead(); checkTiny(); }, 800);
+          im.addEventListener('load', () => { checkDeadV(); checkTinyMedia(im, url); markMediaLoaded(im); });
+          setTimeout(() => { checkDeadV(); checkTinyMedia(im, url); }, 800);
         }
         return im;
       }
@@ -4268,6 +4703,23 @@
         for (const it of all) { if (it.kind === 'album') continue; mediaCounts[it.kind === 'embed' ? 'video' : it.kind] += 1; }
         const items = panelSubTab === 'all' ? all : all.filter((it) => it.kind === panelSubTab || (panelSubTab === 'video' && it.kind === 'embed'));
         return { all: all, items: items, mediaCounts: mediaCounts };
+      }
+
+      // count-only fast path for fetch ticks while the grid rebuild is held:
+      // the item counter + sub-tab counts climb live without touching grid DOM
+      // (collectMediaItems is pure CPU ~1-2ms at 1500 items; the mount +
+      // replaceChildren + cell-build work is what the gate exists to defer)
+      let countsQueued = false;
+      function scheduleCountsOnly() {
+        if (countsQueued || !panelIsOpen() || panelTab !== 'media') return;
+        countsQueued = true;
+        requestAnimationFrame(() => {
+          countsQueued = false;
+          if (!panelIsOpen() || panelTab !== 'media') return;
+          const m = collectMediaItems(panelData());
+          updateSubTabCounts(m.mediaCounts);
+          updateCountOnly(m.items.length);
+        });
       }
 
       function renderPanelBody() {
@@ -5031,6 +5483,11 @@
           if (performance.now() - programmaticScrollAt > 40) lastUserScrollAt = performance.now();
           queueRenderSlice();
         }, { passive: true });
+        // wheel/touch input is UNAMBIGUOUSLY the user: rebuilds restore scroll
+        // positions (refreshing programmaticScrollAt), and a scroll event
+        // landing inside that 40ms guard would otherwise read as programmatic
+        // too — the idle gate would then apply rebuilds mid-fling (0.20.0)
+        panelBodyEl.addEventListener('wheel', () => { lastUserScrollAt = performance.now(); }, { passive: true });
       }
       // drawer/window resizes change the row width → the uniform row height
       // changes → every offset changes. Debounced re-mount of the metrics
@@ -5048,6 +5505,7 @@
           t = setTimeout(() => {
             if (panelTab !== 'media' || !vRowsEl || !vRowsEl.isConnected || !vMetrics) return;
             const st = panelBodyEl.scrollTop;
+            vProbeGen++; // width changed -> row height changed -> re-probe once
             mountVirtualGrid(vRowsEl, vLayout, { prevTotal: vMetrics.total, st: st }, null);
           }, 150);
         }).observe(panelBodyEl);
@@ -5212,6 +5670,7 @@
           tinyMediaUrls.clear();
           hqStage.clear();
           hqTriedRetry.clear();
+          thumbNeg.clear(); // session thumb-fetch negatives ride with the rest of the failure state; the BYTES survive
           clearStalls();
           clearVRows();
           ensure(true);
@@ -5616,6 +6075,7 @@
       (async function init() {
         injectStyles();
         await cache.init();
+        thumbScan(); // warm the thumb-cache LRU table once the DB handle exists
         const savedMeta = await cache.getThreadMeta(threadKey);
         if (savedMeta) {
           // load complete AND partial caches — partial data stays usable (resume)
