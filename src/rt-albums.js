@@ -11,6 +11,7 @@
     const ALBUMS_KEY = 'xfThreadTools:albumExpansions';
     const albumStore = readStore(ALBUMS_KEY, {}) || {};
     const albumChildren = new Map();  // albumUrl -> children[] (runtime mirror of the store)
+    const albumMeta = new Map();      // albumUrl -> display name (page/API title; slug fallback at read)
     const albumInflight = new Map();
     const albumCooldown = new Map();
     const ALBUM_TTL_MS = 6 * 3600 * 1000;
@@ -23,14 +24,15 @@
       }
       writeStore(ALBUMS_KEY, albumStore);
     }
-    function albumDone(url, children, persist) {
+    function albumDone(url, children, persist, name) {
       if (children && children.length) {
         albumChildren.set(url, children);
+        if (name) albumMeta.set(url, name);
         // partial walks (a mid-walk page error) populate the SESSION view
         // but never persist — a transient page-2 failure must not pin a
         // truncated album for the whole 6h TTL
         if (persist !== false) {
-          albumStore[url] = { children: children, at: Date.now() };
+          albumStore[url] = { children: children, at: Date.now(), name: albumMeta.get(url) || '' };
           saveAlbumStore();
         }
       } else {
@@ -62,25 +64,29 @@
       // item grid) or a fetch error falls through to the JSON album API.
       imgPageGet(url, (text) => {
         const kids = parseAlbumPage(text, url);
-        if (kids.length) { albumDone(url, kids, true); return; }
+        if (kids.length) { albumDone(url, kids, true, parseAlbumTitle(text)); return; }
         const acc = [];
         const seen = new Set();
+        let nm = '';
         const step = (page) => {
-          if (page > ALBUM_MAX_PAGES) { albumDone(url, acc, true); return; }
+          if (page > ALBUM_MAX_PAGES) { albumDone(url, acc, true, nm); return; }
           fetchAlbumApiPage(url, page, (t) => {
             const p = parseAlbumApiResponse(t);
-            if (p) for (const c of p.children) { if (!seen.has(c.url)) { seen.add(c.url); acc.push(c); } }
+            if (p) {
+              for (const c of p.children) { if (!seen.has(c.url)) { seen.add(c.url); acc.push(c); } }
+              if (page === 1 && p.name) nm = p.name;
+            }
             if (p && page < p.lastPage) step(page + 1);
-            else albumDone(url, acc, true); // walked to the last page
-          }, () => albumDone(url, acc, false)); // mid-walk error: session-only
+            else albumDone(url, acc, true, nm); // walked to the last page
+          }, () => albumDone(url, acc, false, nm)); // mid-walk error: session-only
         };
         step(1);
       }, () => {
         // page GET failed outright — still try the API before giving up
         fetchAlbumApiPage(url, 1, (t) => {
           const p = parseAlbumApiResponse(t);
-          albumDone(url, p ? p.children : null, true);
-        }, () => albumDone(url, null, true));
+          albumDone(url, p ? p.children : null, true, p ? p.name : '');
+        }, () => albumDone(url, null, true, ''));
       });
     }
     // warm-cache hits must also surface children: the first collect pass runs
@@ -97,16 +103,26 @@
       }, 0);
     }
     function ensureAlbum(url, cb) {
-      if (albumChildren.has(url)) { cb(albumChildren.get(url)); return; }
+      // cb is optional: the Album sub-tab render asks for expansion without
+      // waiting on a callback (the rebuild lands via albumDone's rerender)
+      const done = (c) => { if (cb) cb(c); };
+      if (albumChildren.has(url)) { done(albumChildren.get(url)); return; }
       const st = albumStore[url];
       if (st && Array.isArray(st.children) && st.children.length && Date.now() - (st.at || 0) < ALBUM_TTL_MS) {
         albumChildren.set(url, st.children);
-        cb(st.children);
+        if (st.name) albumMeta.set(url, st.name);
+        done(st.children);
         albumPrimeRender();
         return;
       }
-      if (Date.now() < (albumCooldown.get(url) || 0)) { cb(null); return; }
-      if (albumInflight.has(url)) { albumInflight.get(url).push(cb); return; }
-      albumInflight.set(url, [cb]);
+      if (Date.now() < (albumCooldown.get(url) || 0)) { done(null); return; }
+      if (albumInflight.has(url)) { if (cb) albumInflight.get(url).push(cb); return; }
+      albumInflight.set(url, cb ? [cb] : []);
       expandAlbum(url);
+    }
+    // '[host] - [name]' group label (user spec 0.21): name = parsed page/API
+    // title, falling back to the /a/<slug> identifier from the URL
+    function albumLabelFor(url) {
+      const s = String(url || '');
+      return '[' + (extractDomain(s) || '?') + '] - ' + albumDisplayName(s, albumMeta.get(s));
     }

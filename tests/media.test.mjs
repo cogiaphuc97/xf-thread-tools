@@ -1,7 +1,7 @@
 // Unit tests for the media module (src/media.mjs). Regrouped to mirror the src/ split.
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { boilerplateUrls, hqCandidates, imagePageHref, isAlbumPageUrl, isSmilieUrl, parseAlbumApiResponse, parseAlbumPage, parseImageApiResponse, parseImagePage } from '../src/media.mjs';
+import { albumDisplayName, boilerplateUrls, hqCandidates, imagePageHref, isAlbumPageUrl, isSmilieUrl, parseAlbumApiResponse, parseAlbumPage, parseAlbumTitle, parseImageApiResponse, parseImagePage } from '../src/media.mjs';
 
 
 // ---- boilerplateUrls (signature / "sent via app" footer fingerprint) ----
@@ -138,6 +138,34 @@ test('parseAlbumPage: bunkr-shaped item grid -> children', () => {
 test('parseAlbumPage: empty shell / non-album html -> []', () => {
   assert.deepEqual(parseAlbumPage('', 'https://host.invalid/a/x'), []);
   assert.deepEqual(parseAlbumPage('<!doctype html><div id="app"></div>', 'https://host.invalid/a/x'), []);
+});
+
+test('parseAlbumTitle: <title> extraction, entity unescape, whitespace collapse', () => {
+  assert.equal(parseAlbumTitle('<html><head><title>My Album 2026</title></head><body></body></html>'), 'My Album 2026');
+  assert.equal(parseAlbumTitle('<title>  spaced   out &amp;  tidy &quot;x&quot; </title>'), 'spaced out & tidy "x"');
+  assert.equal(parseAlbumTitle("<title>it&#39;s here</title>"), "it's here");
+  assert.equal(parseAlbumTitle('<TITLE>case insensitive</TITLE>'), 'case insensitive');
+  assert.equal(parseAlbumTitle('<!doctype html><div id="app"></div>'), ''); // SPA shell: no title
+  assert.equal(parseAlbumTitle(''), '');
+});
+
+test('albumDisplayName: parsed title wins, /a/<slug> fallback, garbage url last resort', () => {
+  assert.equal(albumDisplayName('https://h.invalid/a/ab12', 'Parsed Name'), 'Parsed Name');
+  assert.equal(albumDisplayName('https://h.invalid/a/ab12', ''), 'ab12'); // slug fallback
+  assert.equal(albumDisplayName('https://h.invalid/a/ab12', undefined), 'ab12');
+  assert.equal(albumDisplayName('https://h.invalid/a/ab12', '   '), 'ab12'); // blank name -> slug
+  assert.equal(albumDisplayName('https://h.invalid/other', ''), 'https://h.invalid/other'); // no slug shape
+  assert.equal(albumDisplayName('', ''), '?');
+});
+
+test('parseAlbumApiResponse: name/title field surfaces as album display name', () => {
+  const mk = (extra) => parseAlbumApiResponse(JSON.stringify(Object.assign({
+    images: [{ encoded_id: 'i1', mime: 'image/jpeg', original_url: 'https://cdn.invalid/a.jpg', thumb_url: '' }],
+    pagination: { last_page: 1 }
+  }, extra)));
+  assert.equal(mk({ name: 'Album Name' }).name, 'Album Name');
+  assert.equal(mk({ title: 'Album Title' }).name, 'Album Title'); // secondary field
+  assert.equal(mk({}).name, ''); // absent -> '' (slug fallback at read)
 });
 
 test('parseAlbumApiResponse: goonbox shape -> children + pagination', () => {

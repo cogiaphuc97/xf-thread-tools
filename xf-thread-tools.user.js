@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         xf-thread-tools
 // @namespace    xf-thread-tools
-// @version      0.20.0
+// @version      0.21.0
 // @description  XenForo 2: sort thread posts by reaction count across all pages (cached) + floating media panel (images / external links).
 // @author       xf-thread-tools
 // @match        *://*/threads/*
@@ -174,6 +174,25 @@
     return /^\/a\/[A-Za-z0-9_-]{3,64}$/.test(path);
   }
   
+  // Album display name from the album page HTML <title> (pure). Empty string
+  // when absent — callers fall back to the URL slug. The page is already
+  // fetched for child parsing, so this costs no extra request.
+  function parseAlbumTitle(html) {
+    const m = String(html || '').match(/<title[^>]*>([^<]{1,300})<\/title>/i);
+    if (!m) return '';
+    return m[1].replace(/&quot;/g, '"').replace(/&#39;/g, "'").replace(/&amp;/g, '&').replace(/\s+/g, ' ').trim();
+  }
+  
+  // Album group display name (pure): parsed page/API title, else the
+  // /a/<slug> identifier from the URL (user spec 0.21, Round 8).
+  function albumDisplayName(url, name) {
+    const nm = String(name || '').trim();
+    if (nm) return nm;
+    const s = String(url || '');
+    const m = s.match(/\/a\/([A-Za-z0-9_-]{3,64})$/);
+    return m ? m[1] : (s || '?');
+  }
+  
   // Server-rendered album page parser: each grid item block carries the
   // filename in a title attr, a download href (/f/<slug>) and an absolute
   // thumbnail img. Archive/other extensions are skipped — only playable
@@ -225,7 +244,9 @@
       }
       const pag = j.pagination || {};
       const last = Math.max(1, parseInt(pag.last_page, 10) || 1);
-      return { children: children, lastPage: last };
+      // album display name (SPA hosts): name or title field, else '' -> slug fallback
+      const nm = typeof j.name === 'string' ? j.name : (typeof j.title === 'string' ? j.title : '');
+      return { children: children, lastPage: last, name: nm };
     } catch (e) { return null; }
   }
   /* ==== pure module: parse ==== */
@@ -553,6 +574,19 @@
     if (!t) return (tag || 'thread') + k + '.zip';
     return '[' + (tag || 'Site') + '] ' + t + k + '.zip';
   }
+  // Multi-part zip name: `x.zip` → `x.part1.zip`. The ONLY runs that carry a
+  // part suffix are ones whose bytes crossed the per-part cap mid-download —
+  // an under-cap run never seals early and keeps the single-zip name exactly.
+  function partZipName(base, n) {
+    const s = String(base || '');
+    return (/\.zip$/i.test(s) ? s.slice(0, -4) : s) + '.part' + (n | 0) + '.zip';
+  }
+  // Outer (download-attribute) name for album zips: Unicode + spaces stay
+  // readable like zipFileName; filesystem-illegal characters die, and ':'
+  // (host:port labels) becomes '_' so the port does not glue onto the host.
+  function safeOuterName(s) {
+    return String(s || '').replace(/:/g, '_').replace(/[\\/:*?"<>|]/g, '').replace(/\s+/g, ' ').trim().slice(0, 150);
+  }
   function dlBasename(url, kind, idx) {
     let b = '';
     try { b = new URL(url).pathname.split('/').filter(Boolean).pop() || ''; } catch (e) { /* keep '' */ }
@@ -660,6 +694,7 @@
         cands: cands,
         kind: it.kind,
         page: page,
+        album: String(it.album || ''), // parent album URL — album-mode downloads folder by it
         name: String(jobs.length + 1).padStart(3, '0') + '_' + dlBasename(cands[0], isVid ? 'video' : it.kind, jobs.length)
       });
     }
@@ -780,7 +815,7 @@
   }
   
   // ---------- media grid grouping/layout (pure — unit-tested, no DOM) ----------
-  function buildMediaLayout(items, mode) {
+  function buildMediaLayout(items, mode, albumLabel) {
     const lay = [];
     // sequential 4-packs — NO holes (user-facing rule: the grid is always
     // densely packed in every mode). Re-chunking after a retirement is
@@ -788,6 +823,23 @@
     // their elements (and their decoded frames) even when they slide into
     // a different row.
     const chunk = (list) => { for (let j = 0; j < list.length; j += 4) lay.push({ idxs: list.slice(j, j + 4) }); };
+    // Album sub-tab: one group per parent album, '[host] - [name]' main
+    // header (label fn passed by the caller — the pure module never reads
+    // runtime caches) with the group's item count at the right end
+    if (mode === 'album') {
+      const groups = new Map();
+      for (let i = 0; i < items.length; i++) {
+        const key = String(items[i].album || '');
+        let g = groups.get(key);
+        if (!g) { g = { key: key, label: albumLabel ? String(albumLabel(key)) : key, list: [] }; groups.set(key, g); }
+        g.list.push(i);
+      }
+      for (const g of groups.values()) {
+        lay.push({ hdr: 'main', label: g.label + '  ·  ' + g.list.length, postId: '', album: g.key });
+        chunk(g.list);
+      }
+      return lay;
+    }
     if (mode !== 'post' && mode !== 'page' && mode !== 'user') {
       chunk(items.map((_, i) => i));
       return lay;
@@ -1498,7 +1550,11 @@
         });
 
         // media-file anchors (lightbox wraps img.bbImage in <a>) belong on the
-        // Files/Videos tabs, not Links — partition before filtering
+        // Files/Videos tabs, not Links — partition before filtering.
+        // DUAL-LISTING (0.21): anchors re-routed into Media (ext-matched file
+        // links, cross-host /d/ file pages, cross-host /a/ albums) ALSO keep a
+        // Links row — a URL visible as a clickable link in the post must be
+        // visible as a link in the panel, not swallowed by reclassification.
         const parts = partitionLinks(rawLinks);
         for (const u of parts.imageLinks) images.push(absolutize(u));
         for (const u of parts.videoLinks) videos.push(absolutize(u));
@@ -1508,15 +1564,13 @@
         // forum's own and stay on Links
         const restLinks = [];
         const albums = [];
+        const dual = parts.imageLinks.concat(parts.videoLinks); // re-routed anchors that keep link rows
         for (const u of parts.links) {
           const abs = absolutize(u);
-          if (isFileDPageUrl(abs) && extractDomain(abs) !== hostKey(location.host)) videos.push(abs);
-          else if (isAlbumPageUrl(abs) && extractDomain(abs) !== hostKey(location.host)) albums.push(abs);
+          if (isFileDPageUrl(abs) && extractDomain(abs) !== hostKey(location.host)) { videos.push(abs); dual.push(u); }
+          else if (isAlbumPageUrl(abs) && extractDomain(abs) !== hostKey(location.host)) { albums.push(abs); dual.push(u); }
           else restLinks.push(u);
         }
-        const imgSet = new Set(images.filter(Boolean));
-        const vidSet = new Set(videos.filter(Boolean));
-        const embSet = new Set(embeds.filter(Boolean));
         return {
           threadKey: threadKey,
           postId: postId,
@@ -1526,7 +1580,7 @@
           date: dateEl ? (dateEl.getAttribute('datetime') || '') : '',
           reactionCount: reactionCount,
           bodyHtml: body ? lazyBodyHtml(body) : '',
-          links: filterLinks(restLinks, location.host).filter((u) => !imgSet.has(u) && !vidSet.has(u) && !embSet.has(u)),
+          links: Array.from(new Set(filterLinks(restLinks.concat(dual), location.host))),
           images: Array.from(new Set(images.filter(Boolean))),
           videos: Array.from(new Set(videos.filter(Boolean))),
           embeds: Array.from(new Set(embeds.filter(Boolean))),
@@ -1734,6 +1788,9 @@
       async function runFetch(force) {
         hub.fetchRunning = true;
         hub.abortRef = { aborted: false };
+        // paint the busy state AT START (spinner + Stop enabled): waiting for
+        // the first page's notify left Stop disabled through a whole page
+        updateProgressText();
         hub.partialNotice = false;
         hub.partialWhy = '';
         let warned = false;
@@ -2177,6 +2234,13 @@
         const line = document.createElement('span');
         line.className = 'xft-gline';
         hEl.append(lab, line);
+        // album groups carry their own download: zips exactly this album
+        // (Pics/ + Videos/ inside), named from the '[host] - [name]' label
+        if (en.album) {
+          const db = mkBtn('⬇', () => startAlbumDownload(en.album), 'xft-btn xft-dlhead');
+          db.title = 'Download this album as a zip';
+          hEl.appendChild(db);
+        }
         if (en.postId) {
           hEl.classList.add('xft-gjump');
           hEl.title = en.label + ' — jump to post';
@@ -3006,6 +3070,7 @@
       const ALBUMS_KEY = 'xfThreadTools:albumExpansions';
       const albumStore = readStore(ALBUMS_KEY, {}) || {};
       const albumChildren = new Map();  // albumUrl -> children[] (runtime mirror of the store)
+      const albumMeta = new Map();      // albumUrl -> display name (page/API title; slug fallback at read)
       const albumInflight = new Map();
       const albumCooldown = new Map();
       const ALBUM_TTL_MS = 6 * 3600 * 1000;
@@ -3018,14 +3083,15 @@
         }
         writeStore(ALBUMS_KEY, albumStore);
       }
-      function albumDone(url, children, persist) {
+      function albumDone(url, children, persist, name) {
         if (children && children.length) {
           albumChildren.set(url, children);
+          if (name) albumMeta.set(url, name);
           // partial walks (a mid-walk page error) populate the SESSION view
           // but never persist — a transient page-2 failure must not pin a
           // truncated album for the whole 6h TTL
           if (persist !== false) {
-            albumStore[url] = { children: children, at: Date.now() };
+            albumStore[url] = { children: children, at: Date.now(), name: albumMeta.get(url) || '' };
             saveAlbumStore();
           }
         } else {
@@ -3057,25 +3123,29 @@
         // item grid) or a fetch error falls through to the JSON album API.
         imgPageGet(url, (text) => {
           const kids = parseAlbumPage(text, url);
-          if (kids.length) { albumDone(url, kids, true); return; }
+          if (kids.length) { albumDone(url, kids, true, parseAlbumTitle(text)); return; }
           const acc = [];
           const seen = new Set();
+          let nm = '';
           const step = (page) => {
-            if (page > ALBUM_MAX_PAGES) { albumDone(url, acc, true); return; }
+            if (page > ALBUM_MAX_PAGES) { albumDone(url, acc, true, nm); return; }
             fetchAlbumApiPage(url, page, (t) => {
               const p = parseAlbumApiResponse(t);
-              if (p) for (const c of p.children) { if (!seen.has(c.url)) { seen.add(c.url); acc.push(c); } }
+              if (p) {
+                for (const c of p.children) { if (!seen.has(c.url)) { seen.add(c.url); acc.push(c); } }
+                if (page === 1 && p.name) nm = p.name;
+              }
               if (p && page < p.lastPage) step(page + 1);
-              else albumDone(url, acc, true); // walked to the last page
-            }, () => albumDone(url, acc, false)); // mid-walk error: session-only
+              else albumDone(url, acc, true, nm); // walked to the last page
+            }, () => albumDone(url, acc, false, nm)); // mid-walk error: session-only
           };
           step(1);
         }, () => {
           // page GET failed outright — still try the API before giving up
           fetchAlbumApiPage(url, 1, (t) => {
             const p = parseAlbumApiResponse(t);
-            albumDone(url, p ? p.children : null, true);
-          }, () => albumDone(url, null, true));
+            albumDone(url, p ? p.children : null, true, p ? p.name : '');
+          }, () => albumDone(url, null, true, ''));
         });
       }
       // warm-cache hits must also surface children: the first collect pass runs
@@ -3092,22 +3162,32 @@
         }, 0);
       }
       function ensureAlbum(url, cb) {
-        if (albumChildren.has(url)) { cb(albumChildren.get(url)); return; }
+        // cb is optional: the Album sub-tab render asks for expansion without
+        // waiting on a callback (the rebuild lands via albumDone's rerender)
+        const done = (c) => { if (cb) cb(c); };
+        if (albumChildren.has(url)) { done(albumChildren.get(url)); return; }
         const st = albumStore[url];
         if (st && Array.isArray(st.children) && st.children.length && Date.now() - (st.at || 0) < ALBUM_TTL_MS) {
           albumChildren.set(url, st.children);
-          cb(st.children);
+          if (st.name) albumMeta.set(url, st.name);
+          done(st.children);
           albumPrimeRender();
           return;
         }
-        if (Date.now() < (albumCooldown.get(url) || 0)) { cb(null); return; }
-        if (albumInflight.has(url)) { albumInflight.get(url).push(cb); return; }
-        albumInflight.set(url, [cb]);
+        if (Date.now() < (albumCooldown.get(url) || 0)) { done(null); return; }
+        if (albumInflight.has(url)) { if (cb) albumInflight.get(url).push(cb); return; }
+        albumInflight.set(url, cb ? [cb] : []);
         expandAlbum(url);
+      }
+      // '[host] - [name]' group label (user spec 0.21): name = parsed page/API
+      // title, falling back to the /a/<slug> identifier from the URL
+      function albumLabelFor(url) {
+        const s = String(url || '');
+        return '[' + (extractDomain(s) || '?') + '] - ' + albumDisplayName(s, albumMeta.get(s));
       }
       let settingsView = null;
       let panelTab = 'files';
-      let panelSubTab = 'all';        // media sub-tab: all | image | video
+      let panelSubTab = 'all';        // media sub-tab: all | image | video | album
       // every view (tab × sub-tab × group) remembers its own scroll position —
       // switching views restores where the user left THAT list, it must not
       // inherit the scroll of the list being left
@@ -3135,6 +3215,7 @@
         apply(3, true);
       }
       let subtabsEl = null;
+      let mediaGroupSel = null; // group-by select (hidden on the Album sub-tab — grouping is forced there)
       let subTabBtns = {};
       let linksBarEl = null;
       let linkSearchEl = null;
@@ -3322,7 +3403,7 @@
       // ranged parts (GM path only — Range is CORS-unsafe on fetch), per-
       // origin caps stop one CDN monopolizing the pool, per-attempt retries
       // + layered leashes make every path settle; a second click stops.
-      const dlRun = { running: false, cancel: false, phase: 'idle', total: 0, done: 0, fail: 0, bytes: 0, lastErr: '' };
+      const dlRun = { running: false, cancel: false, phase: 'idle', total: 0, done: 0, fail: 0, bytes: 0, lastErr: '', entryPlan: null, zipBase: '' };
       const dlNet = { active: 0, queue: [], last: 0, conns: 0 };
       const DL_NET_MAX = 6;
       const DL_NET_GAP = 200;
@@ -3336,16 +3417,35 @@
       const DL_STALL = 45000;           // no bytes for 45s mid-stream = dead attempt
       const DL_READ = 180000;           // per-attempt read ceiling
       const DL_WATCHDOG = 480000;       // absolute per job, retries included
-      const DL_BYTE_CAP = 3500 * 1024 * 1024; // zip offsets are 32-bit — stop well under 4 GB
+      // Per-part cap: the moment a part's fetched bytes reach this, it is
+      // sealed, saved, and freed while the rest of the list keeps fetching —
+      // resident memory stays ~one part regardless of list size (700+ item
+      // runs died on the old single-zip-everything-in-memory design). Zip
+      // offsets are 32-bit, so 1 GB also keeps every part well under 4 GB.
+      // Read per-call: the localhost test hook (IMG_PAGE_GAP convention)
+      // lets the headless probe lower the cap between runs in one page.
+      const DL_PART_CAP_DEFAULT = 1024 * 1048576;
+      function dlPartCap() {
+        return (/^(localhost|127\.)/.test(location.hostname) && typeof __XFT_DL_PART_CAP_FOR_TESTS === 'number')
+          ? __XFT_DL_PART_CAP_FOR_TESTS
+          : DL_PART_CAP_DEFAULT;
+      }
       const dlOriginFiles = new Map(); // origin → jobs in flight
       const dlOriginConns = new Map(); // origin → open connections (files + parts)
       let dlConnWaiters = [];           // parked part-starters waiting on a connection
       let dlRunSeq = 0;                 // run identity — stale timers must not touch a new run
       let dlJobs = [];
       let dlBtnEl = null;
+      let dlLastCounts = { all: 0, image: 0, video: 0, album: 0 }; // last per-subtab counts (Download disabled-state input)
       let dlBarEl = null, dlNameEl = null, dlFillEl = null, dlStatsEl = null, dlStopEl = null, dlCloseEl = null;
       let dlSpdEl = null, dlPctEl = null, dlListEl = null;
       let dlFailPins = [];              // last ≤4 failed jobs, pinned as rows
+      let dlPartJobs = [];              // jobs assigned to the part being filled
+      let dlPartBytes = 0;              // summed blob bytes in that part
+      let dlPartNo = 0;                 // parts sealed so far
+      let dlSealQ = [];                 // sealed parts waiting on the zip builder
+      let dlSealing = false;            // one buildZipBlob at a time (peak memory)
+      let dlRunOver = false;            // fetch loop done; drain the seal queue
       let dlSpeedWin = []; // [{t, b}] byte deltas — rolling 3s window for the speed readout
       let dlDashAt = 0;    // dash repaint throttle stamp
       let dlStartedAt = 0; // ETA warm-up gate
@@ -3369,12 +3469,16 @@
         if (!dlBtnEl) return;
         dlBtnEl.textContent = dlRun.running ? 'Stop' : 'Download';
         dlBtnEl.classList.toggle('xft-dl-run', !!dlRun.running);
+        // disabled when the active sub-tab has nothing to download; enabled
+        // while running (second click = stop)
+        dlBtnEl.disabled = !dlRun.running && !(dlLastCounts[panelSubTab] > 0);
         dlBtnEl.title = dlRun.running
           ? 'Stop the bulk download'
-          : 'Download the ' + panelSubTab + ' list as one zip named after the thread. '
+          : 'Download the ' + panelSubTab + ' list as a zip named after the thread. '
             + 'Mixed lists get Pics/ + Videos/ folders; single-type lists skip the folder '
             + 'and say (Images) or (Videos) in the zip name. Player embeds are resolved '
-            + 'to their direct stream and included.';
+            + 'to their direct stream and included. Very large lists split into ~1 GB '
+            + 'zip parts, each saved as it fills.';
       }
       function dlSpeed() {
         const now = performance.now();
@@ -3412,6 +3516,10 @@
           const pct = dlRun.total ? Math.floor((finished / dlRun.total) * 100) : 0;
           dlFillEl.style.width = pct + '%';
           setStat(dlPctEl, pct + '%');
+          // the 'done' phase writes a plain textContent summary (killing the
+          // span children) — drop that leftover text node or the next run's
+          // stats glue onto the previous run's final line
+          if (dlStatsEl.firstChild && dlStatsEl.firstChild.nodeType === 3) dlStatsEl.firstChild.remove();
           while (dlStatsEl.children.length < 3) dlStatsEl.appendChild(document.createElement('span'));
           const c = dlStatsEl.children;
           setStat(c[0], finished + '/' + dlRun.total + ' files');
@@ -3508,6 +3616,10 @@
       function dlPinFail(job) {
         dlFailPins.push(job);
         if (dlFailPins.length > 4) dlFailPins.shift();
+        if (/^(localhost|127\.)/.test(location.hostname)) { // test ledger (see dlLedgerMark)
+          const L = (window.__xftDlLedger = window.__xftDlLedger || { saves: [], released: 0, held: 0 });
+          L.fails = (L.fails | 0) + 1;
+        }
       }
       function dlDashTick() {
         if (dlRun.phase !== 'fetch') return;
@@ -3699,15 +3811,21 @@
                   return;
                 }
                 if (isHtml) { failWith('moved page unresolved', 0, 0, 'trans'); return; }
+                // a single file beyond the 32-bit zip size limit would wrap
+                // its header sizes and corrupt the part silently — fail it
+                // with a reason instead (0.20.0 at least said "size cap
+                // reached"; per-part splitting cannot help one huge file)
+                if (r.blob.size > 0xFFFFFFF0) { failWith('file exceeds the 4 GB zip limit', 0, 0, 'perm'); return; }
                 job.state = 'done';
                 job.badge = '';
                 dlRun.done++;
                 dlRun.bytes += r.blob.size;
                 job.blob = r.blob;
-                if (dlRun.bytes > DL_BYTE_CAP) { // stop scheduling; keep what's fetched
-                  dlRun.lastErr = 'size cap reached — zip truncated';
-                  dlNet.queue.length = 0;
-                }
+                // assign to the part being filled; a full part seals+saves+
+                // frees immediately so memory never grows with list size
+                dlPartJobs.push(job);
+                dlPartBytes += r.blob.size;
+                if (dlPartBytes >= dlPartCap()) dlSealPart();
                 dlAfter(release);
               });
               return;
@@ -3958,15 +4076,112 @@
         const cd = concatU8(cds);
         return new Blob(parts.concat([cd, zipEocd(files.length, cd.length, off)]), { type: 'application/zip' });
       }
-      function dlSaveZip(zip, kind) {
+      // one blob → one anchor-click save (legacy single zips and sealed parts
+      // share it; the objectURL outlives the click by 60s so the download
+      // manager can grab it)
+      function dlSaveBlobAs(zip, fname) {
         const u = URL.createObjectURL(zip);
         const a = document.createElement('a');
         a.href = u;
-        a.download = zipName(kind);
+        a.download = fname;
         document.body.appendChild(a);
         a.click();
         a.remove();
         setTimeout(() => URL.revokeObjectURL(u), 60000);
+      }
+      // Album runs (0.21): entry names come from per-job dirs (album folder +
+      // Pics/Videos inside, or just Pics/Videos for a single-album zip) and
+      // the zip name is the album label — the flat kind-tag/folder logic is
+      // legacy-only so All/Image/Video behavior stays byte-identical.
+      function dlEntryName(j, kind) {
+        if (dlRun.entryPlan === 'albums') return (j.dir ? j.dir + '/' : '') + j.name;
+        return kind ? j.name : (j.kind === 'video' || j.kind === 'embed' ? 'Videos/' : 'Pics/') + j.name;
+      }
+      function dlZipNameFor(kind) {
+        if (dlRun.entryPlan === 'albums') return dlRun.zipBase || zipName('');
+        return zipName(kind);
+      }
+      function albumDirFor(albumUrl) {
+        return sanitizeFileSeg(extractDomain(albumUrl) + ' - ' + albumDisplayName(albumUrl, albumMeta.get(albumUrl)));
+      }
+      // ---- multi-part sealing (0.21.0) ----------------------------------
+      // A part is sealed the MOMENT its bytes reach DL_PART_CAP: zipped,
+      // saved via anchor click, and its job blobs released while the rest of
+      // the list keeps fetching. dlFinish takes the legacy single-zip path
+      // whenever nothing sealed early, so under-cap runs keep the exact
+      // 0.20.0 filename and structure. Cancel semantics: parts already on
+      // disk stay; blobs of an unsealed remainder are dropped (same
+      // "stop = no zip for the tail" rule as 0.20.0). The only run that can
+      // end up `…part1.zip` with no part 2 is one whose LAST byte crossed
+      // the cap exactly — boundary case, harmless.
+      // localhost test ledger (IMG_PAGE_GAP convention): the headless probe
+      // reads saves/names/held to prove parts were really saved and freed.
+      function dlLedgerMark(name, released, heldBefore) {
+        if (!/^(localhost|127\.)/.test(location.hostname)) return;
+        const L = (window.__xftDlLedger = window.__xftDlLedger || { saves: [], released: 0, held: 0, peak: 0 });
+        if (name) L.saves.push(name);
+        L.released += released | 0;
+        L.held = dlJobs.filter((j) => j.blob).length;
+        if ((heldBefore | 0) > (L.peak | 0)) L.peak = heldBefore | 0;
+      }
+      function dlSealPart() {
+        if (!dlPartJobs.length) return;
+        dlSealQ.push(dlPartJobs);
+        dlPartJobs = [];
+        dlPartBytes = 0;
+        dlSealDrain();
+      }
+      function dlSealDrain() {
+        if (dlSealing || !dlSealQ.length) {
+          dlSealMaybeDone();
+          return;
+        }
+        dlSealing = true;
+        // seal identity: a stop/restart mid-build bumps dlRunSeq — the stale
+        // build's .then must not save, free, or touch the NEW run's dashboard
+        // (it would otherwise run two zip builds at once and append stale
+        // part counts to the new header)
+        const seq = dlRunSeq;
+        const jobs = dlSealQ.shift();
+        dlPartNo++;
+        // per-part kind detection: parts are decided from what actually
+        // DOWNLOADED into them (same rule the legacy finish path applies to
+        // the whole run, scoped to the part)
+        let hImg = false;
+        let hVid = false;
+        for (const j of jobs) {
+          if (j.kind === 'video' || j.kind === 'embed') hVid = true;
+          else hImg = true;
+        }
+        const kind = dlRun.entryPlan === 'albums' ? '' : zipKindTag(hImg, hVid);
+        buildZipBlob(jobs.map((j) => ({
+          name: dlEntryName(j, kind),
+          blob: j.blob
+        })))
+          .then((z) => {
+            if (seq !== dlRunSeq) return; // run changed under us — drop the stale build
+            const fname = partZipName(dlZipNameFor(kind), dlPartNo);
+            dlSaveBlobAs(z, fname);
+            const heldBefore = dlJobs.filter((j) => j.blob).length; // includes this part — the memory peak a seal observes
+            for (const j of jobs) j.blob = null; // free the part's bytes — the whole point
+            dlLedgerMark(fname, jobs.length, heldBefore);
+            if (dlNameEl && dlRun.phase === 'fetch') dlNameEl.textContent = dlNameEl.title + ' · ' + dlPartNo + (dlPartNo > 1 ? ' parts' : ' part');
+            dlSealing = false;
+            dlSealDrain();
+          })
+          .catch((e) => {
+            if (seq !== dlRunSeq) return;
+            dlRun.lastErr = 'zip failed: ' + (e && e.message ? e.message : e);
+            dlSealing = false;
+            dlRun.phase = 'error';
+            updateDlDash();
+          });
+      }
+      function dlSealMaybeDone() {
+        if (dlRunOver && !dlSealing && !dlSealQ.length && !dlPartJobs.length && dlRun.phase !== 'done' && dlRun.phase !== 'error') {
+          dlRun.phase = 'done';
+          updateDlDash();
+        }
       }
       function dlFinish() {
         dlRun.running = false;
@@ -3974,6 +4189,18 @@
         if (dlRun.cancel || !dlRun.done) {
           dlRun.phase = 'done';
           updateDlDash();
+          return;
+        }
+        if (dlPartNo > 0 || dlSealing || dlSealQ.length) {
+          // multi-part run: the unfilled remainder is the final part; phase
+          // stays 'zip' until the seal queue drains, then flips to done
+          dlRunOver = true;
+          if (dlPartJobs.length) dlSealPart();
+          else dlSealMaybeDone();
+          if (dlRun.phase !== 'done' && dlRun.phase !== 'error') {
+            dlRun.phase = 'zip';
+            updateDlDash();
+          }
           return;
         }
         // Single-kind runs (user ask 0.9.0): drop the inner folder and tag
@@ -3992,10 +4219,10 @@
         updateDlDash();
         setTimeout(() => {
           buildZipBlob(keep.map((j) => ({
-            name: kind ? j.name : (j.kind === 'video' || j.kind === 'embed' ? 'Videos/' : 'Pics/') + j.name,
+            name: dlEntryName(j, kind),
             blob: j.blob
           })))
-            .then((z) => { dlSaveZip(z, kind); dlRun.phase = 'done'; updateDlDash(); })
+            .then((z) => { dlSaveBlobAs(z, dlZipNameFor(kind)); dlRun.phase = 'done'; updateDlDash(); })
             .catch((e) => {
               dlRun.lastErr = 'zip failed: ' + (e && e.message ? e.message : e);
               dlRun.phase = 'error';
@@ -4021,13 +4248,45 @@
           dlNet.active = 0;
           dlOriginFiles.clear();
           dlOriginConns.clear();
+          dlSealQ.length = 0; // stop = stop: queued-but-unbuilt parts are dropped (parts already on disk stay)
           dlFinish();
           return;
         }
         const pd = panelData();
-        const res = buildDlJobs(collectMediaItems(pd).items);
-        dlJobs = res.jobs;
-        for (const j of dlJobs) j.state = 'queue';
+        const col = collectMediaItems(pd);
+        if (panelSubTab === 'album') {
+          // Album-tab main download (user spec 0.21): ONE archive with a
+          // folder per album, Pics/ + Videos/ inside each — never the flat
+          // thread plan the All/Image/Video tabs use
+          const items = col.all.filter((it) => it.album && it.kind !== 'album');
+          dlBegin(buildDlJobs(items).jobs, {
+            entryPlan: 'albums',
+            dirOf: (j) => albumDirFor(j.album) + '/' + (j.kind === 'video' || j.kind === 'embed' ? 'Videos' : 'Pics')
+          });
+          return;
+        }
+        dlBegin(buildDlJobs(col.items).jobs, null);
+      }
+      // per-album header button: zips exactly that album (Pics/ + Videos/
+      // inside), named from the readable '[host] - [name]' label
+      function startAlbumDownload(url) {
+        if (dlRun.running) return;
+        const col = collectMediaItems(panelData());
+        const items = col.all.filter((it) => it.album === url && it.kind !== 'album');
+        if (!items.length) return;
+        dlBegin(buildDlJobs(items).jobs, {
+          entryPlan: 'albums',
+          zipBase: safeOuterName(albumLabelFor(url)) + '.zip',
+          dirOf: (j) => (j.kind === 'video' || j.kind === 'embed' ? 'Videos' : 'Pics')
+        });
+      }
+      function dlBegin(jobs, opts) {
+        const o = opts || {};
+        dlJobs = jobs;
+        for (const j of dlJobs) {
+          j.state = 'queue';
+          if (o.dirOf) j.dir = o.dirOf(j);
+        }
         dlRunSeq++;
         dlRun.running = true;
         dlRun.cancel = false;
@@ -4036,8 +4295,16 @@
         dlRun.fail = 0;
         dlRun.bytes = 0;
         dlRun.lastErr = '';
+        dlRun.entryPlan = o.entryPlan || null;
+        dlRun.zipBase = o.zipBase || '';
         dlSpeedWin = [];
         dlFailPins = [];
+        dlPartJobs = [];
+        dlPartBytes = 0;
+        dlPartNo = 0;
+        dlSealQ = [];
+        dlSealing = false;
+        dlRunOver = false;
         dlConnWaiters = [];
         dlNet.active = 0;
         dlNet.conns = 0;
@@ -4073,7 +4340,9 @@
             if (j.kind === 'video' || j.kind === 'embed') pVid = true;
             else pImg = true;
           }
-          const nm = zipName(zipKindTag(pImg, pVid));
+          const nm = dlRun.entryPlan === 'albums'
+            ? (dlRun.zipBase || zipName(''))
+            : zipName(zipKindTag(pImg, pVid));
           dlNameEl.textContent = nm;
           dlNameEl.title = nm;
           dlBarEl.hidden = false;
@@ -4451,12 +4720,13 @@
           if (busy) progressEl.innerHTML = '<span class="xft-spinner" aria-hidden="true"></span>' + t;
           else progressEl.textContent = t;
         }
-        // while a fetch is in flight the panel buttons lock: no re-Refresh
-        // mid-run and no accidental Stop (fetch runs to completion)
-        if (panelCancelBtn) panelCancelBtn.disabled = busy;
+        // while a fetch is in flight Refresh locks (no re-Refresh mid-run).
+        // Stop is the inverse (0.21 user ask: disable what cannot act): Stop
+        // ONLY works mid-fetch — abortRef halts the page walk into a partial
+        // — so it enables while busy and disables when idle. Resume stays
+        // hidden unless a stopped/incomplete run has data worth resuming.
+        if (panelCancelBtn) panelCancelBtn.disabled = !busy;
         if (panelRefreshBtn) panelRefreshBtn.disabled = busy;
-        // Resume only exists for a stopped/incomplete run with data worth
-        // keeping — hidden on a clean slate (Refresh covers that) and while busy
         if (panelResumeBtn) panelResumeBtn.hidden = busy || hub.meta.complete || hub.records.size === 0;
         // NOT disabled while pending: the second click cancels + sorts partial
         if (sorterPending) setSortBtn('⚡ ' + t + '…', false);
@@ -4489,9 +4759,12 @@
         saveViewScroll();
         panelSubTab = t;
         clearVRows(); // different kind filter -> different item list
-        for (const k of ['all', 'image', 'video']) {
+        for (const k of ['all', 'image', 'video', 'album']) {
           if (subTabBtns[k]) subTabBtns[k].classList.toggle('xft-tab-active', k === t);
         }
+        // the group-by select has no effect on the Album sub-tab (grouping is
+        // forced to album there) — hide it instead of leaving a dead control
+        if (mediaGroupSel) mediaGroupSel.hidden = t === 'album';
         renderPanelBody();
       }
 
@@ -4499,6 +4772,12 @@
         if (subTabBtns.all) subTabBtns.all.textContent = 'All ' + c.all;
         if (subTabBtns.image) subTabBtns.image.textContent = 'Image ' + c.image;
         if (subTabBtns.video) subTabBtns.video.textContent = 'Video ' + c.video;
+        if (subTabBtns.album) subTabBtns.album.textContent = 'Album ' + (c.album || 0);
+        // Download affordance re-evaluates with the counts (0.21): an empty
+        // active list means nothing to zip. Mid-run the button IS the stop
+        // control, so it stays enabled while running.
+        dlLastCounts = c || { all: 0, image: 0, video: 0, album: 0 };
+        if (dlBtnEl && !dlRun.running) dlBtnEl.disabled = !(dlLastCounts[panelSubTab] > 0);
       }
 
       // fullscreen media viewer: prev/next, thumbnail filmstrip below the
@@ -4699,9 +4978,15 @@
           }
         }
         // embeds are videos hosted elsewhere — they count under the Video tab
-        const mediaCounts = { all: all.length, image: 0, video: 0 };
-        for (const it of all) { if (it.kind === 'album') continue; mediaCounts[it.kind === 'embed' ? 'video' : it.kind] += 1; }
-        const items = panelSubTab === 'all' ? all : all.filter((it) => it.kind === panelSubTab || (panelSubTab === 'video' && it.kind === 'embed'));
+        const mediaCounts = { all: all.length, image: 0, video: 0, album: 0 };
+        for (const it of all) {
+          if (it.kind === 'album') continue; // the album PAGE tile is navigation, not media
+          mediaCounts[it.kind === 'embed' ? 'video' : it.kind] += 1;
+          if (it.album) mediaCounts.album += 1; // expanded album children (Album sub-tab)
+        }
+        const items = panelSubTab === 'all' ? all
+          : panelSubTab === 'album' ? all.filter((it) => it.album)
+          : all.filter((it) => it.kind === panelSubTab || (panelSubTab === 'video' && it.kind === 'embed'));
         return { all: all, items: items, mediaCounts: mediaCounts };
       }
 
@@ -4735,6 +5020,12 @@
           mediaCounts = m.mediaCounts;
           updateSubTabCounts(mediaCounts);
           items = m.items;
+          // the Album tab lists CHILDREN — no album tile renders here to
+          // trigger expansion, so ask directly (ensureAlbum's inflight and
+          // cooldown guards make repeat renders free)
+          if (panelSubTab === 'album') {
+            for (const r of pd.orderedShown) for (const a of (r.albums || [])) ensureAlbum(String(a || ''));
+          }
           // album tiles open the host page in a tab, not the viewer — the
           // viewer walks media only; children are ordinary viewer items
           viewerItems = items.filter((it) => it.kind !== 'album').map((it) => ({ kind: it.kind, url: it.url, postId: it.r.postId, pos: it.pos, author: it.r.author, page: (it.r.imgPages || {})[it.url] || '', album: it.album || '', thumb: it.thumb || '' }));
@@ -4818,7 +5109,7 @@
           frag.appendChild(vrows);
           // the mount runs AFTER replaceChildren — the spacer must be in the
           // live DOM to probe real row/header heights (one synchronous pass)
-          if (items.length) pendingMount = { vrows: vrows, layout: buildMediaLayout(items, settings.mediaGroup) };
+          if (items.length) pendingMount = { vrows: vrows, layout: buildMediaLayout(items, panelSubTab === 'album' ? 'album' : settings.mediaGroup, albumLabelFor) };
         } else {
           // grouped rows: the post label ([#pos] author) renders once per post
           // in a fixed-width first column; the post's links stack beneath it
@@ -5700,6 +5991,7 @@
         subTabBtns.all = mkBtn('All', () => setSubTab('all'), 'xft-btn xft-subtab');
         subTabBtns.image = mkBtn('Image', () => setSubTab('image'), 'xft-btn xft-subtab');
         subTabBtns.video = mkBtn('Video', () => setSubTab('video'), 'xft-btn xft-subtab');
+        subTabBtns.album = mkBtn('Album', () => setSubTab('album'), 'xft-btn xft-subtab');
         subTabBtns.all.classList.add('xft-tab-active');
         // group-by picker lives in the sub-tab row: flat | post | page | user.
         // Persisted in settings, so switching All/Image/Video keeps the group.
@@ -5714,6 +6006,7 @@
           groupSel.appendChild(o);
         }
         groupSel.value = settings.mediaGroup;
+        mediaGroupSel = groupSel;
         groupSel.addEventListener('change', () => {
           saveViewScroll();
           settings.mediaGroup = groupSel.value;
@@ -5725,7 +6018,7 @@
         const dlBtn = mkBtn('Download', startBulkDownload, 'xft-btn xft-subtab xft-dlbtn');
         dlBtnEl = dlBtn;
         updateDlBtn();
-        subtabsEl.append(subTabBtns.all, subTabBtns.image, subTabBtns.video, groupSel, dlBtn);
+        subtabsEl.append(subTabBtns.all, subTabBtns.image, subTabBtns.video, subTabBtns.album, groupSel, dlBtn);
 
         // bulk download dashboard: header (name / speed / ETA / stop),
         // overall bar + counts, live rows for in-flight files (+ pinned fails)
@@ -5902,6 +6195,7 @@
           '.xft-ghead.xft-gjump{cursor:pointer}',
           '.xft-glabel{font-size:12px;font-weight:600;color:hsl(var(--xft-fg));white-space:nowrap;overflow:hidden;text-overflow:ellipsis;max-width:70%}',
           '.xft-gline{flex:1 1 auto;border-top:1px solid hsl(var(--xft-border))}',
+          '.xft-ghead .xft-dlhead{flex:none;margin-left:0;padding:1px 8px;font-size:11px;line-height:18px}',
           '.xft-gsub{height:24px;padding-left:14px}',
           '.xft-gsub .xft-glabel{font-weight:500;font-size:11px;color:hsl(var(--xft-muted-fg))}',
           '.xft-linksbar{display:flex;align-items:center;gap:6px;padding:6px 8px;border-bottom:1px solid hsl(var(--xft-border))}',

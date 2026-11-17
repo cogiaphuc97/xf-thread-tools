@@ -28,6 +28,7 @@ export function buildDlJobs(items) {
       cands: cands,
       kind: it.kind,
       page: page,
+      album: String(it.album || ''), // parent album URL — album-mode downloads folder by it
       name: String(jobs.length + 1).padStart(3, '0') + '_' + dlBasename(cands[0], isVid ? 'video' : it.kind, jobs.length)
     });
   }

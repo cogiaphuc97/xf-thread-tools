@@ -2,7 +2,7 @@
 // Order-preserving slice of main()'s body — shares main() scope; no imports.
     let settingsView = null;
     let panelTab = 'files';
-    let panelSubTab = 'all';        // media sub-tab: all | image | video
+    let panelSubTab = 'all';        // media sub-tab: all | image | video | album
     // every view (tab × sub-tab × group) remembers its own scroll position —
     // switching views restores where the user left THAT list, it must not
     // inherit the scroll of the list being left
@@ -30,6 +30,7 @@
       apply(3, true);
     }
     let subtabsEl = null;
+    let mediaGroupSel = null; // group-by select (hidden on the Album sub-tab — grouping is forced there)
     let subTabBtns = {};
     let linksBarEl = null;
     let linkSearchEl = null;

@@ -3,6 +3,9 @@
     async function runFetch(force) {
       hub.fetchRunning = true;
       hub.abortRef = { aborted: false };
+      // paint the busy state AT START (spinner + Stop enabled): waiting for
+      // the first page's notify left Stop disabled through a whole page
+      updateProgressText();
       hub.partialNotice = false;
       hub.partialWhy = '';
       let warned = false;

@@ -115,7 +115,11 @@
       });
 
       // media-file anchors (lightbox wraps img.bbImage in <a>) belong on the
-      // Files/Videos tabs, not Links — partition before filtering
+      // Files/Videos tabs, not Links — partition before filtering.
+      // DUAL-LISTING (0.21): anchors re-routed into Media (ext-matched file
+      // links, cross-host /d/ file pages, cross-host /a/ albums) ALSO keep a
+      // Links row — a URL visible as a clickable link in the post must be
+      // visible as a link in the panel, not swallowed by reclassification.
       const parts = partitionLinks(rawLinks);
       for (const u of parts.imageLinks) images.push(absolutize(u));
       for (const u of parts.videoLinks) videos.push(absolutize(u));
@@ -125,15 +129,13 @@
       // forum's own and stay on Links
       const restLinks = [];
       const albums = [];
+      const dual = parts.imageLinks.concat(parts.videoLinks); // re-routed anchors that keep link rows
       for (const u of parts.links) {
         const abs = absolutize(u);
-        if (isFileDPageUrl(abs) && extractDomain(abs) !== hostKey(location.host)) videos.push(abs);
-        else if (isAlbumPageUrl(abs) && extractDomain(abs) !== hostKey(location.host)) albums.push(abs);
+        if (isFileDPageUrl(abs) && extractDomain(abs) !== hostKey(location.host)) { videos.push(abs); dual.push(u); }
+        else if (isAlbumPageUrl(abs) && extractDomain(abs) !== hostKey(location.host)) { albums.push(abs); dual.push(u); }
         else restLinks.push(u);
       }
-      const imgSet = new Set(images.filter(Boolean));
-      const vidSet = new Set(videos.filter(Boolean));
-      const embSet = new Set(embeds.filter(Boolean));
       return {
         threadKey: threadKey,
         postId: postId,
@@ -143,7 +145,7 @@
         date: dateEl ? (dateEl.getAttribute('datetime') || '') : '',
         reactionCount: reactionCount,
         bodyHtml: body ? lazyBodyHtml(body) : '',
-        links: filterLinks(restLinks, location.host).filter((u) => !imgSet.has(u) && !vidSet.has(u) && !embSet.has(u)),
+        links: Array.from(new Set(filterLinks(restLinks.concat(dual), location.host))),
         images: Array.from(new Set(images.filter(Boolean))),
         videos: Array.from(new Set(videos.filter(Boolean))),
         embeds: Array.from(new Set(embeds.filter(Boolean))),

@@ -118,6 +118,25 @@ export function isAlbumPageUrl(u) {
   return /^\/a\/[A-Za-z0-9_-]{3,64}$/.test(path);
 }
 
+// Album display name from the album page HTML <title> (pure). Empty string
+// when absent — callers fall back to the URL slug. The page is already
+// fetched for child parsing, so this costs no extra request.
+export function parseAlbumTitle(html) {
+  const m = String(html || '').match(/<title[^>]*>([^<]{1,300})<\/title>/i);
+  if (!m) return '';
+  return m[1].replace(/&quot;/g, '"').replace(/&#39;/g, "'").replace(/&amp;/g, '&').replace(/\s+/g, ' ').trim();
+}
+
+// Album group display name (pure): parsed page/API title, else the
+// /a/<slug> identifier from the URL (user spec 0.21, Round 8).
+export function albumDisplayName(url, name) {
+  const nm = String(name || '').trim();
+  if (nm) return nm;
+  const s = String(url || '');
+  const m = s.match(/\/a\/([A-Za-z0-9_-]{3,64})$/);
+  return m ? m[1] : (s || '?');
+}
+
 // Server-rendered album page parser: each grid item block carries the
 // filename in a title attr, a download href (/f/<slug>) and an absolute
 // thumbnail img. Archive/other extensions are skipped — only playable
@@ -169,7 +188,9 @@ export function parseAlbumApiResponse(text) {
     }
     const pag = j.pagination || {};
     const last = Math.max(1, parseInt(pag.last_page, 10) || 1);
-    return { children: children, lastPage: last };
+    // album display name (SPA hosts): name or title field, else '' -> slug fallback
+    const nm = typeof j.name === 'string' ? j.name : (typeof j.title === 'string' ? j.title : '');
+    return { children: children, lastPage: last, name: nm };
   } catch (e) { return null; }
 }
 

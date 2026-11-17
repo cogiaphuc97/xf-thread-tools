@@ -100,7 +100,8 @@ export function threadHtml(pages, perPage, imgUrl) {
     const out = [];
     for (let k = 0; k < perPage; k++, n++) {
       const u = imgUrl(n, pageNo);
-      if (u) out.push(postHtml(n, [u]));
+      // array return = multi-anchor post (links-probe fixtures)
+      if (u) out.push(postHtml(n, Array.isArray(u) ? u : [u]));
     }
     return out.join('\n');
   };
@@ -116,7 +117,7 @@ export function threadHtml(pages, perPage, imgUrl) {
 </div></div></body></html>`;
 }
 
-export function startFixtureServer({ pages = 30, perPage = 50, port = 0 } = {}) {
+export function startFixtureServer({ pages = 30, perPage = 50, port = 0, imgUrl = null } = {}) {
   const png = tinyPng();
   const bmp = bigBmp();
   const gif = animGif();
@@ -127,6 +128,31 @@ export function startFixtureServer({ pages = 30, perPage = 50, port = 0 } = {}) 
   let mainPort = 0, albumPort = 0;
   const albumHost = http.createServer((req, res) => {
     const u = new URL(req.url, 'http://127.0.0.1');
+    // cross-host media anchor for the links probe: a real PNG on the OTHER
+    // origin — ext-matched anchor dual-lists (Links row + Media item)
+    if (u.pathname.startsWith('/ximg/')) {
+      hits.set(u.pathname, (hits.get(u.pathname) || 0) + 1);
+      ACAO(res); res.setHeader('content-type', 'image/png');
+      res.end(png);
+      return;
+    }
+    // direct bytes for album-child downloads (the /f/ page's og:video
+    // carrier points here): padded PNG, deterministic size
+    if (u.pathname.startsWith('/dl/')) {
+      hits.set(u.pathname, (hits.get(u.pathname) || 0) + 1);
+      ACAO(res); res.setHeader('content-type', 'image/png');
+      const want = parseInt(u.searchParams.get('b') || '0', 10) || png.length;
+      res.end(want > png.length ? Buffer.concat([png, Buffer.alloc(want - png.length)]) : png);
+      return;
+    }
+    // album-child file pages (/f/<slug> resolved against the album origin):
+    // og:video absolute URL is what parseVideoPage reads as the carrier
+    if (/^\/f\/slug\d+$/.test(u.pathname)) {
+      const m = u.pathname.match(/slug(\d+)$/);
+      ACAO(res); res.setHeader('content-type', 'text/html; charset=utf-8');
+      res.end('<!doctype html><html><head><meta property="og:video" content="http://127.0.0.1:' + albumPort + '/dl/' + (m ? m[1] : '1') + '.jpg?b=2000"></head><body>file page</body></html>');
+      return;
+    }
     if (u.pathname === '/a/ab12') {
       hits.set(u.pathname, (hits.get(u.pathname) || 0) + 1);
       ACAO(res); res.setHeader('content-type', 'text/html; charset=utf-8');
@@ -158,6 +184,20 @@ export function startFixtureServer({ pages = 30, perPage = 50, port = 0 } = {}) 
       return;
     }
     if (u.pathname === '/__reset') { hits.clear(); res.end('ok'); return; }
+    // download-probe files: deterministic byte size (?b=) — real PNG bytes
+    // then zero padding (decoders stop at IEND, downloads/sniff don't care).
+    // Hit key is Range-tagged ('dl|' prefix): download attempts probe with
+    // a Range header, cell thumb fetches do not — the probe counts policy
+    // retries from download hits only.
+    if (u.pathname.startsWith('/dl/') || u.pathname.startsWith('/dldead/')) {
+      hits.set((req.headers.range ? 'dl|' : '') + u.pathname, (hits.get((req.headers.range ? 'dl|' : '') + u.pathname) || 0) + 1);
+      ACAO(res);
+      if (u.pathname.startsWith('/dldead/')) { res.statusCode = /500/.test(u.pathname) ? 500 : 404; res.end('dead'); return; }
+      const want = parseInt(u.searchParams.get('b') || '0', 10) || png.length;
+      res.setHeader('content-type', 'image/png');
+      res.end(want > png.length ? Buffer.concat([png, Buffer.alloc(want - png.length)]) : png);
+      return;
+    }
     if (u.pathname.startsWith('/img/') || u.pathname.startsWith('/big/') || u.pathname === '/anim.gif') {
       hits.set(u.pathname, (hits.get(u.pathname) || 0) + 1);
       const noStore = /\/img\/\d*[13579]\.png$/.test(u.pathname); // odd-numbered tiny urls
@@ -179,17 +219,16 @@ export function startFixtureServer({ pages = 30, perPage = 50, port = 0 } = {}) 
       res.end('<!doctype html><html><head><meta property="og:image" content="http://' + req.headers.host + '/img/900.png"></head><body>video page</body></html>');
       return;
     }
-    // album page: server-rendered item grid (bunkr-style theItem blocks)
-    if (/^\/f\/slug\d+$/.test(u.pathname)) { ACAO(res); res.end('file page'); return; }
     res.statusCode = 404; res.end('nope');
   });
   const listen = (srv, p) => new Promise((r) => srv.listen(p, '127.0.0.1', () => r(srv.address().port)));
   return Promise.all([listen(server, port), listen(albumHost, 0)]).then(([mp, ap]) => {
     mainPort = mp;
     albumPort = ap;
-    page = threadHtml(pages, perPage, mixImg);
+    page = threadHtml(pages, perPage, (n, p) => (imgUrl || mixImg)(n, p, 'http://127.0.0.1:' + albumPort));
     return {
       port: mp,
+      albumPort: ap,
       url: `http://127.0.0.1:${mp}/threads/777/`,
       stats: async () => { try { return await (await fetch(`http://127.0.0.1:${mp}/__stats`)).json(); } catch (e) { return {}; } },
       reset: () => fetch(`http://127.0.0.1:${mp}/__reset`).then(() => {}),

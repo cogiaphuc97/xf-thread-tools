@@ -241,6 +241,7 @@
       subTabBtns.all = mkBtn('All', () => setSubTab('all'), 'xft-btn xft-subtab');
       subTabBtns.image = mkBtn('Image', () => setSubTab('image'), 'xft-btn xft-subtab');
       subTabBtns.video = mkBtn('Video', () => setSubTab('video'), 'xft-btn xft-subtab');
+      subTabBtns.album = mkBtn('Album', () => setSubTab('album'), 'xft-btn xft-subtab');
       subTabBtns.all.classList.add('xft-tab-active');
       // group-by picker lives in the sub-tab row: flat | post | page | user.
       // Persisted in settings, so switching All/Image/Video keeps the group.
@@ -255,6 +256,7 @@
         groupSel.appendChild(o);
       }
       groupSel.value = settings.mediaGroup;
+      mediaGroupSel = groupSel;
       groupSel.addEventListener('change', () => {
         saveViewScroll();
         settings.mediaGroup = groupSel.value;
@@ -266,7 +268,7 @@
       const dlBtn = mkBtn('Download', startBulkDownload, 'xft-btn xft-subtab xft-dlbtn');
       dlBtnEl = dlBtn;
       updateDlBtn();
-      subtabsEl.append(subTabBtns.all, subTabBtns.image, subTabBtns.video, groupSel, dlBtn);
+      subtabsEl.append(subTabBtns.all, subTabBtns.image, subTabBtns.video, subTabBtns.album, groupSel, dlBtn);
 
       // bulk download dashboard: header (name / speed / ETA / stop),
       // overall bar + counts, live rows for in-flight files (+ pinned fails)

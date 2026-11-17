@@ -103,6 +103,30 @@ test('buildMediaLayout: unknown mode string falls back to flat packing', () => {
   assert.deepEqual(buildMediaLayout(items, 'weird'), [{ idxs: [0, 1, 2, 3] }]);
 });
 
+test('buildMediaLayout: album mode groups by item.album, first-appearance order, count at header end', () => {
+  const A = 'http://h1.invalid/a/aaa';
+  const B = 'http://h2.invalid/a/bbb';
+  const items = [
+    Object.assign(mk('p1', 'u1', 1, 1), { album: A }),
+    Object.assign(mk('p1', 'u1', 1, 1), { album: A }),
+    Object.assign(mk('p2', 'u2', 1, 2), { album: B }),
+    Object.assign(mk('p1', 'u1', 1, 1), { album: A }),
+    Object.assign(mk('p2', 'u2', 1, 2), { album: B }),
+    Object.assign(mk('p2', 'u2', 1, 2), { album: B }),
+    Object.assign(mk('p2', 'u2', 1, 2), { album: B })
+  ];
+  const lay = buildMediaLayout(items, 'album', (u) => '[' + u + '] label');
+  assert.deepEqual(lay, [
+    { hdr: 'main', label: '[http://h1.invalid/a/aaa] label  ·  3', postId: '', album: A },
+    { idxs: [0, 1, 3] },
+    { hdr: 'main', label: '[http://h2.invalid/a/bbb] label  ·  4', postId: '', album: B },
+    { idxs: [2, 4, 5, 6] }
+  ]);
+  // no label fn -> raw album key as the label (pure module never reads runtime caches)
+  const raw = buildMediaLayout(items, 'album');
+  assert.equal(raw[0].label, A + '  ·  3');
+});
+
 test('buildMediaLayout: post mode regathers scattered posts, no sub-headers', () => {
   // items of p1 appear, then p2, then MORE p1 — grouping must reunite them
   const items = [mk('p1', 'Alice', 1, 3), mk('p1', 'Alice', 1, 3), mk('p2', 'Bob', 1, 4), mk('p1', 'Alice', 1, 3), mk('p1', 'Alice', 1, 3)];

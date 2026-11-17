@@ -9,7 +9,7 @@
     // ranged parts (GM path only — Range is CORS-unsafe on fetch), per-
     // origin caps stop one CDN monopolizing the pool, per-attempt retries
     // + layered leashes make every path settle; a second click stops.
-    const dlRun = { running: false, cancel: false, phase: 'idle', total: 0, done: 0, fail: 0, bytes: 0, lastErr: '' };
+    const dlRun = { running: false, cancel: false, phase: 'idle', total: 0, done: 0, fail: 0, bytes: 0, lastErr: '', entryPlan: null, zipBase: '' };
     const dlNet = { active: 0, queue: [], last: 0, conns: 0 };
     const DL_NET_MAX = 6;
     const DL_NET_GAP = 200;
@@ -23,16 +23,35 @@
     const DL_STALL = 45000;           // no bytes for 45s mid-stream = dead attempt
     const DL_READ = 180000;           // per-attempt read ceiling
     const DL_WATCHDOG = 480000;       // absolute per job, retries included
-    const DL_BYTE_CAP = 3500 * 1024 * 1024; // zip offsets are 32-bit — stop well under 4 GB
+    // Per-part cap: the moment a part's fetched bytes reach this, it is
+    // sealed, saved, and freed while the rest of the list keeps fetching —
+    // resident memory stays ~one part regardless of list size (700+ item
+    // runs died on the old single-zip-everything-in-memory design). Zip
+    // offsets are 32-bit, so 1 GB also keeps every part well under 4 GB.
+    // Read per-call: the localhost test hook (IMG_PAGE_GAP convention)
+    // lets the headless probe lower the cap between runs in one page.
+    const DL_PART_CAP_DEFAULT = 1024 * 1048576;
+    function dlPartCap() {
+      return (/^(localhost|127\.)/.test(location.hostname) && typeof __XFT_DL_PART_CAP_FOR_TESTS === 'number')
+        ? __XFT_DL_PART_CAP_FOR_TESTS
+        : DL_PART_CAP_DEFAULT;
+    }
     const dlOriginFiles = new Map(); // origin → jobs in flight
     const dlOriginConns = new Map(); // origin → open connections (files + parts)
     let dlConnWaiters = [];           // parked part-starters waiting on a connection
     let dlRunSeq = 0;                 // run identity — stale timers must not touch a new run
     let dlJobs = [];
     let dlBtnEl = null;
+    let dlLastCounts = { all: 0, image: 0, video: 0, album: 0 }; // last per-subtab counts (Download disabled-state input)
     let dlBarEl = null, dlNameEl = null, dlFillEl = null, dlStatsEl = null, dlStopEl = null, dlCloseEl = null;
     let dlSpdEl = null, dlPctEl = null, dlListEl = null;
     let dlFailPins = [];              // last ≤4 failed jobs, pinned as rows
+    let dlPartJobs = [];              // jobs assigned to the part being filled
+    let dlPartBytes = 0;              // summed blob bytes in that part
+    let dlPartNo = 0;                 // parts sealed so far
+    let dlSealQ = [];                 // sealed parts waiting on the zip builder
+    let dlSealing = false;            // one buildZipBlob at a time (peak memory)
+    let dlRunOver = false;            // fetch loop done; drain the seal queue
     let dlSpeedWin = []; // [{t, b}] byte deltas — rolling 3s window for the speed readout
     let dlDashAt = 0;    // dash repaint throttle stamp
     let dlStartedAt = 0; // ETA warm-up gate
@@ -56,12 +75,16 @@
       if (!dlBtnEl) return;
       dlBtnEl.textContent = dlRun.running ? 'Stop' : 'Download';
       dlBtnEl.classList.toggle('xft-dl-run', !!dlRun.running);
+      // disabled when the active sub-tab has nothing to download; enabled
+      // while running (second click = stop)
+      dlBtnEl.disabled = !dlRun.running && !(dlLastCounts[panelSubTab] > 0);
       dlBtnEl.title = dlRun.running
         ? 'Stop the bulk download'
-        : 'Download the ' + panelSubTab + ' list as one zip named after the thread. '
+        : 'Download the ' + panelSubTab + ' list as a zip named after the thread. '
           + 'Mixed lists get Pics/ + Videos/ folders; single-type lists skip the folder '
           + 'and say (Images) or (Videos) in the zip name. Player embeds are resolved '
-          + 'to their direct stream and included.';
+          + 'to their direct stream and included. Very large lists split into ~1 GB '
+          + 'zip parts, each saved as it fills.';
     }
     function dlSpeed() {
       const now = performance.now();
@@ -99,6 +122,10 @@
         const pct = dlRun.total ? Math.floor((finished / dlRun.total) * 100) : 0;
         dlFillEl.style.width = pct + '%';
         setStat(dlPctEl, pct + '%');
+        // the 'done' phase writes a plain textContent summary (killing the
+        // span children) — drop that leftover text node or the next run's
+        // stats glue onto the previous run's final line
+        if (dlStatsEl.firstChild && dlStatsEl.firstChild.nodeType === 3) dlStatsEl.firstChild.remove();
         while (dlStatsEl.children.length < 3) dlStatsEl.appendChild(document.createElement('span'));
         const c = dlStatsEl.children;
         setStat(c[0], finished + '/' + dlRun.total + ' files');
@@ -195,6 +222,10 @@
     function dlPinFail(job) {
       dlFailPins.push(job);
       if (dlFailPins.length > 4) dlFailPins.shift();
+      if (/^(localhost|127\.)/.test(location.hostname)) { // test ledger (see dlLedgerMark)
+        const L = (window.__xftDlLedger = window.__xftDlLedger || { saves: [], released: 0, held: 0 });
+        L.fails = (L.fails | 0) + 1;
+      }
     }
     function dlDashTick() {
       if (dlRun.phase !== 'fetch') return;
@@ -386,15 +417,21 @@
                 return;
               }
               if (isHtml) { failWith('moved page unresolved', 0, 0, 'trans'); return; }
+              // a single file beyond the 32-bit zip size limit would wrap
+              // its header sizes and corrupt the part silently — fail it
+              // with a reason instead (0.20.0 at least said "size cap
+              // reached"; per-part splitting cannot help one huge file)
+              if (r.blob.size > 0xFFFFFFF0) { failWith('file exceeds the 4 GB zip limit', 0, 0, 'perm'); return; }
               job.state = 'done';
               job.badge = '';
               dlRun.done++;
               dlRun.bytes += r.blob.size;
               job.blob = r.blob;
-              if (dlRun.bytes > DL_BYTE_CAP) { // stop scheduling; keep what's fetched
-                dlRun.lastErr = 'size cap reached — zip truncated';
-                dlNet.queue.length = 0;
-              }
+              // assign to the part being filled; a full part seals+saves+
+              // frees immediately so memory never grows with list size
+              dlPartJobs.push(job);
+              dlPartBytes += r.blob.size;
+              if (dlPartBytes >= dlPartCap()) dlSealPart();
               dlAfter(release);
             });
             return;
@@ -645,15 +682,112 @@
       const cd = concatU8(cds);
       return new Blob(parts.concat([cd, zipEocd(files.length, cd.length, off)]), { type: 'application/zip' });
     }
-    function dlSaveZip(zip, kind) {
+    // one blob → one anchor-click save (legacy single zips and sealed parts
+    // share it; the objectURL outlives the click by 60s so the download
+    // manager can grab it)
+    function dlSaveBlobAs(zip, fname) {
       const u = URL.createObjectURL(zip);
       const a = document.createElement('a');
       a.href = u;
-      a.download = zipName(kind);
+      a.download = fname;
       document.body.appendChild(a);
       a.click();
       a.remove();
       setTimeout(() => URL.revokeObjectURL(u), 60000);
+    }
+    // Album runs (0.21): entry names come from per-job dirs (album folder +
+    // Pics/Videos inside, or just Pics/Videos for a single-album zip) and
+    // the zip name is the album label — the flat kind-tag/folder logic is
+    // legacy-only so All/Image/Video behavior stays byte-identical.
+    function dlEntryName(j, kind) {
+      if (dlRun.entryPlan === 'albums') return (j.dir ? j.dir + '/' : '') + j.name;
+      return kind ? j.name : (j.kind === 'video' || j.kind === 'embed' ? 'Videos/' : 'Pics/') + j.name;
+    }
+    function dlZipNameFor(kind) {
+      if (dlRun.entryPlan === 'albums') return dlRun.zipBase || zipName('');
+      return zipName(kind);
+    }
+    function albumDirFor(albumUrl) {
+      return sanitizeFileSeg(extractDomain(albumUrl) + ' - ' + albumDisplayName(albumUrl, albumMeta.get(albumUrl)));
+    }
+    // ---- multi-part sealing (0.21.0) ----------------------------------
+    // A part is sealed the MOMENT its bytes reach DL_PART_CAP: zipped,
+    // saved via anchor click, and its job blobs released while the rest of
+    // the list keeps fetching. dlFinish takes the legacy single-zip path
+    // whenever nothing sealed early, so under-cap runs keep the exact
+    // 0.20.0 filename and structure. Cancel semantics: parts already on
+    // disk stay; blobs of an unsealed remainder are dropped (same
+    // "stop = no zip for the tail" rule as 0.20.0). The only run that can
+    // end up `…part1.zip` with no part 2 is one whose LAST byte crossed
+    // the cap exactly — boundary case, harmless.
+    // localhost test ledger (IMG_PAGE_GAP convention): the headless probe
+    // reads saves/names/held to prove parts were really saved and freed.
+    function dlLedgerMark(name, released, heldBefore) {
+      if (!/^(localhost|127\.)/.test(location.hostname)) return;
+      const L = (window.__xftDlLedger = window.__xftDlLedger || { saves: [], released: 0, held: 0, peak: 0 });
+      if (name) L.saves.push(name);
+      L.released += released | 0;
+      L.held = dlJobs.filter((j) => j.blob).length;
+      if ((heldBefore | 0) > (L.peak | 0)) L.peak = heldBefore | 0;
+    }
+    function dlSealPart() {
+      if (!dlPartJobs.length) return;
+      dlSealQ.push(dlPartJobs);
+      dlPartJobs = [];
+      dlPartBytes = 0;
+      dlSealDrain();
+    }
+    function dlSealDrain() {
+      if (dlSealing || !dlSealQ.length) {
+        dlSealMaybeDone();
+        return;
+      }
+      dlSealing = true;
+      // seal identity: a stop/restart mid-build bumps dlRunSeq — the stale
+      // build's .then must not save, free, or touch the NEW run's dashboard
+      // (it would otherwise run two zip builds at once and append stale
+      // part counts to the new header)
+      const seq = dlRunSeq;
+      const jobs = dlSealQ.shift();
+      dlPartNo++;
+      // per-part kind detection: parts are decided from what actually
+      // DOWNLOADED into them (same rule the legacy finish path applies to
+      // the whole run, scoped to the part)
+      let hImg = false;
+      let hVid = false;
+      for (const j of jobs) {
+        if (j.kind === 'video' || j.kind === 'embed') hVid = true;
+        else hImg = true;
+      }
+      const kind = dlRun.entryPlan === 'albums' ? '' : zipKindTag(hImg, hVid);
+      buildZipBlob(jobs.map((j) => ({
+        name: dlEntryName(j, kind),
+        blob: j.blob
+      })))
+        .then((z) => {
+          if (seq !== dlRunSeq) return; // run changed under us — drop the stale build
+          const fname = partZipName(dlZipNameFor(kind), dlPartNo);
+          dlSaveBlobAs(z, fname);
+          const heldBefore = dlJobs.filter((j) => j.blob).length; // includes this part — the memory peak a seal observes
+          for (const j of jobs) j.blob = null; // free the part's bytes — the whole point
+          dlLedgerMark(fname, jobs.length, heldBefore);
+          if (dlNameEl && dlRun.phase === 'fetch') dlNameEl.textContent = dlNameEl.title + ' · ' + dlPartNo + (dlPartNo > 1 ? ' parts' : ' part');
+          dlSealing = false;
+          dlSealDrain();
+        })
+        .catch((e) => {
+          if (seq !== dlRunSeq) return;
+          dlRun.lastErr = 'zip failed: ' + (e && e.message ? e.message : e);
+          dlSealing = false;
+          dlRun.phase = 'error';
+          updateDlDash();
+        });
+    }
+    function dlSealMaybeDone() {
+      if (dlRunOver && !dlSealing && !dlSealQ.length && !dlPartJobs.length && dlRun.phase !== 'done' && dlRun.phase !== 'error') {
+        dlRun.phase = 'done';
+        updateDlDash();
+      }
     }
     function dlFinish() {
       dlRun.running = false;
@@ -661,6 +795,18 @@
       if (dlRun.cancel || !dlRun.done) {
         dlRun.phase = 'done';
         updateDlDash();
+        return;
+      }
+      if (dlPartNo > 0 || dlSealing || dlSealQ.length) {
+        // multi-part run: the unfilled remainder is the final part; phase
+        // stays 'zip' until the seal queue drains, then flips to done
+        dlRunOver = true;
+        if (dlPartJobs.length) dlSealPart();
+        else dlSealMaybeDone();
+        if (dlRun.phase !== 'done' && dlRun.phase !== 'error') {
+          dlRun.phase = 'zip';
+          updateDlDash();
+        }
         return;
       }
       // Single-kind runs (user ask 0.9.0): drop the inner folder and tag
@@ -679,10 +825,10 @@
       updateDlDash();
       setTimeout(() => {
         buildZipBlob(keep.map((j) => ({
-          name: kind ? j.name : (j.kind === 'video' || j.kind === 'embed' ? 'Videos/' : 'Pics/') + j.name,
+          name: dlEntryName(j, kind),
           blob: j.blob
         })))
-          .then((z) => { dlSaveZip(z, kind); dlRun.phase = 'done'; updateDlDash(); })
+          .then((z) => { dlSaveBlobAs(z, dlZipNameFor(kind)); dlRun.phase = 'done'; updateDlDash(); })
           .catch((e) => {
             dlRun.lastErr = 'zip failed: ' + (e && e.message ? e.message : e);
             dlRun.phase = 'error';
@@ -708,13 +854,45 @@
         dlNet.active = 0;
         dlOriginFiles.clear();
         dlOriginConns.clear();
+        dlSealQ.length = 0; // stop = stop: queued-but-unbuilt parts are dropped (parts already on disk stay)
         dlFinish();
         return;
       }
       const pd = panelData();
-      const res = buildDlJobs(collectMediaItems(pd).items);
-      dlJobs = res.jobs;
-      for (const j of dlJobs) j.state = 'queue';
+      const col = collectMediaItems(pd);
+      if (panelSubTab === 'album') {
+        // Album-tab main download (user spec 0.21): ONE archive with a
+        // folder per album, Pics/ + Videos/ inside each — never the flat
+        // thread plan the All/Image/Video tabs use
+        const items = col.all.filter((it) => it.album && it.kind !== 'album');
+        dlBegin(buildDlJobs(items).jobs, {
+          entryPlan: 'albums',
+          dirOf: (j) => albumDirFor(j.album) + '/' + (j.kind === 'video' || j.kind === 'embed' ? 'Videos' : 'Pics')
+        });
+        return;
+      }
+      dlBegin(buildDlJobs(col.items).jobs, null);
+    }
+    // per-album header button: zips exactly that album (Pics/ + Videos/
+    // inside), named from the readable '[host] - [name]' label
+    function startAlbumDownload(url) {
+      if (dlRun.running) return;
+      const col = collectMediaItems(panelData());
+      const items = col.all.filter((it) => it.album === url && it.kind !== 'album');
+      if (!items.length) return;
+      dlBegin(buildDlJobs(items).jobs, {
+        entryPlan: 'albums',
+        zipBase: safeOuterName(albumLabelFor(url)) + '.zip',
+        dirOf: (j) => (j.kind === 'video' || j.kind === 'embed' ? 'Videos' : 'Pics')
+      });
+    }
+    function dlBegin(jobs, opts) {
+      const o = opts || {};
+      dlJobs = jobs;
+      for (const j of dlJobs) {
+        j.state = 'queue';
+        if (o.dirOf) j.dir = o.dirOf(j);
+      }
       dlRunSeq++;
       dlRun.running = true;
       dlRun.cancel = false;
@@ -723,8 +901,16 @@
       dlRun.fail = 0;
       dlRun.bytes = 0;
       dlRun.lastErr = '';
+      dlRun.entryPlan = o.entryPlan || null;
+      dlRun.zipBase = o.zipBase || '';
       dlSpeedWin = [];
       dlFailPins = [];
+      dlPartJobs = [];
+      dlPartBytes = 0;
+      dlPartNo = 0;
+      dlSealQ = [];
+      dlSealing = false;
+      dlRunOver = false;
       dlConnWaiters = [];
       dlNet.active = 0;
       dlNet.conns = 0;
@@ -760,7 +946,9 @@
           if (j.kind === 'video' || j.kind === 'embed') pVid = true;
           else pImg = true;
         }
-        const nm = zipName(zipKindTag(pImg, pVid));
+        const nm = dlRun.entryPlan === 'albums'
+          ? (dlRun.zipBase || zipName(''))
+          : zipName(zipKindTag(pImg, pVid));
         dlNameEl.textContent = nm;
         dlNameEl.title = nm;
         dlBarEl.hidden = false;

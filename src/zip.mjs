@@ -35,6 +35,19 @@ export function zipFileName(tag, title, kind) {
   if (!t) return (tag || 'thread') + k + '.zip';
   return '[' + (tag || 'Site') + '] ' + t + k + '.zip';
 }
+// Multi-part zip name: `x.zip` → `x.part1.zip`. The ONLY runs that carry a
+// part suffix are ones whose bytes crossed the per-part cap mid-download —
+// an under-cap run never seals early and keeps the single-zip name exactly.
+export function partZipName(base, n) {
+  const s = String(base || '');
+  return (/\.zip$/i.test(s) ? s.slice(0, -4) : s) + '.part' + (n | 0) + '.zip';
+}
+// Outer (download-attribute) name for album zips: Unicode + spaces stay
+// readable like zipFileName; filesystem-illegal characters die, and ':'
+// (host:port labels) becomes '_' so the port does not glue onto the host.
+export function safeOuterName(s) {
+  return String(s || '').replace(/:/g, '_').replace(/[\\/:*?"<>|]/g, '').replace(/\s+/g, ' ').trim().slice(0, 150);
+}
 export function dlBasename(url, kind, idx) {
   let b = '';
   try { b = new URL(url).pathname.split('/').filter(Boolean).pop() || ''; } catch (e) { /* keep '' */ }

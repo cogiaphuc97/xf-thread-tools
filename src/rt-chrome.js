@@ -7,12 +7,13 @@
         if (busy) progressEl.innerHTML = '<span class="xft-spinner" aria-hidden="true"></span>' + t;
         else progressEl.textContent = t;
       }
-      // while a fetch is in flight the panel buttons lock: no re-Refresh
-      // mid-run and no accidental Stop (fetch runs to completion)
-      if (panelCancelBtn) panelCancelBtn.disabled = busy;
+      // while a fetch is in flight Refresh locks (no re-Refresh mid-run).
+      // Stop is the inverse (0.21 user ask: disable what cannot act): Stop
+      // ONLY works mid-fetch — abortRef halts the page walk into a partial
+      // — so it enables while busy and disables when idle. Resume stays
+      // hidden unless a stopped/incomplete run has data worth resuming.
+      if (panelCancelBtn) panelCancelBtn.disabled = !busy;
       if (panelRefreshBtn) panelRefreshBtn.disabled = busy;
-      // Resume only exists for a stopped/incomplete run with data worth
-      // keeping — hidden on a clean slate (Refresh covers that) and while busy
       if (panelResumeBtn) panelResumeBtn.hidden = busy || hub.meta.complete || hub.records.size === 0;
       // NOT disabled while pending: the second click cancels + sorts partial
       if (sorterPending) setSortBtn('⚡ ' + t + '…', false);
@@ -45,9 +46,12 @@
       saveViewScroll();
       panelSubTab = t;
       clearVRows(); // different kind filter -> different item list
-      for (const k of ['all', 'image', 'video']) {
+      for (const k of ['all', 'image', 'video', 'album']) {
         if (subTabBtns[k]) subTabBtns[k].classList.toggle('xft-tab-active', k === t);
       }
+      // the group-by select has no effect on the Album sub-tab (grouping is
+      // forced to album there) — hide it instead of leaving a dead control
+      if (mediaGroupSel) mediaGroupSel.hidden = t === 'album';
       renderPanelBody();
     }
 
@@ -55,6 +59,12 @@
       if (subTabBtns.all) subTabBtns.all.textContent = 'All ' + c.all;
       if (subTabBtns.image) subTabBtns.image.textContent = 'Image ' + c.image;
       if (subTabBtns.video) subTabBtns.video.textContent = 'Video ' + c.video;
+      if (subTabBtns.album) subTabBtns.album.textContent = 'Album ' + (c.album || 0);
+      // Download affordance re-evaluates with the counts (0.21): an empty
+      // active list means nothing to zip. Mid-run the button IS the stop
+      // control, so it stays enabled while running.
+      dlLastCounts = c || { all: 0, image: 0, video: 0, album: 0 };
+      if (dlBtnEl && !dlRun.running) dlBtnEl.disabled = !(dlLastCounts[panelSubTab] > 0);
     }
 
     // fullscreen media viewer: prev/next, thumbnail filmstrip below the

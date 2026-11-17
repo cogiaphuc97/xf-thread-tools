@@ -18,7 +18,7 @@
       "name": "media",
       "file": "src/media.mjs",
       "desc": "Pure media classification and resolution helpers: image/video extension gates, smilie + boilerplate fingerprint, image landing-page parse, HQ .md/.th candidate chain, album page/API parse.",
-      "symbols": ["IMG_EXT_RE", "VID_EXT_RE", "boilerplateUrls", "isSmilieUrl", "imagePageHref", "parseImagePage", "parseImageApiResponse", "HQ_IMG_RE", "hqCandidates", "isAlbumPageUrl", "parseAlbumPage", "parseAlbumApiResponse"]
+      "symbols": ["IMG_EXT_RE", "VID_EXT_RE", "boilerplateUrls", "isSmilieUrl", "imagePageHref", "parseImagePage", "parseImageApiResponse", "HQ_IMG_RE", "hqCandidates", "isAlbumPageUrl", "parseAlbumPage", "parseAlbumTitle", "albumDisplayName", "parseAlbumApiResponse"]
     },
     {
       "name": "embed",
@@ -30,7 +30,7 @@
       "name": "zip",
       "file": "src/zip.mjs",
       "desc": "Pure zip writer (STORE method, hand-rolled, CRC32, LE helpers, headers, EOCD) + naming: segment sanitize, site tag, thread title cleaning, kind tag, outer/entry file names.",
-      "symbols": ["sanitizeFileSeg", "siteTagFromHost", "cleanThreadTitle", "zipKindTag", "zipFileName", "dlBasename", "CRC_TABLE", "crc32", "dosDateTime", "u16le", "u32le", "concatU8", "zipLocalHeader", "zipCentralEntry", "zipEocd", "zipStoreU8"]
+      "symbols": ["sanitizeFileSeg", "siteTagFromHost", "cleanThreadTitle", "zipKindTag", "zipFileName", "partZipName", "safeOuterName", "dlBasename", "CRC_TABLE", "crc32", "dosDateTime", "u16le", "u32le", "concatU8", "zipLocalHeader", "zipCentralEntry", "zipEocd", "zipStoreU8"]
     },
     {
       "name": "dlplan",

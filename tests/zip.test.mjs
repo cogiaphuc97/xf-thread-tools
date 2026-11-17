@@ -1,7 +1,7 @@
 // Unit tests for the zip module (src/zip.mjs). Regrouped to mirror the src/ split.
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { cleanThreadTitle, crc32, dlBasename, dosDateTime, sanitizeFileSeg, siteTagFromHost, zipFileName, zipKindTag, zipStoreU8 } from '../src/zip.mjs';
+import { cleanThreadTitle, crc32, dlBasename, dosDateTime, partZipName, safeOuterName, sanitizeFileSeg, siteTagFromHost, zipFileName, zipKindTag, zipStoreU8 } from '../src/zip.mjs';
 
 
 test('sanitizeFileSeg + dlBasename: hostile names defused, empties fall back', () => {
@@ -112,6 +112,20 @@ test('dosDateTime: exact DOS bit-packing for a known date', () => {
   assert.deepEqual(dosDateTime(new Date(2026, 10, 9, 20, 46, 30)), { time: (20 << 11) | (46 << 5) | (30 >> 1), date: (46 << 9) | (11 << 5) | 9 });
   // seconds floor to 2s resolution (>> 1)
   assert.deepEqual(dosDateTime(new Date(2020, 0, 1, 0, 0, 59)).time, 29);
+});
+
+test('partZipName: suffix only for multi-part runs, extension handled', () => {
+  assert.equal(partZipName('[Site] Thread (Images).zip', 1), '[Site] Thread (Images).part1.zip');
+  assert.equal(partZipName('[Site] Thread.zip', 12), '[Site] Thread.part12.zip');
+  assert.equal(partZipName('noext', 2), 'noext.part2.zip'); // missing .zip still suffixes
+  assert.equal(partZipName('UPPER.ZIP', 3), 'UPPER.part3.zip'); // case-insensitive strip
+});
+
+test('safeOuterName: Unicode kept, illegals die, host:port colon underscored', () => {
+  assert.equal(safeOuterName('[127.0.0.1:41235] - album'), '[127.0.0.1_41235] - album'); // port not glued onto IP
+  assert.equal(safeOuterName('a/b\\c:d*e?f"g<h>i|j'), 'abc_defghij'); // ':' → '_', the rest stripped
+  assert.equal(safeOuterName('Bộ sưu tập đẹp'), 'Bộ sưu tập đẹp'); // Unicode + spaces stay readable
+  assert.equal(safeOuterName('   '), '');
 });
 
 test('dosDateTime: pre-1980 dates clamp to the DOS epoch 1980-01-01', () => {

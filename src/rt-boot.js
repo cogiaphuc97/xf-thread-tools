@@ -119,6 +119,7 @@
         '.xft-ghead.xft-gjump{cursor:pointer}',
         '.xft-glabel{font-size:12px;font-weight:600;color:hsl(var(--xft-fg));white-space:nowrap;overflow:hidden;text-overflow:ellipsis;max-width:70%}',
         '.xft-gline{flex:1 1 auto;border-top:1px solid hsl(var(--xft-border))}',
+        '.xft-ghead .xft-dlhead{flex:none;margin-left:0;padding:1px 8px;font-size:11px;line-height:18px}',
         '.xft-gsub{height:24px;padding-left:14px}',
         '.xft-gsub .xft-glabel{font-weight:500;font-size:11px;color:hsl(var(--xft-muted-fg))}',
         '.xft-linksbar{display:flex;align-items:center;gap:6px;padding:6px 8px;border-bottom:1px solid hsl(var(--xft-border))}',

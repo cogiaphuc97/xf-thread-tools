@@ -179,6 +179,13 @@
       const line = document.createElement('span');
       line.className = 'xft-gline';
       hEl.append(lab, line);
+      // album groups carry their own download: zips exactly this album
+      // (Pics/ + Videos/ inside), named from the '[host] - [name]' label
+      if (en.album) {
+        const db = mkBtn('⬇', () => startAlbumDownload(en.album), 'xft-btn xft-dlhead');
+        db.title = 'Download this album as a zip';
+        hEl.appendChild(db);
+      }
       if (en.postId) {
         hEl.classList.add('xft-gjump');
         hEl.title = en.label + ' — jump to post';

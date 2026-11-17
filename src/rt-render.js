@@ -92,9 +92,15 @@
         }
       }
       // embeds are videos hosted elsewhere — they count under the Video tab
-      const mediaCounts = { all: all.length, image: 0, video: 0 };
-      for (const it of all) { if (it.kind === 'album') continue; mediaCounts[it.kind === 'embed' ? 'video' : it.kind] += 1; }
-      const items = panelSubTab === 'all' ? all : all.filter((it) => it.kind === panelSubTab || (panelSubTab === 'video' && it.kind === 'embed'));
+      const mediaCounts = { all: all.length, image: 0, video: 0, album: 0 };
+      for (const it of all) {
+        if (it.kind === 'album') continue; // the album PAGE tile is navigation, not media
+        mediaCounts[it.kind === 'embed' ? 'video' : it.kind] += 1;
+        if (it.album) mediaCounts.album += 1; // expanded album children (Album sub-tab)
+      }
+      const items = panelSubTab === 'all' ? all
+        : panelSubTab === 'album' ? all.filter((it) => it.album)
+        : all.filter((it) => it.kind === panelSubTab || (panelSubTab === 'video' && it.kind === 'embed'));
       return { all: all, items: items, mediaCounts: mediaCounts };
     }
 
@@ -128,6 +134,12 @@
         mediaCounts = m.mediaCounts;
         updateSubTabCounts(mediaCounts);
         items = m.items;
+        // the Album tab lists CHILDREN — no album tile renders here to
+        // trigger expansion, so ask directly (ensureAlbum's inflight and
+        // cooldown guards make repeat renders free)
+        if (panelSubTab === 'album') {
+          for (const r of pd.orderedShown) for (const a of (r.albums || [])) ensureAlbum(String(a || ''));
+        }
         // album tiles open the host page in a tab, not the viewer — the
         // viewer walks media only; children are ordinary viewer items
         viewerItems = items.filter((it) => it.kind !== 'album').map((it) => ({ kind: it.kind, url: it.url, postId: it.r.postId, pos: it.pos, author: it.r.author, page: (it.r.imgPages || {})[it.url] || '', album: it.album || '', thumb: it.thumb || '' }));
@@ -211,7 +223,7 @@
         frag.appendChild(vrows);
         // the mount runs AFTER replaceChildren — the spacer must be in the
         // live DOM to probe real row/header heights (one synchronous pass)
-        if (items.length) pendingMount = { vrows: vrows, layout: buildMediaLayout(items, settings.mediaGroup) };
+        if (items.length) pendingMount = { vrows: vrows, layout: buildMediaLayout(items, panelSubTab === 'album' ? 'album' : settings.mediaGroup, albumLabelFor) };
       } else {
         // grouped rows: the post label ([#pos] author) renders once per post
         // in a fixed-width first column; the post's links stack beneath it

@@ -72,7 +72,7 @@ export function fmtEta(s) {
 }
 
 // ---------- media grid grouping/layout (pure — unit-tested, no DOM) ----------
-export function buildMediaLayout(items, mode) {
+export function buildMediaLayout(items, mode, albumLabel) {
   const lay = [];
   // sequential 4-packs — NO holes (user-facing rule: the grid is always
   // densely packed in every mode). Re-chunking after a retirement is
@@ -80,6 +80,23 @@ export function buildMediaLayout(items, mode) {
   // their elements (and their decoded frames) even when they slide into
   // a different row.
   const chunk = (list) => { for (let j = 0; j < list.length; j += 4) lay.push({ idxs: list.slice(j, j + 4) }); };
+  // Album sub-tab: one group per parent album, '[host] - [name]' main
+  // header (label fn passed by the caller — the pure module never reads
+  // runtime caches) with the group's item count at the right end
+  if (mode === 'album') {
+    const groups = new Map();
+    for (let i = 0; i < items.length; i++) {
+      const key = String(items[i].album || '');
+      let g = groups.get(key);
+      if (!g) { g = { key: key, label: albumLabel ? String(albumLabel(key)) : key, list: [] }; groups.set(key, g); }
+      g.list.push(i);
+    }
+    for (const g of groups.values()) {
+      lay.push({ hdr: 'main', label: g.label + '  ·  ' + g.list.length, postId: '', album: g.key });
+      chunk(g.list);
+    }
+    return lay;
+  }
   if (mode !== 'post' && mode !== 'page' && mode !== 'user') {
     chunk(items.map((_, i) => i));
     return lay;
