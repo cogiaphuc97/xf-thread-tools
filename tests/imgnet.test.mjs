@@ -7,16 +7,16 @@ const job = (origin, at, urgent) => ({ origin: origin, at: at, urgent: !!urgent 
 
 test('netPick: -1 when the global cap is reached, regardless of queue contents', () => {
   const q = [job('a.test', 0, true), job('b.test', 1, true)];
-  assert.equal(netPick(q, 6, {}, {}, 20000), -1); // active >= default global 6
+  assert.equal(netPick(q, 12, {}, {}, 20000), -1); // active >= default global 12
   assert.equal(netPick(q, 2, {}, { global: 2 }, 20000), -1); // explicit cap
 });
 
 test('netPick: skips a saturated origin and starts a later job from another origin', () => {
   const q = [job('a.test', 0), job('a.test', 1), job('b.test', 2)];
-  // origin a has both slots busy; the earliest b job still starts
-  assert.equal(netPick(q, 2, { 'a.test': 2 }, {}, 100), 2);
+  // origin a has all 4 slots busy; the earliest b job still starts
+  assert.equal(netPick(q, 2, { 'a.test': 4 }, {}, 100), 2);
   // nothing eligible when every represented origin is saturated
-  assert.equal(netPick(q, 2, { 'a.test': 2, 'b.test': 2 }, {}, 100), -1);
+  assert.equal(netPick(q, 2, { 'a.test': 4, 'b.test': 4 }, {}, 100), -1);
 });
 
 test('netPick: urgent job behind an earlier non-urgent job wins (visible-first)', () => {
@@ -36,9 +36,9 @@ test('netPick: FIFO fallback when no job is urgent; defaults apply for 0/undefin
   const q = [job('a.test', 30), job('b.test', 10), job('a.test', 20)];
   // earliest eligible job by QUEUE order (index 0), not by timestamp
   assert.equal(netPick(q, 0, {}, {}, 100), 0);
-  assert.equal(netPick(q, 5, {}, {}, 100), 0); // active below default global 6
-  // perOrigin 0 -> default 2: a saturated, only the b job is startable
-  assert.equal(netPick(q, 2, { 'a.test': 2 }, { perOrigin: 0 }, 100), 1);
+  assert.equal(netPick(q, 11, {}, {}, 100), 0); // active below default global 12
+  // perOrigin 0 -> default 4: a saturated, only the b job is startable
+  assert.equal(netPick(q, 2, { 'a.test': 4 }, { perOrigin: 0 }, 100), 1);
 });
 
 test('netPick: mixed field exercise — caps, urgency, aging, FIFO together', () => {
@@ -49,8 +49,8 @@ test('netPick: mixed field exercise — caps, urgency, aging, FIFO together', ()
     job('cdn3.test', 300, true) // 3: urgent, eligible
   ];
   // urgent cdn3 beats eligible cdn2 even though cdn2 is earlier
-  assert.equal(netPick(q, 1, { 'cdn1.test': 2 }, {}, 1000), 3);
+  assert.equal(netPick(q, 1, { 'cdn1.test': 4 }, {}, 1000), 3);
   // late `now`: cdn1 jobs aged but still origin-blocked; cdn2 aged too ->
   // first AGED eligible is cdn2 (index 2), still ahead of plain fallback
-  assert.equal(netPick(q, 1, { 'cdn1.test': 2 }, {}, 10400), 2);
+  assert.equal(netPick(q, 1, { 'cdn1.test': 4 }, {}, 10400), 2);
 });

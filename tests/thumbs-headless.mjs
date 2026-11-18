@@ -5,7 +5,7 @@
 // Proves the 0.22 thumb-queue changes on ONE build via the localhost hook
 // window.__XFT_IMGNET_FOR_TESTS (read per pump):
 //   run A (old throttle): { global: 2, perOrigin: 999 }  -> global-2 fill
-//   run B (new default):  { global: 6, perOrigin: 2 }    -> per-origin fill
+//   run B (new default):  { global: 12, perOrigin: 4 }   -> per-origin fill
 // 40 image cells split across BOTH fixture origins, each response delayed
 // 120ms server-side. Server-side [start,end] timing log (/__tl) gives fill
 // time, per-origin + global max concurrency, and pick order after a
@@ -173,7 +173,7 @@ async function main() {
   const tmp = '/tmp/xf-thumbs-' + process.pid;
 
   const A = await runOnce(fx, tmp, 9415, { global: 2, perOrigin: 999, gap: 10 }, true); // same scroll so tail rows mount in BOTH runs
-  const B = await runOnce(fx, tmp, 9416, { global: 6, perOrigin: 2, gap: 10 }, true);
+  const B = await runOnce(fx, tmp, 9416, { global: 12, perOrigin: 4, gap: 10 }, true);
 
   const fill = (recs) => {
     const ss = recs.map((r) => r.s), es = recs.map((r) => r.e);
@@ -188,8 +188,8 @@ async function main() {
 
   const perOriginB = maxConcurrent(B.recs, (r) => r.o);
   const globalB = maxConcurrent(B.recs, () => 'g');
-  check('AC-P2: per-origin in-flight never exceeds 2 (run B)', perOriginB <= 2, 'max=' + perOriginB);
-  check('AC-P2: global in-flight never exceeds 6 (run B)', globalB <= 6, 'max=' + globalB);
+  check('AC-P2: per-origin in-flight never exceeds 4 (run B)', perOriginB <= 4, 'max=' + perOriginB);
+  check('AC-P2: global in-flight never exceeds 12 (run B)', globalB <= 12, 'max=' + globalB);
 
   // AC-P3: requests STARTED after the scroll skew toward visible bottom
   // rows. 20 rows x ~135px, viewport ~640 + 300px margin -> only rows ~13+

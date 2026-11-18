@@ -11,18 +11,21 @@
     const imgPageCooldown = new Map(); // pageUrl -> retry-not-before timestamp
     const imgPageInflight = new Map();
     // landing-page/API fetches + thumb-byte fetches share one queued net.
-    // Throttle (0.22): per-origin cap 2, global cap 6, 150ms between starts
-    // — politeness is per HOST (the 2/350 lesson came from one origin
-    // getting hammered into 403s), so threads whose media sit on several
-    // image hosts fetch them in parallel without any host seeing a burst.
+    // Throttle (0.22.1): per-origin cap 4, global cap 12, 60ms between
+    // starts — politeness is per HOST (the 2/350 lesson came from one
+    // origin getting hammered into 403s), so threads whose media sit on
+    // several image hosts fetch them in parallel without any host seeing
+    // an unbounded burst. Real threads are often single-host: the
+    // per-origin cap is the effective ceiling there, which is why it
+    // leads the raise.
     // Pick order is visible-first (pure netPick in imgnet.mjs): jobs with
     // no element (landing pages, viewer, downloads — user-initiated) and
     // jobs whose cell is on screen start ahead of off-screen/buffer rows;
     // a 10s aging bound keeps the tail from starving. localhost (fixture
     // probes) keeps a 10ms gap: politeness exists for remote CDNs.
-    const IMG_PAGE_GAP = /^(localhost|127\.)/.test(location.hostname) ? 10 : 150;
-    const IMG_NET_GLOBAL = 6;
-    const IMG_NET_PER_ORIGIN = 2;
+    const IMG_PAGE_GAP = /^(localhost|127\.)/.test(location.hostname) ? 10 : 60;
+    const IMG_NET_GLOBAL = 12;
+    const IMG_NET_PER_ORIGIN = 4;
     const IMG_NET_AGE_MS = 10000;
     const imgPageNet = { active: 0, perOrigin: {}, queue: [], last: 0 };
     // localhost test hook (IMG_PAGE_GAP convention): __XFT_IMGNET_FOR_TESTS

@@ -10,16 +10,16 @@
 // Next job index to start, or -1 when nothing is startable.
 //  - `active`      : jobs currently in flight, all origins combined
 //  - `perOrigin`   : plain object origin -> in-flight count
-//  - `opts.global` : max total in flight (default 6)
-//  - `opts.perOrigin`: max in flight per origin (default 2)
+//  - `opts.global` : max total in flight (default 12)
+//  - `opts.perOrigin`: max in flight per origin (default 4)
 //  - `opts.ageMs`  : queued this long => urgent (default 10000, starvation bound)
 // Order: an eligible urgent job (flagged, or aged) beats any earlier
 // non-urgent job; otherwise the earliest eligible job wins (FIFO).
 // A job whose origin is saturated is skipped, never started.
 export function netPick(queue, active, perOrigin, opts, now) {
   const o = opts || {};
-  const global = o.global > 0 ? o.global | 0 : 6;
-  const cap = o.perOrigin > 0 ? o.perOrigin | 0 : 2;
+  const global = o.global > 0 ? o.global | 0 : 12;
+  const cap = o.perOrigin > 0 ? o.perOrigin | 0 : 4;
   const ageMs = o.ageMs > 0 ? o.ageMs : 10000;
   if (active >= global) return -1;
   let fallback = -1;
