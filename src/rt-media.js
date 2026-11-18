@@ -40,7 +40,7 @@
       // posters ride the thumb cache too (same one-fetch/byte-bounded rule);
       // a failed poster fetch falls back to the direct URL — the error
       // listener above then drops it exactly as before
-      const hit = thumbFor(poster, (u) => { im.src = u || poster; });
+      const hit = thumbFor(poster, (u) => { im.src = u || poster; }, im);
       if (hit) im.src = hit; // sync hit: set before attach, no shimmer; miss keeps src empty until the cb
       tile.appendChild(im);
     }
@@ -283,7 +283,7 @@
           if (sync) im.classList.add('xft-ok');
           im.addEventListener('load', () => { im.classList.add('xft-ok'); checkTinyMedia(im, url); markMediaLoaded(im); }, { once: true });
         };
-        const hit = thumbFor(url, (u) => { if (u) applyStill(u, false); else wireFallback(); });
+        const hit = thumbFor(url, (u) => { if (u) applyStill(u, false); else wireFallback(); }, im);
         if (hit) applyStill(hit, true);
         // animated gifs: the cell holds the still frame; hover swaps in the
         // original bytes (memory LRU), leaving restores the still

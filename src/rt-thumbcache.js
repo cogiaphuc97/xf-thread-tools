@@ -217,8 +217,10 @@
     // thumb (cells set src before paint — no flash). Otherwise null; cb then
     // fires ASYNC exactly once with the objectURL (fetched/loaded) or null
     // (failed — caller falls back to the direct-URL img path and its failure
-    // policy). data:/blob: URLs never enter the cache.
-    function thumbFor(url, cb) {
+    // policy). data:/blob: URLs never enter the cache. `el` (optional, the
+    // cell's img element) feeds the net's visible-first pick order: on-
+    // screen cells' fetches start ahead of off-screen/buffer rows.
+    function thumbFor(url, cb, el) {
       const s = String(url || '');
       if (!s || /^(data|blob):/i.test(s)) { if (cb) setTimeout(() => cb(null), 0); return null; }
       const key = thumbKey(s);
@@ -247,14 +249,14 @@
               if (m) { m.hits = (m.hits | 0) + 1; }
               settle(thumbMemPut(key, rec.blob));
             } else {
-              runImgPageNet((done) => thumbFetch(key, url, [(u) => { settle(u); done(); }]));
+              runImgPageNet((done) => thumbFetch(key, url, [(u) => { settle(u); done(); }]), url, el);
             }
           };
-          req.onerror = () => runImgPageNet((done) => thumbFetch(key, url, [(u) => { settle(u); done(); }]));
+          req.onerror = () => runImgPageNet((done) => thumbFetch(key, url, [(u) => { settle(u); done(); }]), url, el);
           return null;
         } catch (e) { /* fall through to fetch */ }
       }
-      runImgPageNet((done) => thumbFetch(key, url, [(u) => { settle(u); done(); }]));
+      runImgPageNet((done) => thumbFetch(key, url, [(u) => { settle(u); done(); }]), url, el);
       return null;
     }
     // Animated-original accessor for hover-play / viewer: sync hit when the

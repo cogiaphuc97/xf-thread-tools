@@ -1,4 +1,4 @@
-// rt-imgpage: Image landing-page HQ resolution: session cache, cooldown, queued net (2/350ms), inflight dedup, force path for viewer/downloads.
+// rt-imgpage: Image landing-page HQ resolution: session cache, cooldown, queued net (per-origin 2 / global 6 / 150ms gap, visible-first pick), inflight dedup, force path for viewer/downloads.
 // Order-preserving slice of main()'s body — shares main() scope; no imports.
     // Image landing pages (/img/<id>): the embed is a re-encoded copy (random
     // uuid / /th/ thumb) and the full-quality original — often a signed URL —
@@ -10,28 +10,78 @@
     const imgPageCache = new Map();
     const imgPageCooldown = new Map(); // pageUrl -> retry-not-before timestamp
     const imgPageInflight = new Map();
-    // landing-page/API fetches run serialized (2 concurrent, 350ms apart) —
-    // scrolling a dense grid resolves one page per cell and a burst would
-    // trip the host's challenge, the same lesson the poster queue learned.
-    // localhost (fixture probes) gets a 10ms gap: politeness exists for
-    // remote CDNs, and a 1500-cell probe at 350ms would run 4+ minutes
-    const IMG_PAGE_GAP = /^(localhost|127\.)/.test(location.hostname) ? 10 : 350;
-    const imgPageNet = { active: 0, gap: IMG_PAGE_GAP, queue: [], last: 0 };
-    function runImgPageNet(job) {
-      imgPageNet.queue.push(job);
-      pumpImgPageNet();
+    // landing-page/API fetches + thumb-byte fetches share one queued net.
+    // Throttle (0.22): per-origin cap 2, global cap 6, 150ms between starts
+    // — politeness is per HOST (the 2/350 lesson came from one origin
+    // getting hammered into 403s), so threads whose media sit on several
+    // image hosts fetch them in parallel without any host seeing a burst.
+    // Pick order is visible-first (pure netPick in imgnet.mjs): jobs with
+    // no element (landing pages, viewer, downloads — user-initiated) and
+    // jobs whose cell is on screen start ahead of off-screen/buffer rows;
+    // a 10s aging bound keeps the tail from starving. localhost (fixture
+    // probes) keeps a 10ms gap: politeness exists for remote CDNs.
+    const IMG_PAGE_GAP = /^(localhost|127\.)/.test(location.hostname) ? 10 : 150;
+    const IMG_NET_GLOBAL = 6;
+    const IMG_NET_PER_ORIGIN = 2;
+    const IMG_NET_AGE_MS = 10000;
+    const imgPageNet = { active: 0, perOrigin: {}, queue: [], last: 0 };
+    // localhost test hook (IMG_PAGE_GAP convention): __XFT_IMGNET_FOR_TESTS
+    // = { global, perOrigin, gap } read on EVERY pump so probes can flip
+    // the throttle between runs inside one page.
+    function imgNetOpts() {
+      const h = (typeof window !== 'undefined' && window.__XFT_IMGNET_FOR_TESTS) || null;
+      return {
+        global: h && h.global > 0 ? h.global | 0 : IMG_NET_GLOBAL,
+        perOrigin: h && h.perOrigin > 0 ? h.perOrigin | 0 : IMG_NET_PER_ORIGIN,
+        gap: h && h.gap >= 0 ? h.gap | 0 : IMG_PAGE_GAP,
+        ageMs: IMG_NET_AGE_MS
+      };
+    }
+    function imgNetUrgent(el) {
+      if (!el) return true; // no element = user-initiated fetch
+      if (!el.isConnected) return false; // recycled cell — ages out, never jumps the queue
+      const r = el.getBoundingClientRect();
+      return r.bottom > -300 && r.top < (innerHeight || 1e9) + 300;
+    }
+    let imgNetPumpQueued = false;
+    function runImgPageNet(job, url, el) {
+      let origin = '';
+      try { origin = new URL(String(url || '')).origin; } catch (e) { origin = ''; }
+      imgPageNet.queue.push({ run: job, origin: origin, el: el || null, at: Date.now(), urgent: false });
+      // enqueue defers the pump to a macrotask: cells enqueue their thumbs
+      // BEFORE the row attaches (mid-mount), and a synchronous pump here
+      // would read every queued cell as disconnected — off-screen — and
+      // hand the slots to stale FIFO heads. One deferred pump also collapses
+      // a whole mount burst (40 cells -> 1 urgency pass, no reflow storm).
+      if (!imgNetPumpQueued) {
+        imgNetPumpQueued = true;
+        setTimeout(() => { imgNetPumpQueued = false; pumpImgPageNet(); }, 0);
+      }
     }
     function pumpImgPageNet() {
-      if (imgPageNet.active >= 2 || !imgPageNet.queue.length) return;
-      const job = imgPageNet.queue.shift();
-      imgPageNet.active++;
-      const now = Date.now();
-      const wait = Math.max(0, imgPageNet.last + imgPageNet.gap - now);
-      imgPageNet.last = now + wait;
-      setTimeout(() => job(() => { imgPageNet.active--; pumpImgPageNet(); }), wait);
+      const o = imgNetOpts();
+      for (;;) {
+        if (!imgPageNet.queue.length) return;
+        for (const j of imgPageNet.queue) j.urgent = imgNetUrgent(j.el); // pick-time truth
+        const i = netPick(imgPageNet.queue, imgPageNet.active, imgPageNet.perOrigin, o, Date.now());
+        if (i < 0) return;
+        const job = imgPageNet.queue.splice(i, 1)[0];
+        imgPageNet.active++; // slot reserved at schedule time
+        imgPageNet.perOrigin[job.origin] = (imgPageNet.perOrigin[job.origin] || 0) + 1;
+        const wait = Math.max(0, imgPageNet.last + o.gap - Date.now());
+        imgPageNet.last = Date.now() + wait;
+        setTimeout(() => {
+          job.run(() => {
+            imgPageNet.active--;
+            if (imgPageNet.perOrigin[job.origin] > 1) imgPageNet.perOrigin[job.origin]--;
+            else delete imgPageNet.perOrigin[job.origin];
+            pumpImgPageNet();
+          });
+        }, wait);
+      }
     }
     function imgPageGet(url, onOk, onErr) {
-      runImgPageNet((done) => gmGetText(url, (t) => { onOk(t); done(); }, () => { onErr(); done(); }));
+      runImgPageNet((done) => gmGetText(url, (t) => { onOk(t); done(); }, () => { onErr(); done(); }), url, null);
     }
     function resolveImagePage(pageUrl, embedded, cb, force) {
       const c = imgPageCache.get(pageUrl);

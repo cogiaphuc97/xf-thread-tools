@@ -122,6 +122,18 @@ export function startFixtureServer({ pages = 30, perPage = 50, port = 0, imgUrl 
   const bmp = bigBmp();
   const gif = animGif();
   const hits = new Map(); // url -> count
+  // thumb-traffic timing log (per-request wall clock, both origins) for the
+  // net-throttle probe: { p: path, o: 'main'|'album', s: startMs, e: endMs }
+  const tl = [];
+  const logTl = (res, u, origin) => {
+    const rec = { p: u.pathname, o: origin, s: Date.now(), e: 0 };
+    tl.push(rec);
+    res.on('finish', () => { rec.e = Date.now(); });
+  };
+  const sendDelayed = (res, d, bytes) => {
+    if (d > 0) setTimeout(() => res.end(bytes), d);
+    else res.end(bytes);
+  };
   // second origin for the album host: album classification is CROSS-HOST
   // only (a forum's own /a/ routes must never expand), so the album page
   // needs its own port
@@ -132,8 +144,9 @@ export function startFixtureServer({ pages = 30, perPage = 50, port = 0, imgUrl 
     // origin — ext-matched anchor dual-lists (Links row + Media item)
     if (u.pathname.startsWith('/ximg/')) {
       hits.set(u.pathname, (hits.get(u.pathname) || 0) + 1);
+      logTl(res, u, 'album');
       ACAO(res); res.setHeader('content-type', 'image/png');
-      res.end(png);
+      sendDelayed(res, parseInt(u.searchParams.get('d') || '0', 10) || 0, png);
       return;
     }
     // direct bytes for album-child downloads (the /f/ page's og:video
@@ -183,7 +196,12 @@ export function startFixtureServer({ pages = 30, perPage = 50, port = 0, imgUrl 
       res.end(JSON.stringify(Object.fromEntries(hits)));
       return;
     }
-    if (u.pathname === '/__reset') { hits.clear(); res.end('ok'); return; }
+    if (u.pathname === '/__reset') { hits.clear(); tl.length = 0; res.end('ok'); return; }
+    if (u.pathname === '/__tl') {
+      ACAO(res); res.setHeader('content-type', 'application/json');
+      res.end(JSON.stringify(tl));
+      return;
+    }
     // download-probe files: deterministic byte size (?b=) — real PNG bytes
     // then zero padding (decoders stop at IEND, downloads/sniff don't care).
     // Hit key is Range-tagged ('dl|' prefix): download attempts probe with
@@ -200,10 +218,12 @@ export function startFixtureServer({ pages = 30, perPage = 50, port = 0, imgUrl 
     }
     if (u.pathname.startsWith('/img/') || u.pathname.startsWith('/big/') || u.pathname === '/anim.gif') {
       hits.set(u.pathname, (hits.get(u.pathname) || 0) + 1);
+      if (u.pathname.startsWith('/img/')) logTl(res, u, 'main'); // thumb-traffic timing only for /img/
       const noStore = /\/img\/\d*[13579]\.png$/.test(u.pathname); // odd-numbered tiny urls
       ACAO(res); res.setHeader('content-type', u.pathname.endsWith('.bmp') ? 'image/bmp' : u.pathname.endsWith('.gif') ? 'image/gif' : 'image/png');
       if (noStore) res.setHeader('cache-control', 'no-store');
-      res.end(u.pathname.startsWith('/big/') ? bmp : u.pathname === '/anim.gif' ? gif : png);
+      const d = parseInt(u.searchParams.get('d') || '0', 10) || 0;
+      sendDelayed(res, d, u.pathname.startsWith('/big/') ? bmp : u.pathname === '/anim.gif' ? gif : png);
       return;
     }
     const pm = u.pathname.match(/^\/threads\/777\/(?:page-(\d+))?\/?$/);

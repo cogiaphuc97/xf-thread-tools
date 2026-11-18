@@ -51,6 +51,12 @@
       "symbols": ["htmlToText", "buildAiTranscript", "AI_SYS_PROMPTS", "AI_STOPWORDS", "aiQueryTerms", "aiScorePost", "aiSearchPosts", "aiMessages", "AI_BASES", "aiEndpoint", "aiOllamaOrigin", "aiNativeChatUrl", "aiContextStats", "aiNumCtx", "aiTranscriptBudget", "parseAiModels", "parseAiReply", "mdInlineTokens", "mdParse", "aiSseParser"]
     },
     {
+      "name": "imgnet",
+      "file": "src/imgnet.mjs",
+      "desc": "Pure scheduling math for the shared preview-net queue: per-origin politeness caps, visible-first pick order, aging bound against starvation.",
+      "symbols": ["netPick"]
+    },
+    {
       "name": "thumb",
       "file": "src/thumb.mjs",
       "desc": "Pure preview-thumb cache math: identity key (hash-stripped, query kept), LRU prune plan (hits-then-ts), downscale target (never upscale, aspect kept), gif detection, byte caps.",
