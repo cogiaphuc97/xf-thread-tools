@@ -62,7 +62,9 @@
       const o = imgNetOpts();
       for (;;) {
         if (!imgPageNet.queue.length) return;
-        for (const j of imgPageNet.queue) j.urgent = imgNetUrgent(j.el); // pick-time truth
+        // pick-time truth, refreshed once per pump: nothing mutates the DOM
+        // inside the burst loop, so one pass covers every start it makes
+        for (const j of imgPageNet.queue) j.urgent = imgNetUrgent(j.el);
         const i = netPick(imgPageNet.queue, imgPageNet.active, imgPageNet.perOrigin, o, Date.now());
         if (i < 0) return;
         const job = imgPageNet.queue.splice(i, 1)[0];

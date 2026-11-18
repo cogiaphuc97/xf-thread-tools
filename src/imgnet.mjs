@@ -25,7 +25,6 @@ export function netPick(queue, active, perOrigin, opts, now) {
   let fallback = -1;
   for (let i = 0; i < queue.length; i++) {
     const j = queue[i];
-    if (!j) continue;
     if ((perOrigin[j.origin] || 0) >= cap) continue; // origin saturated — keep scanning
     if (j.urgent || (now - (j.at || 0)) >= ageMs) return i; // visible/aged first
     if (fallback < 0) fallback = i; // first startable non-urgent (FIFO)
