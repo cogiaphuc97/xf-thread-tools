@@ -83,6 +83,22 @@
       return el;
     }
 
+    // Viewer videos must START, every time, once enough data has landed
+    // (0.23.1). The `autoplay` attribute alone tries exactly once at
+    // resource-load time and fails silently when the browser's sound policy
+    // rejects it — common here because embeds resolve their src SECONDS
+    // after the click gesture, and slow direct files fall outside the
+    // activation window too. An explicit play() on the FIRST canplay (once:
+    // — a later canplay after a user pause/seek must not force a restart)
+    // with a muted retry covers every path: muted playback is always
+    // allowed, and the visible controls carry the unmute.
+    function armVideoAutoplay(v) {
+      v.addEventListener('canplay', () => {
+        const p = v.play();
+        if (p && p.catch) p.catch(() => { v.muted = true; v.play().catch(() => {}); });
+      }, { once: true });
+    }
+
     function buildMediaEl(kind, url, thumb, pageUrl) {
       if (kind === 'embed') {
         // Embed thumbs: base no-fetch tile (hosts rate-limit, some embeds
@@ -124,6 +140,7 @@
           // the CDN rejects foreign Referers — media requests must go out
           // with none, or playback 403s
           v.referrerPolicy = 'no-referrer';
+          armVideoAutoplay(v);
           v.src = src;
           v.addEventListener('error', () => { mode = 'none'; mountIframe(); }, { once: true });
           v.addEventListener('loadeddata', () => markMediaLoaded(v), { once: true });
@@ -151,6 +168,7 @@
         const v = document.createElement('video');
         v.controls = true;
         v.autoplay = true;
+        armVideoAutoplay(v);
         // file-PAGE urls (host /v/ or /f/ pages carrying the media behind a
         // sign endpoint or page parse) resolve to the direct src first; the
         // raw page URL is never playable as bytes. Resolution failure falls
