@@ -183,7 +183,7 @@
       const attempt = (noRef) => gmThumbBytes(url, noRef, (blob) => {
         if (blob === null) {
           if (!noRef) { attempt(true); return; }
-          thumbNeg.add(key);
+          thumbNeg.add(key); imgNetPunish(url); // adaptive: this origin throttles to 2/350 for a window
           for (const cb of cbs) cb(null);
           return;
         }
@@ -191,7 +191,7 @@
           if (bmp.width <= 1 || bmp.height <= 1) { // hotlink block pixel: valid 1x1 bytes, dead preview
             bmp.close();
             if (!noRef) { attempt(true); return; }
-            thumbNeg.add(key);
+            thumbNeg.add(key); imgNetPunish(url); // adaptive: this origin throttles to 2/350 for a window
             for (const cb of cbs) cb(null);
             return;
           }
@@ -206,7 +206,7 @@
         }, () => {
           // undecodable bytes (HTML challenge page mid-queue): not worth a
           // no-referrer retry ladder round — the cell fallback handles it
-          thumbNeg.add(key);
+          thumbNeg.add(key); imgNetPunish(url); // adaptive: this origin throttles to 2/350 for a window
           for (const cb of cbs) cb(null);
         });
       });

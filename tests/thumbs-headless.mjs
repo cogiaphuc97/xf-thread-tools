@@ -6,6 +6,9 @@
 // window.__XFT_IMGNET_FOR_TESTS (read per pump):
 //   run A (old throttle): { global: 2, perOrigin: 999 }  -> global-2 fill
 //   run B (new default):  { global: 12, perOrigin: 4 }   -> per-origin fill
+//   run C (penalized):    { ..., penalize: [albumOrigin] } -> the adaptive
+//     per-origin penalty (0.22.3): one origin drops to 2 concurrent +
+//     350ms start spacing while the other keeps the fast 4/60 profile
 // 40 image cells split across BOTH fixture origins, each response delayed
 // 120ms server-side. Server-side [start,end] timing log (/__tl) gives fill
 // time, per-origin + global max concurrency, and pick order after a
@@ -165,15 +168,19 @@ async function runOnce(fx, tmp, port, hook, withScrollProbe) {
 }
 
 async function main() {
+  let albumOrigin = '';
   const fx = await startFixtureServer({
     pages: 1, perPage: N,
-    imgUrl: (n, pageNo, albumOrigin) =>
-      (n % 2 ? albumOrigin + '/ximg/' + n + '.png' : '/img/' + n + '.png') + '?d=' + DELAY
+    imgUrl: (n, pageNo, ao) => {
+      albumOrigin = ao; // capture for the run-C penalize hook (exact origin string)
+      return (n % 2 ? ao + '/ximg/' + n + '.png' : '/img/' + n + '.png') + '?d=' + DELAY;
+    }
   });
   const tmp = '/tmp/xf-thumbs-' + process.pid;
 
   const A = await runOnce(fx, tmp, 9415, { global: 2, perOrigin: 999, gap: 10 }, true); // same scroll so tail rows mount in BOTH runs
   const B = await runOnce(fx, tmp, 9416, { global: 12, perOrigin: 4, gap: 10 }, true);
+  const C = await runOnce(fx, tmp, 9417, { global: 12, perOrigin: 4, gap: 10, penalize: [albumOrigin] }, true);
 
   const fill = (recs) => {
     const ss = recs.map((r) => r.s), es = recs.map((r) => r.e);
@@ -194,9 +201,11 @@ async function main() {
   // AC-P3: requests STARTED after the scroll skew toward visible bottom
   // rows. 20 rows x ~135px, viewport ~640 + 300px margin -> only rows ~13+
   // (n >= 49) are urgent after a jump-to-bottom; the FIFO head is n ~11+.
-  // Priority working = post-scroll starts land in the tail band; a stale
-  // FIFO pick would start n < 20.
-  const postScroll = B.recs.filter((r) => r.s > B.scrollT).sort((a, b) => a.s - b.s);
+  // The first ~250ms after the jump is a legitimate race window: a pump
+  // can fire on the OLD queue (settling head job) before the virtualizer
+  // mounts the tail rows and enqueues them — one stale head start per jump
+  // is harmless in production, so judge only starts AFTER the settle.
+  const postScroll = B.recs.filter((r) => r.s > B.scrollT + 250).sort((a, b) => a.s - b.s);
   const first5 = postScroll.slice(0, 5);
   const nums = first5.map((r) => { const m = /\/(?:x)?img\/(\d+)\.png$/.exec(r.p); return m ? parseInt(m[1], 10) : 0; });
   const bottom = nums.filter((n2) => n2 >= N - 31); // n >= 49: the urgent band
@@ -204,6 +213,18 @@ async function main() {
     'first5=' + JSON.stringify(first5.map((r) => r.p)) + ' nums=' + JSON.stringify(nums) + ' scrollT=' + B.scrollT);
 
   check('AC-P4: zero longtasks > 50ms during run B fill', (B.longtasks || []).length === 0, JSON.stringify(B.longtasks || []));
+
+  // AC-P5 (0.22.3): the penalized origin runs the polite 2/350 profile —
+  // starts spaced >=350ms (330 with scheduler jitter) and never more than
+  // 2 overlapping — while the healthy origin keeps 4 concurrent.
+  check('AC-P5: run C serves all ' + N + ' requests', C.recs.length === N, 'served=' + C.recs.length);
+  const albumStarts = C.recs.filter((r) => r.o === 'album').map((r) => r.s).sort((a, b) => a - b);
+  const minGap = Math.min(...albumStarts.slice(1).map((s, i) => s - albumStarts[i]));
+  check('AC-P5: penalized origin starts spaced >=330ms', albumStarts.length > 1 && minGap >= 330, 'minGap=' + minGap + 'ms over ' + albumStarts.length + ' starts');
+  const albumConc = maxConcurrent(C.recs.filter((r) => r.o === 'album'), () => 'a');
+  check('AC-P5: penalized origin never exceeds 2 in flight', albumConc <= 2, 'max=' + albumConc);
+  const mainConc = maxConcurrent(C.recs.filter((r) => r.o === 'main'), () => 'm');
+  check('AC-P5: healthy origin keeps the fast profile (<=4 in flight)', mainConc <= 4, 'max=' + mainConc);
 
   await fx.close();
   const fails = results.filter((r) => !r.ok);

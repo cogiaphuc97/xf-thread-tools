@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         xf-thread-tools
 // @namespace    xf-thread-tools
-// @version      0.22.2
+// @version      0.22.3
 // @description  XenForo 2: sort thread posts by reaction count across all pages (cached) + floating media panel (images / external links).
 // @author       xf-thread-tools
 // @match        *://*/threads/*
@@ -1280,6 +1280,10 @@
   //  - `perOrigin`   : plain object origin -> in-flight count
   //  - `opts.global` : max total in flight (default 12)
   //  - `opts.perOrigin`: max in flight per origin (default 4)
+  //  - `opts.originCaps`: plain object origin -> override cap for that origin
+  //    (adaptive penalty: an origin that served failures runs 2-concurrent —
+  //    some CDN families challenge bursts above 2 — while healthy origins
+  //    keep the fast default; behavior-based, no hostnames)
   //  - `opts.ageMs`  : queued this long => urgent (default 10000, starvation bound)
   // Order: an eligible urgent job (flagged, or aged) beats any earlier
   // non-urgent job; otherwise the earliest eligible job wins (FIFO).
@@ -1288,12 +1292,14 @@
     const o = opts || {};
     const global = o.global > 0 ? o.global | 0 : 12;
     const cap = o.perOrigin > 0 ? o.perOrigin | 0 : 4;
+    const caps = o.originCaps || null;
     const ageMs = o.ageMs > 0 ? o.ageMs : 10000;
     if (active >= global) return -1;
     let fallback = -1;
     for (let i = 0; i < queue.length; i++) {
       const j = queue[i];
-      if ((perOrigin[j.origin] || 0) >= cap) continue; // origin saturated — keep scanning
+      const c = caps && caps[j.origin] > 0 ? caps[j.origin] | 0 : cap;
+      if ((perOrigin[j.origin] || 0) >= c) continue; // origin saturated — keep scanning
       if (j.urgent || (now - (j.at || 0)) >= ageMs) return i; // visible/aged first
       if (fallback < 0) fallback = i; // first startable non-urgent (FIFO)
     }
@@ -2773,17 +2779,49 @@
       const IMG_NET_GLOBAL = 12;
       const IMG_NET_PER_ORIGIN = 4;
       const IMG_NET_AGE_MS = 10000;
-      const imgPageNet = { active: 0, perOrigin: {}, queue: [], last: 0 };
+      const imgPageNet = { active: 0, perOrigin: {}, queue: [], last: 0, originLast: {} };
+      // Adaptive per-origin penalty (0.22.3): some CDN families (the scdn
+      // poster infra documented 0.7.18) challenge cookie-less bursts above 2
+      // concurrent — first few 200, then 403 for the whole session. Raising
+      // the per-origin cap to 4 for speed tripped them. Instead of capping
+      // everyone, a FAILED fetch (challenge page, block pixel, dead ladder)
+      // punishes just that origin back to the proven poster-net profile —
+      // 2 concurrent + 350ms between starts — for an escalating window
+      // (60s x trips, max 5min). Healthy origins keep the fast 4/60 profile.
+      // Session-only, behavior-based: no hostnames anywhere.
+      const imgNetPenalty = new Map(); // origin -> { trips, until }
+      const IMG_NET_PENALTY_CAP = 2;
+      const IMG_NET_PENALTY_GAP = 350;
+      function imgNetPunish(url) {
+        let origin = '';
+        try { origin = new URL(String(url || '')).origin; } catch (e) { return; }
+        if (!origin) return;
+        const p = imgNetPenalty.get(origin) || { trips: 0, until: 0 };
+        p.trips++;
+        p.until = Date.now() + Math.min(60000 * p.trips, 300000);
+        imgNetPenalty.set(origin, p);
+      }
+      function imgNetPenalized(origin) {
+        const p = imgNetPenalty.get(origin);
+        return !!(p && Date.now() < p.until);
+      }
       // localhost test hook (IMG_PAGE_GAP convention): __XFT_IMGNET_FOR_TESTS
       // = { global, perOrigin, gap } read on EVERY pump so probes can flip
       // the throttle between runs inside one page.
       function imgNetOpts() {
         const h = (typeof window !== 'undefined' && window.__XFT_IMGNET_FOR_TESTS) || null;
+        const penalize = new Set();
+        if (h && Array.isArray(h.penalize)) for (const org of h.penalize) penalize.add(org);
+        for (const [org, p] of imgNetPenalty) if (Date.now() < p.until) penalize.add(org);
+        const originCaps = {};
+        for (const org of penalize) originCaps[org] = IMG_NET_PENALTY_CAP;
         return {
           global: h && h.global > 0 ? h.global | 0 : IMG_NET_GLOBAL,
           perOrigin: h && h.perOrigin > 0 ? h.perOrigin | 0 : IMG_NET_PER_ORIGIN,
           gap: h && h.gap >= 0 ? h.gap | 0 : IMG_PAGE_GAP,
-          ageMs: IMG_NET_AGE_MS
+          ageMs: IMG_NET_AGE_MS,
+          penalize: penalize,
+          originCaps: originCaps
         };
       }
       function imgNetUrgent(el) {
@@ -2819,8 +2857,14 @@
           const job = imgPageNet.queue.splice(i, 1)[0];
           imgPageNet.active++; // slot reserved at schedule time
           imgPageNet.perOrigin[job.origin] = (imgPageNet.perOrigin[job.origin] || 0) + 1;
-          const wait = Math.max(0, imgPageNet.last + o.gap - Date.now());
+          // global start gap for every origin, PLUS a per-origin gap for
+          // penalized ones (350ms spacing on top of the 2-concurrent cap —
+          // the challenge trigger is the burst, not just the overlap)
+          const orgGap = o.penalize.has(job.origin) ? IMG_NET_PENALTY_GAP : 0;
+          const prevOrg = imgPageNet.originLast[job.origin] || 0;
+          const wait = Math.max(0, imgPageNet.last + o.gap - Date.now(), prevOrg + orgGap - Date.now());
           imgPageNet.last = Date.now() + wait;
+          imgPageNet.originLast[job.origin] = Date.now() + wait;
           setTimeout(() => {
             job.run(() => {
               imgPageNet.active--;
@@ -2832,7 +2876,7 @@
         }
       }
       function imgPageGet(url, onOk, onErr) {
-        runImgPageNet((done) => gmGetText(url, (t) => { onOk(t); done(); }, () => { onErr(); done(); }), url, null);
+        runImgPageNet((done) => gmGetText(url, (t) => { onOk(t); done(); }, () => { onErr(); imgNetPunish(url); done(); }), url, null);
       }
       function resolveImagePage(pageUrl, embedded, cb, force) {
         const c = imgPageCache.get(pageUrl);
@@ -3058,7 +3102,7 @@
         const attempt = (noRef) => gmThumbBytes(url, noRef, (blob) => {
           if (blob === null) {
             if (!noRef) { attempt(true); return; }
-            thumbNeg.add(key);
+            thumbNeg.add(key); imgNetPunish(url); // adaptive: this origin throttles to 2/350 for a window
             for (const cb of cbs) cb(null);
             return;
           }
@@ -3066,7 +3110,7 @@
             if (bmp.width <= 1 || bmp.height <= 1) { // hotlink block pixel: valid 1x1 bytes, dead preview
               bmp.close();
               if (!noRef) { attempt(true); return; }
-              thumbNeg.add(key);
+              thumbNeg.add(key); imgNetPunish(url); // adaptive: this origin throttles to 2/350 for a window
               for (const cb of cbs) cb(null);
               return;
             }
@@ -3081,7 +3125,7 @@
           }, () => {
             // undecodable bytes (HTML challenge page mid-queue): not worth a
             // no-referrer retry ladder round — the cell fallback handles it
-            thumbNeg.add(key);
+            thumbNeg.add(key); imgNetPunish(url); // adaptive: this origin throttles to 2/350 for a window
             for (const cb of cbs) cb(null);
           });
         });

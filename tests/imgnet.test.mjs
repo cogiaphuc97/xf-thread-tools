@@ -54,3 +54,17 @@ test('netPick: mixed field exercise — caps, urgency, aging, FIFO together', ()
   // first AGED eligible is cdn2 (index 2), still ahead of plain fallback
   assert.equal(netPick(q, 1, { 'cdn1.test': 4 }, {}, 10400), 2);
 });
+
+test('netPick: originCaps override throttles one origin, others keep the default', () => {
+  // penalized origin a capped at 2 while default stays 4: a 3rd in-flight
+  // a-job blocks the a head, so the later b job starts
+  const q = [job('a.test', 0), job('a.test', 1), job('b.test', 2)];
+  const caps = { 'a.test': 2 };
+  assert.equal(netPick(q, 2, { 'a.test': 2 }, { originCaps: caps }, 100), 2);
+  // every represented origin saturated under its own cap -> nothing startable
+  assert.equal(netPick(q, 2, { 'a.test': 2, 'b.test': 4 }, { originCaps: caps }, 100), -1);
+  // default cap still governs unlisted origins: 3 < 4 so b remains startable
+  assert.equal(netPick([job('b.test', 0)], 3, { 'b.test': 3 }, { originCaps: caps }, 100), 0);
+  // override 0 is not a valid cap -> the default 4 applies (a at 3 passes)
+  assert.equal(netPick(q, 3, { 'a.test': 3 }, { originCaps: { 'a.test': 0 } }, 100), 0);
+});

@@ -53,7 +53,7 @@
     {
       "name": "imgnet",
       "file": "src/imgnet.mjs",
-      "desc": "Pure scheduling math for the shared preview-net queue: per-origin politeness caps, visible-first pick order, aging bound against starvation.",
+      "desc": "Pure scheduling math for the shared preview-net queue: per-origin politeness caps (with adaptive per-origin overrides), visible-first pick order, aging bound against starvation.",
       "symbols": ["netPick"]
     },
     {
@@ -73,7 +73,7 @@
     { "name": "rt-grid", "file": "src/rt-grid.js", "anchor": "panel", "desc": "Panel element handles, virtualizer (pool, sig rows, reconcile, renderSlice, mount, clearVRows), tiny/broken media state, pop suppress + broken-rerender debounce. NOTE: 'panel' here is the first `let panel` handle declaration; fragment spans through scheduleBrokenRerender." },
     { "name": "rt-posters", "file": "src/rt-posters.js", "anchor": "EMBED_POSTERS_KEY", "desc": "Embed poster cache (GM storage), queued poster fetch net (2/350ms, backoff, cooldown), ensureEmbedPoster." },
     { "name": "rt-embednet", "file": "src/rt-embednet.js", "anchor": "EMBED_STREAMS_KEY", "desc": "Embed stream cache, gmGetText/gmPostJson (GM XHR + fetch fallback), resolveEmbedStream (sign endpoint / view API / file-page carriers)." },
-    { "name": "rt-imgpage", "file": "src/rt-imgpage.js", "anchor": "imgPageCache", "desc": "Image landing-page HQ resolution + shared preview net queue: session cache, cooldown, per-origin 2 / global 6 / 150ms throttle with visible-first pick, inflight dedup, force path for viewer/downloads." },
+    { "name": "rt-imgpage", "file": "src/rt-imgpage.js", "anchor": "imgPageCache", "desc": "Image landing-page HQ resolution + shared preview net queue: session cache, cooldown, per-origin 4 / global 12 / 60ms gap with visible-first pick, adaptive per-origin penalty (2/350 after fetch failures), inflight dedup, force path for viewer/downloads." },
     { "name": "rt-thumbcache", "file": "src/rt-thumbcache.js", "anchor": "thumbMem", "desc": "Preview thumb cache: memory objectURL layer (LRU, revoke on evict) over IDB thumbs/thumbsMeta (LRU at cap), GM blob fetch with referer ladder through imgPageNet, createImageBitmap downscale to capped webp stills, gif still/original split (hover/viewer playback)." },
     { "name": "rt-albums", "file": "src/rt-albums.js", "anchor": "ALBUMS_KEY", "desc": "Album expansion runtime: GM-storage store (TTL, prune), HTML/API walk, albumDone rerender, ensureAlbum lazy trigger." },
     { "name": "rt-viewstate", "file": "src/rt-viewstate.js", "anchor": "settingsView", "desc": "View state (tab/subtab/scroll memory per view), viewer state vars, render queue flag, mkBtn button helper." },
