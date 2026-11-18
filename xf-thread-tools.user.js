@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         xf-thread-tools
 // @namespace    xf-thread-tools
-// @version      0.22.1
+// @version      0.22.2
 // @description  XenForo 2: sort thread posts by reaction count across all pages (cached) + floating media panel (images / external links).
 // @author       xf-thread-tools
 // @match        *://*/threads/*
@@ -6107,11 +6107,17 @@
           clearVRows();
           renderPanelBody();
         });
-        // bulk download: zips the current list (Pics/ + Videos/) as one file
-        const dlBtn = mkBtn('Download', startBulkDownload, 'xft-btn xft-subtab xft-dlbtn');
+        // bulk download: zips the current list (Pics/ + Videos/) as one file.
+        // Select + button sit in ONE right-anchored cluster (.xft-subr owns
+        // margin-left:auto): the Album sub-tab hides the group select, and a
+        // bare button would slide left and read as a fifth sub-tab.
+        const dlBtn = mkBtn('Download', startBulkDownload, 'xft-btn xft-dlbtn');
         dlBtnEl = dlBtn;
         updateDlBtn();
-        subtabsEl.append(subTabBtns.all, subTabBtns.image, subTabBtns.video, subTabBtns.album, groupSel, dlBtn);
+        const subR = document.createElement('div');
+        subR.className = 'xft-subr';
+        subR.append(groupSel, dlBtn);
+        subtabsEl.append(subTabBtns.all, subTabBtns.image, subTabBtns.video, subTabBtns.album, subR);
 
         // bulk download dashboard: header (name / speed / ETA / stop),
         // overall bar + counts, live rows for in-flight files (+ pinned fails)
@@ -6249,8 +6255,13 @@
           '.xft-subtab:hover{background:hsl(var(--xft-accent));color:hsl(var(--xft-accent-fg))}',
           // shadcn Toggle active: secondary chip, readable on the plain panel bg
           '.xft-subtab.xft-tab-active,.xft-subtab.xft-tab-active:hover{background:hsl(var(--xft-secondary));color:hsl(var(--xft-fg));font-weight:600}',
-          '.xft-gsel{margin-left:auto;height:22px;font-size:11px;background:hsl(var(--xft-secondary));color:hsl(var(--xft-fg));border:1px solid hsl(var(--xft-border));border-radius:6px;padding:0 4px;cursor:pointer;outline:none}',
-          '.xft-dlbtn{min-width:70px;text-align:center}',
+          // right cluster of the sub-tab row: group select + Download button.
+          // The AUTO margin lives on the wrapper, not the select, so hiding
+          // the select (Album tab) never moves the Download button.
+          '.xft-subr{margin-left:auto;display:flex;align-items:center;gap:6px}',
+          '.xft-subr[hidden]{display:none}',
+          '.xft-gsel{height:22px;font-size:11px;background:hsl(var(--xft-secondary));color:hsl(var(--xft-fg));border:1px solid hsl(var(--xft-border));border-radius:6px;padding:0 4px;cursor:pointer;outline:none}',
+          '.xft-dlbtn{height:22px;min-width:70px;padding:0 10px;font-size:11px;text-align:center}',
           '.xft-dlbar{padding:8px 10px;border-bottom:1px solid hsl(var(--xft-border));background:hsl(var(--xft-muted));display:flex;flex-direction:column;gap:6px}',
           '.xft-dlbar[hidden]{display:none}',
           '.xft-dltop{display:flex;align-items:center;gap:6px;min-width:0}',
@@ -6265,7 +6276,11 @@
           '.xft-dl-ok{color:hsl(142 60% 45%)}',
           '.xft-dl-bad{color:hsl(var(--xft-destructive))}',
           '.xft-dl-on{color:hsl(var(--xft-fg))}',
-          '.xft-dlrows{display:flex;flex-direction:column;gap:2px;max-height:132px;overflow-y:auto;scrollbar-width:thin;margin-top:2px}',
+          // FIXED height (not max-height): rows appear/disappear every tick
+          // during a run and failures trim to the last 4 at the end — a
+          // content-sized box would pump the dashboard (and the grid below
+          // it) up and down for the whole download.
+          '.xft-dlrows{display:flex;flex-direction:column;gap:2px;height:132px;overflow-y:auto;scrollbar-width:thin;margin-top:2px}',
           '.xft-dlrows[hidden]{display:none}',
           '.xft-dlrow{display:flex;align-items:center;gap:8px;min-width:0;font-size:11px;line-height:18px}',
           '.xft-dlrowname{flex:1;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;color:hsl(var(--xft-fg))}',
@@ -6288,7 +6303,10 @@
           '.xft-ghead.xft-gjump{cursor:pointer}',
           '.xft-glabel{font-size:12px;font-weight:600;color:hsl(var(--xft-fg));white-space:nowrap;overflow:hidden;text-overflow:ellipsis;max-width:70%}',
           '.xft-gline{flex:1 1 auto;border-top:1px solid hsl(var(--xft-border))}',
-          '.xft-ghead .xft-dlhead{flex:none;margin-left:0;padding:1px 8px;font-size:11px;line-height:18px}',
+          // per-album ⬇: compact ghost icon button at the header's right
+          // end — matches the sub-tab control heights, not a fat square
+          '.xft-ghead .xft-dlhead{flex:none;width:24px;height:20px;padding:0;margin-left:0;font-size:11px;line-height:1;border-radius:5px;background:transparent;border-color:hsl(var(--xft-border));color:hsl(var(--xft-muted-fg))}',
+          '.xft-ghead .xft-dlhead:hover{background:hsl(var(--xft-accent));border-color:hsl(var(--xft-accent));color:hsl(var(--xft-accent-fg))}',
           '.xft-gsub{height:24px;padding-left:14px}',
           '.xft-gsub .xft-glabel{font-weight:500;font-size:11px;color:hsl(var(--xft-muted-fg))}',
           '.xft-linksbar{display:flex;align-items:center;gap:6px;padding:6px 8px;border-bottom:1px solid hsl(var(--xft-border))}',

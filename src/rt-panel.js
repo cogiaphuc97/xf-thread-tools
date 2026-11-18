@@ -264,11 +264,17 @@
         clearVRows();
         renderPanelBody();
       });
-      // bulk download: zips the current list (Pics/ + Videos/) as one file
-      const dlBtn = mkBtn('Download', startBulkDownload, 'xft-btn xft-subtab xft-dlbtn');
+      // bulk download: zips the current list (Pics/ + Videos/) as one file.
+      // Select + button sit in ONE right-anchored cluster (.xft-subr owns
+      // margin-left:auto): the Album sub-tab hides the group select, and a
+      // bare button would slide left and read as a fifth sub-tab.
+      const dlBtn = mkBtn('Download', startBulkDownload, 'xft-btn xft-dlbtn');
       dlBtnEl = dlBtn;
       updateDlBtn();
-      subtabsEl.append(subTabBtns.all, subTabBtns.image, subTabBtns.video, subTabBtns.album, groupSel, dlBtn);
+      const subR = document.createElement('div');
+      subR.className = 'xft-subr';
+      subR.append(groupSel, dlBtn);
+      subtabsEl.append(subTabBtns.all, subTabBtns.image, subTabBtns.video, subTabBtns.album, subR);
 
       // bulk download dashboard: header (name / speed / ETA / stop),
       // overall bar + counts, live rows for in-flight files (+ pinned fails)
