@@ -1,7 +1,7 @@
 // Unit tests for the parse module (src/parse.mjs). Regrouped to mirror the src/ split.
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { applyLinkFilters, estimateSize, extractDomain, filterLinks, groupLinkItems, hostKey, parseReactionCount, partitionLinks, sortPosts } from '../src/parse.mjs';
+import { applyLinkFilters, estimateSize, extractDomain, filterLinks, groupLinkItems, hostKey, orderItems, parseReactionCount, partitionLinks, sortPosts } from '../src/parse.mjs';
 
 
 // ---- parseReactionCount (AC6, live-observed forms) ----
@@ -207,4 +207,31 @@ test('hostKey: port kept, garbage coerced to empty string', () => {
   assert.equal(hostKey(null), '');
   assert.equal(hostKey(undefined), '');
   assert.equal(hostKey('www.'), '');
+});
+// orderItems (0.23.0) — item shape { r, url, pos, kind, ord }
+const oit = (pageN, reactionCount, pos, ord) => ({ r: { pageN: pageN, reactionCount: reactionCount }, url: 'u' + pos + '_' + ord, pos: pos, kind: 'image', ord: ord });
+
+test('orderItems: default/unknown modes return the SAME reference, input never mutated', () => {
+  const items = [oit(2, 5, 3, 0), oit(1, 0, 1, 1)];
+  assert.equal(orderItems(items, 'default'), items);
+  assert.equal(orderItems(items, undefined), items);
+  assert.equal(orderItems(items, 'bogus'), items);
+  const copy = items.slice();
+  const sorted = orderItems(items, 'react');
+  assert.deepEqual(items, copy); // input array untouched by the sort
+  assert.notEqual(sorted, items);
+});
+
+test('orderItems: page mode sorts pageN asc (missing pageN = 1), ties by pos then ord', () => {
+  const items = [oit(3, 99, 7, 0), oit(1, 0, 2, 1), oit(undefined, 0, 1, 2), oit(1, 5, 2, 3), oit(2, 0, 4, 4)];
+  const urls = orderItems(items, 'page').map((it) => it.url);
+  // page-1 group first: missing-pageN item (pos 1), then the two pos-2 items by ord, then page 2, page 3
+  assert.deepEqual(urls, ['u1_2', 'u2_1', 'u2_3', 'u4_4', 'u7_0']);
+});
+
+test('orderItems: react mode sorts reactionCount DESC (missing = 0), ties by pos then ord', () => {
+  const items = [oit(1, 0, 1, 0), oit(2, 7, 5, 1), oit(1, undefined, 2, 2), oit(1, 7, 3, 3), oit(1, 12, 4, 4)];
+  const urls = orderItems(items, 'react').map((it) => it.url);
+  // 12 first; the two 7s tie-break by pos (3 < 5); zero/missing react last by pos
+  assert.deepEqual(urls, ['u4_4', 'u3_3', 'u5_1', 'u1_0', 'u2_2']);
 });

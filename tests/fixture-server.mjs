@@ -81,11 +81,18 @@ function postHtml(n, imgs) {
   const inner = imgs.map((u) => /\.(png|gif|bmp|jpe?g|webp|avif)([?#]|$)/i.test(u)
     ? `<a href="${u}" class="js-lbImage"><img src="${u}" class="bbImage" data-url="${u}" alt=""/></a>`
     : `<a href="${u}">${u}</a>`).join('');
+  // deterministic per-post reaction counts for the order probe: zero every
+  // 4th post, else (n*7)%13 — tests/order-headless.mjs mirrors this
+  // formula to know the expected sequences without shipping a fixture file
+  const rc = n % 4 === 0 ? 0 : (n * 7) % 13;
+  const bar = rc > 0
+    ? `<div class="reactionsBar js-reactionsList is-active"><a class="reactionsBar-link">${rc === 1 ? 'u1' : rc === 2 ? 'u1, u2' : 'u1, u2 and ' + (rc - 2) + ' others'}</a></div>`
+    : '<div class="reactionsBar js-reactionsList"></div>';
   return `<article class="message message--post" data-content="post-${n}">
     <div class="message-inner"><div class="message-cell">
       <header><a class="username message-name">u${n % 17}</a></header>
       <div class="message-body"><div class="bbWrapper">${inner}</div></div>
-      <footer><div class="reactionsBar js-reactionsList"></div></footer>
+      <footer>${bar}</footer>
     </div></div>
   </article>`;
 }

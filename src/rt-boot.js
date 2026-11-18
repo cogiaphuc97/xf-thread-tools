@@ -74,6 +74,10 @@
         '.xft-tabs .xft-tab:hover{background:hsl(var(--xft-fg)/.08);color:hsl(var(--xft-fg))}',
         '.xft-tabs .xft-tab-active,.xft-tabs .xft-tab-active:hover{background:hsl(var(--xft-bg));color:hsl(var(--xft-fg));border-color:hsl(var(--xft-border));box-shadow:0 1px 2px hsl(240 10% 3.9%/.1)}',
         '.xft-count{margin-left:auto;color:hsl(var(--xft-muted-fg));font-variant-numeric:tabular-nums}',
+        // item-order select rides at the tab row's right end, after the
+        // count (which owns the auto margin) — same chip styling as the
+        // group select so the two rows read as one control family
+        '.xft-ordsel{height:22px;font-size:11px;background:hsl(var(--xft-secondary));color:hsl(var(--xft-fg));border:1px solid hsl(var(--xft-border));border-radius:6px;padding:0 4px;cursor:pointer;outline:none;flex:none}',
         '.xft-subtabs{display:flex;align-items:center;gap:6px;padding:6px 8px;border-bottom:1px solid hsl(var(--xft-border))}',
         '.xft-subtabs[hidden]{display:none}',
         '.xft-subtab{font-size:11px;height:22px;padding:0 8px;background:transparent;color:hsl(var(--xft-muted-fg))}',

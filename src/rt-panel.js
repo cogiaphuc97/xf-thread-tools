@@ -232,7 +232,29 @@
       panelCountEl = document.createElement('span');
       panelCountEl.className = 'xft-count';
       panelCountEl.textContent = '0 items';
-      tabs.append(tabFilesBtn, tabLinksBtn, tabAiBtn, panelCountEl);
+      // item-order control (0.23.0): ONE control for every tab — media
+      // (all sub-tabs, all group modes) and links. Sits right of the item
+      // count in the tab row; the count owns margin-left:auto, so this
+      // lands at the row's right end next to it.
+      const ordSel = document.createElement('select');
+      ordSel.className = 'xft-ordsel';
+      ordSel.title = 'Order items by';
+      ordSel.setAttribute('aria-label', 'Order items by');
+      for (const o of [['default', 'Sort: Default'], ['page', 'Sort: Page'], ['react', 'Sort: Reactions']]) {
+        const op = document.createElement('option');
+        op.value = o[0];
+        op.textContent = o[1];
+        ordSel.appendChild(op);
+      }
+      ordSel.value = settings.mediaOrder;
+      ordSel.addEventListener('change', () => {
+        saveViewScroll();
+        settings.mediaOrder = ordSel.value;
+        saveSettings();
+        clearVRows(); // resets lastPanelSignature — the re-render fires even on identical data
+        renderPanelBody();
+      });
+      tabs.append(tabFilesBtn, tabLinksBtn, tabAiBtn, panelCountEl, ordSel);
 
       // media sub-tabs (All / Image / Video), below the main tab row
       subtabsEl = document.createElement('div');

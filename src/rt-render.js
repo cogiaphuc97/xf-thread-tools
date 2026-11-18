@@ -101,7 +101,13 @@
       const items = panelSubTab === 'all' ? all
         : panelSubTab === 'album' ? all.filter((it) => it.album)
         : all.filter((it) => it.kind === panelSubTab || (panelSubTab === 'video' && it.kind === 'embed'));
-      return { all: all, items: items, mediaCounts: mediaCounts };
+      // user-facing order (page / reaction count) applies to the filtered
+      // list AFTER counting — ord still stamps the RAW stream position and
+      // row identity reconciles by URL, so reordering breaks nothing. The
+      // download list and viewer derive from this same list: one sort, one
+      // source of truth. Group modes consume the sorted stream: groups keep
+      // their own keying, ordered by first appearance in sorted order.
+      return { all: all, items: orderItems(items, settings.mediaOrder), mediaCounts: mediaCounts };
     }
 
     // count-only fast path for fetch ticks while the grid rebuild is held:
@@ -144,10 +150,13 @@
         // viewer walks media only; children are ordinary viewer items
         viewerItems = items.filter((it) => it.kind !== 'album').map((it) => ({ kind: it.kind, url: it.url, postId: it.r.postId, pos: it.pos, author: it.r.author, page: (it.r.imgPages || {})[it.url] || '', album: it.album || '', thumb: it.thumb || '' }));
       } else {
+        let lord = 0; // explicit raw-stream position: orderItems' tie-break stays total here too (no NaN→+0 reliance on sort stability)
         for (const r of pd.orderedShown) {
-          for (const url of r.links) if (!boiler.has(url)) items.push({ r: r, url: url, pos: pd.posMap.get(r.postId) || 0, kind: 'link' });
+          for (const url of r.links) if (!boiler.has(url)) items.push({ r: r, url: url, pos: pd.posMap.get(r.postId) || 0, kind: 'link', ord: lord++ });
         }
-        filtered = applyLinkFilters(items, {
+        // ONE sort control governs both tabs: links rows follow the same
+        // page / reaction order as the media grid (filters preserve order)
+        filtered = applyLinkFilters(orderItems(items, settings.mediaOrder), {
           query: linkSearchEl ? linkSearchEl.value : '',
           users: linkUserSel,
           domains: linkDomainSel

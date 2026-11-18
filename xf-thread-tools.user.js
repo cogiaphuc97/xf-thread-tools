@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         xf-thread-tools
 // @namespace    xf-thread-tools
-// @version      0.22.3
+// @version      0.23.0
 // @description  XenForo 2: sort thread posts by reaction count across all pages (cached) + floating media panel (images / external links).
 // @author       xf-thread-tools
 // @match        *://*/threads/*
@@ -30,6 +30,7 @@
     basePath: '',                // '' = forum at site root; '/forum' for subpath installs
     forceAnimations: 0,          // 1 = run UI animations even under prefers-reduced-motion
     mediaGroup: 'flat',          // media grid grouping: flat | post | page | user
+    mediaOrder: 'default',       // panel item order: default | page | react (one control, media + links)
     selectors: {},               // per-site selector overrides, merged over BASE_SEL
     aiProvider: 'ollama',        // AI tab provider preset (Ollama-only phase; engine stays provider-generic)
     aiBase: '',                  // '' = provider preset base URL
@@ -392,6 +393,24 @@
     const cap = typeof capBytes === 'number' && capBytes > 0 ? capBytes : DEFAULT_CAP_BYTES;
     const total = typeof totalBytes === 'number' && isFinite(totalBytes) && totalBytes > 0 ? totalBytes : 0;
     return { totalBytes: total, capBytes: cap, stopPersist: total > cap };
+  }
+  
+  // Panel item ordering (0.23.0): order the collected panel items — media
+  // tiles and links rows share one item shape { r, url, pos, kind, ord } —
+  // by source-post page number or reaction count. `r.pageN` (missing -> 1)
+  // and `r.reactionCount` (missing -> 0 — every item carries its post's
+  // count, zero-react posts included) come from the extraction record; ties
+  // break by `pos` (post position) then `ord` (raw stream position) so the
+  // sort is total and stable. Any other mode (incl. 'default'/undefined)
+  // returns the SAME reference untouched — the default render path stays
+  // allocation-free.
+  function orderItems(items, mode) {
+    if (mode !== 'page' && mode !== 'react') return items;
+    const val = (it) => it && it.r || {};
+    const tie = (a, b) => (a.pos - b.pos) || (a.ord - b.ord);
+    const byPage = (a, b) => ((val(a).pageN || 1) - (val(b).pageN || 1)) || tie(a, b);
+    const byReact = (a, b) => ((val(b).reactionCount || 0) - (val(a).reactionCount || 0)) || tie(a, b);
+    return items.slice().sort(mode === 'page' ? byPage : byReact);
   }
   /* ==== pure module: embed ==== */
   // embed: Pure video-host carriers: embed poster parse, sign-endpoint URL/response shapes, view-API parse, video file-page carrier parse, /v/ /f/ /d/ URL shapes. (split from the single-file userscript; see scripts/modules.json)
@@ -5124,7 +5143,13 @@
         const items = panelSubTab === 'all' ? all
           : panelSubTab === 'album' ? all.filter((it) => it.album)
           : all.filter((it) => it.kind === panelSubTab || (panelSubTab === 'video' && it.kind === 'embed'));
-        return { all: all, items: items, mediaCounts: mediaCounts };
+        // user-facing order (page / reaction count) applies to the filtered
+        // list AFTER counting — ord still stamps the RAW stream position and
+        // row identity reconciles by URL, so reordering breaks nothing. The
+        // download list and viewer derive from this same list: one sort, one
+        // source of truth. Group modes consume the sorted stream: groups keep
+        // their own keying, ordered by first appearance in sorted order.
+        return { all: all, items: orderItems(items, settings.mediaOrder), mediaCounts: mediaCounts };
       }
 
       // count-only fast path for fetch ticks while the grid rebuild is held:
@@ -5167,10 +5192,13 @@
           // viewer walks media only; children are ordinary viewer items
           viewerItems = items.filter((it) => it.kind !== 'album').map((it) => ({ kind: it.kind, url: it.url, postId: it.r.postId, pos: it.pos, author: it.r.author, page: (it.r.imgPages || {})[it.url] || '', album: it.album || '', thumb: it.thumb || '' }));
         } else {
+          let lord = 0; // explicit raw-stream position: orderItems' tie-break stays total here too (no NaN→+0 reliance on sort stability)
           for (const r of pd.orderedShown) {
-            for (const url of r.links) if (!boiler.has(url)) items.push({ r: r, url: url, pos: pd.posMap.get(r.postId) || 0, kind: 'link' });
+            for (const url of r.links) if (!boiler.has(url)) items.push({ r: r, url: url, pos: pd.posMap.get(r.postId) || 0, kind: 'link', ord: lord++ });
           }
-          filtered = applyLinkFilters(items, {
+          // ONE sort control governs both tabs: links rows follow the same
+          // page / reaction order as the media grid (filters preserve order)
+          filtered = applyLinkFilters(orderItems(items, settings.mediaOrder), {
             query: linkSearchEl ? linkSearchEl.value : '',
             users: linkUserSel,
             domains: linkDomainSel
@@ -6119,7 +6147,29 @@
         panelCountEl = document.createElement('span');
         panelCountEl.className = 'xft-count';
         panelCountEl.textContent = '0 items';
-        tabs.append(tabFilesBtn, tabLinksBtn, tabAiBtn, panelCountEl);
+        // item-order control (0.23.0): ONE control for every tab — media
+        // (all sub-tabs, all group modes) and links. Sits right of the item
+        // count in the tab row; the count owns margin-left:auto, so this
+        // lands at the row's right end next to it.
+        const ordSel = document.createElement('select');
+        ordSel.className = 'xft-ordsel';
+        ordSel.title = 'Order items by';
+        ordSel.setAttribute('aria-label', 'Order items by');
+        for (const o of [['default', 'Sort: Default'], ['page', 'Sort: Page'], ['react', 'Sort: Reactions']]) {
+          const op = document.createElement('option');
+          op.value = o[0];
+          op.textContent = o[1];
+          ordSel.appendChild(op);
+        }
+        ordSel.value = settings.mediaOrder;
+        ordSel.addEventListener('change', () => {
+          saveViewScroll();
+          settings.mediaOrder = ordSel.value;
+          saveSettings();
+          clearVRows(); // resets lastPanelSignature — the re-render fires even on identical data
+          renderPanelBody();
+        });
+        tabs.append(tabFilesBtn, tabLinksBtn, tabAiBtn, panelCountEl, ordSel);
 
         // media sub-tabs (All / Image / Video), below the main tab row
         subtabsEl = document.createElement('div');
@@ -6293,6 +6343,10 @@
           '.xft-tabs .xft-tab:hover{background:hsl(var(--xft-fg)/.08);color:hsl(var(--xft-fg))}',
           '.xft-tabs .xft-tab-active,.xft-tabs .xft-tab-active:hover{background:hsl(var(--xft-bg));color:hsl(var(--xft-fg));border-color:hsl(var(--xft-border));box-shadow:0 1px 2px hsl(240 10% 3.9%/.1)}',
           '.xft-count{margin-left:auto;color:hsl(var(--xft-muted-fg));font-variant-numeric:tabular-nums}',
+          // item-order select rides at the tab row's right end, after the
+          // count (which owns the auto margin) — same chip styling as the
+          // group select so the two rows read as one control family
+          '.xft-ordsel{height:22px;font-size:11px;background:hsl(var(--xft-secondary));color:hsl(var(--xft-fg));border:1px solid hsl(var(--xft-border));border-radius:6px;padding:0 4px;cursor:pointer;outline:none;flex:none}',
           '.xft-subtabs{display:flex;align-items:center;gap:6px;padding:6px 8px;border-bottom:1px solid hsl(var(--xft-border))}',
           '.xft-subtabs[hidden]{display:none}',
           '.xft-subtab{font-size:11px;height:22px;padding:0 8px;background:transparent;color:hsl(var(--xft-muted-fg))}',
