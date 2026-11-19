@@ -47,7 +47,7 @@
       for (const r of d.orderedShown) {
         const push = (list, kind) => {
           for (const url of (list || [])) {
-            if (keep(url)) all.push({ r: r, url: String(url || ''), pos: d.posMap.get(r.postId) || 0, kind: kind, ord: raw });
+            if (keep(url)) all.push({ r: r, url: String(url || ''), pos: d.posMap.get(r.postId) || 0, kind: kind, poster: kind === 'video' ? ((r.posters || {})[String(url)]) || '' : '', ord: raw });
             raw++;
           }
         };
@@ -148,7 +148,7 @@
         }
         // album tiles open the host page in a tab, not the viewer — the
         // viewer walks media only; children are ordinary viewer items
-        viewerItems = items.filter((it) => it.kind !== 'album').map((it) => ({ kind: it.kind, url: it.url, postId: it.r.postId, pos: it.pos, author: it.r.author, page: (it.r.imgPages || {})[it.url] || '', album: it.album || '', thumb: it.thumb || '' }));
+        viewerItems = items.filter((it) => it.kind !== 'album').map((it) => ({ kind: it.kind, url: it.url, postId: it.r.postId, pos: it.pos, author: it.r.author, page: (it.r.imgPages || {})[it.url] || '', album: it.album || '', thumb: it.thumb || '', poster: it.poster || '' }));
       } else {
         let lord = 0; // explicit raw-stream position: orderItems' tie-break stays total here too (no NaN→+0 reliance on sort stability)
         for (const r of pd.orderedShown) {

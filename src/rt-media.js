@@ -99,7 +99,7 @@
       }, { once: true });
     }
 
-    function buildMediaEl(kind, url, thumb, pageUrl) {
+    function buildMediaEl(kind, url, thumb, pageUrl, poster) {
       if (kind === 'embed') {
         // Embed thumbs: base no-fetch tile (hosts rate-limit, some embeds
         // autostart); the poster — parsed from the embed page's og:image —
@@ -160,7 +160,11 @@
           // moved-CDN directs). Same-host files never hit this.
           const tile = document.createElement('div');
           tile.className = 'xft-vtile';
-          if (isVideoPageUrl(url) || (VID_EXT_RE.test(url) && extractDomain(url) !== hostKey(location.host))) {
+          if (poster) {
+            // unfurl-card poster captured at extraction (video-file hosts
+            // with no og:image) — no per-video page fetch needed
+            attachTilePoster(tile, poster);
+          } else if (isVideoPageUrl(url) || (VID_EXT_RE.test(url) && extractDomain(url) !== hostKey(location.host))) {
             ensureEmbedPoster(url, (p) => setTimeout(() => attachTilePoster(tile, p), 0));
           }
           return tile;
@@ -168,6 +172,7 @@
         const v = document.createElement('video');
         v.controls = true;
         v.autoplay = true;
+        if (poster) v.setAttribute('poster', poster);
         armVideoAutoplay(v);
         // file-PAGE urls (host /v/ or /f/ pages carrying the media behind a
         // sign endpoint or page parse) resolve to the direct src first; the

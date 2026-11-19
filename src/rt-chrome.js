@@ -91,7 +91,7 @@
       const v = document.createElement('div');
       v.id = 'xft-viewer';
       if (!nav) v.classList.add('xft-vwin'); // animate only a fresh open
-      const media = buildMediaEl(it.kind, it.url, false, it.page || '');
+      const media = buildMediaEl(it.kind, it.url, false, it.page || '', it.poster || '');
       // every viewer media sits in a FIXED-HEIGHT stage so paging next/prev
       // never shifts the bar/filmstrip; the slot inside is sized to the
       // image's own aspect once loaded (small images upscale to fill)
@@ -128,7 +128,7 @@
           const t = viewerItems[k];
           const th = document.createElement('div');
           th.className = 'xft-vthumb' + (k === viewerIndex ? ' xft-vthumb-active' : '');
-          th.appendChild(buildMediaEl(t.kind, t.url, true));
+          th.appendChild(buildMediaEl(t.kind, t.url, true, '', t.poster || ''));
           const idx = k;
           th.addEventListener('click', () => openViewerAt(idx));
           strip.appendChild(th);

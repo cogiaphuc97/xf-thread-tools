@@ -194,3 +194,22 @@ export function parseAlbumApiResponse(text) {
   } catch (e) { return null; }
 }
 
+
+// pairUnfurlPosters (0.25.2): some hosts embed a video as a plain
+// <video> tag preceded by XF's link-preview card, and the card's
+// bbCodeBlockUnfurl-image IS the poster frame (the video file itself has
+// no og:image to fetch). seq is a document-ordered flat walk of the post
+// body — ['u', posterUrl, 'v', videoSrc, …] — collected by one combined
+// querySelectorAll. A video pairs with the NEAREST PRECEDING unconsumed
+// unfurl image (XF renders the card right before its video); an unfurl
+// with no following video (image-host cards) is ignored, and a video with
+// no preceding card stays posterless.
+export function pairUnfurlPosters(seq) {
+  const out = {};
+  let pending = '';
+  for (let i = 0; i + 1 < seq.length; i += 2) {
+    if (seq[i] === 'u') pending = seq[i + 1];
+    else if (seq[i] === 'v' && pending) { out[seq[i + 1]] = pending; pending = ''; }
+  }
+  return out;
+}

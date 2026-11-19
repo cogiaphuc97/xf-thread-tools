@@ -28,6 +28,7 @@ export const BASE_SEL = {
   reactionsLink: 'a.reactionsBar-link',
   repliesHost: '.message-main',
   image: 'img.bbImage',
+  unfurlImage: 'img.bbCodeBlockUnfurl-image',
   attachment: 'a[href*="attachments"]',
   quote: 'blockquote.bbCodeBlock--quote',
   signature: '.message-signature',

@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         xf-thread-tools
 // @namespace    xf-thread-tools
-// @version      0.25.1
+// @version      0.25.2
 // @description  XenForo 2: sort thread posts by reaction count across all pages (cached) + floating media panel (images / external links).
 // @author       xf-thread-tools
 // @match        *://*/threads/*
@@ -47,6 +47,7 @@
     reactionsLink: 'a.reactionsBar-link',
     repliesHost: '.message-main',
     image: 'img.bbImage',
+    unfurlImage: 'img.bbCodeBlockUnfurl-image',
     attachment: 'a[href*="attachments"]',
     quote: 'blockquote.bbCodeBlock--quote',
     signature: '.message-signature',
@@ -250,6 +251,25 @@
       const nm = typeof j.name === 'string' ? j.name : (typeof j.title === 'string' ? j.title : '');
       return { children: children, lastPage: last, name: nm };
     } catch (e) { return null; }
+  }
+  
+  // pairUnfurlPosters (0.25.2): some hosts embed a video as a plain
+  // <video> tag preceded by XF's link-preview card, and the card's
+  // bbCodeBlockUnfurl-image IS the poster frame (the video file itself has
+  // no og:image to fetch). seq is a document-ordered flat walk of the post
+  // body — ['u', posterUrl, 'v', videoSrc, …] — collected by one combined
+  // querySelectorAll. A video pairs with the NEAREST PRECEDING unconsumed
+  // unfurl image (XF renders the card right before its video); an unfurl
+  // with no following video (image-host cards) is ignored, and a video with
+  // no preceding card stays posterless.
+  function pairUnfurlPosters(seq) {
+    const out = {};
+    let pending = '';
+    for (let i = 0; i + 1 < seq.length; i += 2) {
+      if (seq[i] === 'u') pending = seq[i + 1];
+      else if (seq[i] === 'v' && pending) { out[seq[i + 1]] = pending; pending = ''; }
+    }
+    return out;
   }
   /* ==== pure module: parse ==== */
   // parse: Pure parsing/classification: reaction-count text (EN/VI), link filtering, link partition/group/filter, post sorting, size estimation. (split from the single-file userscript; see scripts/modules.json)
@@ -1650,6 +1670,7 @@
         const images = [];
         const videos = [];
         const embeds = [];
+        let posters = undefined; // videoUrl -> unfurl-card poster (old records: undefined)
         const imgPages = {}; // embeddedUrl -> image landing page (/img/<id>)
         // Quoted content is a COPY of another post's media/links — collect only
         // what THIS post authored (probe 2026-10-29: 9 of 19 bbImage were inside
@@ -1700,6 +1721,25 @@
             if (!s || /^(data|blob):/i.test(s)) s = f.getAttribute('data-src') || '';
             if (/^https?:/i.test(s)) embeds.push(absolutize(s));
           });
+          // unfurl cards preceding a <video> carry the poster frame (hosts
+          // that embed a bare video tag + XF link-preview card — the video
+          // file itself has no og:image to fetch). One document-ordered walk
+          // pairs each video with its nearest preceding unconsumed card
+          // image; image-host cards without a following video are ignored.
+          const uSeq = [];
+          body.querySelectorAll(SEL.unfurlImage ? 'video, ' + SEL.unfurlImage : 'video').forEach((el) => {
+            if (skip(el)) return;
+            if (el.tagName === 'VIDEO') {
+              const srcEl = el.querySelector('source');
+              const s = (srcEl && srcEl.getAttribute('src')) || el.getAttribute('src') || '';
+              if (s) uSeq.push('v', absolutize(s));
+            } else {
+              let s = el.getAttribute('src') || '';
+              if (/^(data|blob):/i.test(s)) s = el.getAttribute('data-src') || el.getAttribute('data-url') || el.getAttribute('data-lazy-src') || '';
+              if (s && !isSmilieUrl(s)) uSeq.push('u', absolutize(s));
+            }
+          });
+          posters = pairUnfurlPosters(uSeq);
         }
         // XF2 attachment blocks (.message-attachments) sit OUTSIDE .bbWrapper —
         // scan the whole article; video-file attachments go to Videos by extension
@@ -1748,7 +1788,8 @@
           videos: Array.from(new Set(videos.filter(Boolean))),
           embeds: Array.from(new Set(embeds.filter(Boolean))),
           albums: albums.length ? Array.from(new Set(albums)) : undefined, // old records: undefined
-          imgPages: Object.keys(imgPages).length ? imgPages : undefined // old records: undefined
+          imgPages: Object.keys(imgPages).length ? imgPages : undefined, // old records: undefined
+          posters: posters && Object.keys(posters).length ? posters : undefined // old records: undefined
         };
       }
 
@@ -2333,7 +2374,7 @@
           thumb.className = 'xft-vtile';
           attachTilePoster(thumb, it.thumb);
         } else {
-          thumb = buildMediaEl(it.kind, it.url, true, (it.r.imgPages || {})[it.url] || '');
+          thumb = buildMediaEl(it.kind, it.url, true, (it.r.imgPages || {})[it.url] || '', it.poster || '');
         }
         // shimmer while the media loads (cached-complete images come back
         // already ok'd — no flash for them)
@@ -4851,7 +4892,7 @@
         }, { once: true });
       }
 
-      function buildMediaEl(kind, url, thumb, pageUrl) {
+      function buildMediaEl(kind, url, thumb, pageUrl, poster) {
         if (kind === 'embed') {
           // Embed thumbs: base no-fetch tile (hosts rate-limit, some embeds
           // autostart); the poster — parsed from the embed page's og:image —
@@ -4912,7 +4953,11 @@
             // moved-CDN directs). Same-host files never hit this.
             const tile = document.createElement('div');
             tile.className = 'xft-vtile';
-            if (isVideoPageUrl(url) || (VID_EXT_RE.test(url) && extractDomain(url) !== hostKey(location.host))) {
+            if (poster) {
+              // unfurl-card poster captured at extraction (video-file hosts
+              // with no og:image) — no per-video page fetch needed
+              attachTilePoster(tile, poster);
+            } else if (isVideoPageUrl(url) || (VID_EXT_RE.test(url) && extractDomain(url) !== hostKey(location.host))) {
               ensureEmbedPoster(url, (p) => setTimeout(() => attachTilePoster(tile, p), 0));
             }
             return tile;
@@ -4920,6 +4965,7 @@
           const v = document.createElement('video');
           v.controls = true;
           v.autoplay = true;
+          if (poster) v.setAttribute('poster', poster);
           armVideoAutoplay(v);
           // file-PAGE urls (host /v/ or /f/ pages carrying the media behind a
           // sign endpoint or page parse) resolve to the direct src first; the
@@ -5223,7 +5269,7 @@
         const v = document.createElement('div');
         v.id = 'xft-viewer';
         if (!nav) v.classList.add('xft-vwin'); // animate only a fresh open
-        const media = buildMediaEl(it.kind, it.url, false, it.page || '');
+        const media = buildMediaEl(it.kind, it.url, false, it.page || '', it.poster || '');
         // every viewer media sits in a FIXED-HEIGHT stage so paging next/prev
         // never shifts the bar/filmstrip; the slot inside is sized to the
         // image's own aspect once loaded (small images upscale to fill)
@@ -5260,7 +5306,7 @@
             const t = viewerItems[k];
             const th = document.createElement('div');
             th.className = 'xft-vthumb' + (k === viewerIndex ? ' xft-vthumb-active' : '');
-            th.appendChild(buildMediaEl(t.kind, t.url, true));
+            th.appendChild(buildMediaEl(t.kind, t.url, true, '', t.poster || ''));
             const idx = k;
             th.addEventListener('click', () => openViewerAt(idx));
             strip.appendChild(th);
@@ -5352,7 +5398,7 @@
         for (const r of d.orderedShown) {
           const push = (list, kind) => {
             for (const url of (list || [])) {
-              if (keep(url)) all.push({ r: r, url: String(url || ''), pos: d.posMap.get(r.postId) || 0, kind: kind, ord: raw });
+              if (keep(url)) all.push({ r: r, url: String(url || ''), pos: d.posMap.get(r.postId) || 0, kind: kind, poster: kind === 'video' ? ((r.posters || {})[String(url)]) || '' : '', ord: raw });
               raw++;
             }
           };
@@ -5453,7 +5499,7 @@
           }
           // album tiles open the host page in a tab, not the viewer — the
           // viewer walks media only; children are ordinary viewer items
-          viewerItems = items.filter((it) => it.kind !== 'album').map((it) => ({ kind: it.kind, url: it.url, postId: it.r.postId, pos: it.pos, author: it.r.author, page: (it.r.imgPages || {})[it.url] || '', album: it.album || '', thumb: it.thumb || '' }));
+          viewerItems = items.filter((it) => it.kind !== 'album').map((it) => ({ kind: it.kind, url: it.url, postId: it.r.postId, pos: it.pos, author: it.r.author, page: (it.r.imgPages || {})[it.url] || '', album: it.album || '', thumb: it.thumb || '', poster: it.poster || '' }));
         } else {
           let lord = 0; // explicit raw-stream position: orderItems' tie-break stays total here too (no NaN→+0 reliance on sort stability)
           for (const r of pd.orderedShown) {
@@ -6909,5 +6955,5 @@
       })();
   }
 // UMD export of the pure functions for node:test (no DOM / GM usage in them).
-  if (typeof module !== 'undefined' && module.exports) module.exports = { parseReactionCount, filterLinks, sortPosts, estimateSize, partitionLinks, extractDomain, groupLinkItems, applyLinkFilters, boilerplateUrls, isSmilieUrl, parseEmbedPoster, embedSignUrl, parseSignResponse, parseSignToken, parseVideoPage, isVideoPageUrl, isFileDPageUrl, embedViewApiUrl, parseViewApiResponse, isAlbumPageUrl, parseAlbumPage, parseAlbumApiResponse, hqCandidates, sanitizeFileSeg, siteTagFromHost, cleanThreadTitle, zipKindTag, zipFileName, imagePageHref, parseImagePage, parseImageApiResponse, dlBasename, buildDlJobs, dlChunkPlan, dlFailClass, crc32, zipStoreU8, layoutMetrics, windowRange, originBurstingFromHist, hostKey, dosDateTime, fmtSpeed, fmtEta, buildMediaLayout, htmlToText, buildAiTranscript, aiMessages, aiEndpoint, aiOllamaOrigin, aiNativeChatUrl, aiContextStats, aiNumCtx, aiTranscriptBudget, aiQueryTerms, aiScorePost, aiSearchPosts, parseAiModels, parseAiReply, mdInlineTokens, mdParse, aiSseParser, repliesSearchUrl, parseRepliesPage };
+  if (typeof module !== 'undefined' && module.exports) module.exports = { parseReactionCount, filterLinks, sortPosts, estimateSize, partitionLinks, extractDomain, groupLinkItems, applyLinkFilters, boilerplateUrls, isSmilieUrl, parseEmbedPoster, embedSignUrl, parseSignResponse, parseSignToken, parseVideoPage, isVideoPageUrl, isFileDPageUrl, embedViewApiUrl, parseViewApiResponse, isAlbumPageUrl, parseAlbumPage, parseAlbumApiResponse, hqCandidates, sanitizeFileSeg, siteTagFromHost, cleanThreadTitle, zipKindTag, zipFileName, imagePageHref, parseImagePage, parseImageApiResponse, dlBasename, buildDlJobs, dlChunkPlan, dlFailClass, crc32, zipStoreU8, layoutMetrics, windowRange, originBurstingFromHist, hostKey, dosDateTime, fmtSpeed, fmtEta, buildMediaLayout, htmlToText, buildAiTranscript, aiMessages, aiEndpoint, aiOllamaOrigin, aiNativeChatUrl, aiContextStats, aiNumCtx, aiTranscriptBudget, aiQueryTerms, aiScorePost, aiSearchPosts, parseAiModels, parseAiReply, mdInlineTokens, mdParse, aiSseParser, repliesSearchUrl, parseRepliesPage, pairUnfurlPosters };
 })();

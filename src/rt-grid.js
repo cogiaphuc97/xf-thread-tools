@@ -115,7 +115,7 @@
         thumb.className = 'xft-vtile';
         attachTilePoster(thumb, it.thumb);
       } else {
-        thumb = buildMediaEl(it.kind, it.url, true, (it.r.imgPages || {})[it.url] || '');
+        thumb = buildMediaEl(it.kind, it.url, true, (it.r.imgPages || {})[it.url] || '', it.poster || '');
       }
       // shimmer while the media loads (cached-complete images come back
       // already ok'd — no flash for them)

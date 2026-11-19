@@ -1,7 +1,7 @@
 // Unit tests for the media module (src/media.mjs). Regrouped to mirror the src/ split.
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { albumDisplayName, boilerplateUrls, hqCandidates, imagePageHref, isAlbumPageUrl, isSmilieUrl, parseAlbumApiResponse, parseAlbumPage, parseAlbumTitle, parseImageApiResponse, parseImagePage } from '../src/media.mjs';
+import { albumDisplayName, boilerplateUrls, hqCandidates, imagePageHref, isAlbumPageUrl, isSmilieUrl, pairUnfurlPosters, parseAlbumApiResponse, parseAlbumPage, parseAlbumTitle, parseImageApiResponse, parseImagePage } from '../src/media.mjs';
 
 
 // ---- boilerplateUrls (signature / "sent via app" footer fingerprint) ----
@@ -188,4 +188,28 @@ test('parseAlbumApiResponse: goonbox shape -> children + pagination', () => {
   // garbage
   assert.equal(parseAlbumApiResponse('<html>not json</html>'), null);
   assert.equal(parseAlbumApiResponse('{"images": null}'), null);
+});
+// ---- pairUnfurlPosters (unfurl-card poster pairing, 0.25.2) ----
+test('pairUnfurlPosters: card directly before its video pairs', () => {
+  const out = pairUnfurlPosters(['u', 'https://cdn.example/fr.jpeg', 'v', 'https://cdn.example/clip.webm']);
+  assert.deepEqual(out, { 'https://cdn.example/clip.webm': 'https://cdn.example/fr.jpeg' });
+});
+test('pairUnfurlPosters: interleaved cards pair 1:1 in document order', () => {
+  const out = pairUnfurlPosters([
+    'u', 'https://c/a.fr.jpeg', 'v', 'https://c/a.webm',
+    'u', 'https://c/b.fr.jpeg', 'v', 'https://c/b.webm'
+  ]);
+  assert.equal(out['https://c/a.webm'], 'https://c/a.fr.jpeg');
+  assert.equal(out['https://c/b.webm'], 'https://c/b.fr.jpeg');
+});
+test('pairUnfurlPosters: card with no following video is ignored; posterless video stays bare', () => {
+  const out = pairUnfurlPosters(['u', 'https://c/img.fr.jpeg', 'u', 'https://c/v.fr.jpeg', 'v', 'https://c/v.webm']);
+  assert.deepEqual(Object.keys(out), ['https://c/v.webm']);
+  assert.equal(out['https://c/v.webm'], 'https://c/v.fr.jpeg');
+  const out2 = pairUnfurlPosters(['v', 'https://c/x.webm']);
+  assert.deepEqual(out2, {});
+});
+test('pairUnfurlPosters: one card never feeds two videos (consumed on use)', () => {
+  const out = pairUnfurlPosters(['u', 'https://c/one.fr.jpeg', 'v', 'https://c/one.webm', 'v', 'https://c/two.webm']);
+  assert.deepEqual(Object.keys(out), ['https://c/one.webm']);
 });

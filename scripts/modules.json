@@ -53,7 +53,8 @@
         "parseAlbumPage",
         "parseAlbumTitle",
         "albumDisplayName",
-        "parseAlbumApiResponse"
+        "parseAlbumApiResponse",
+        "pairUnfurlPosters"
       ]
     },
     {

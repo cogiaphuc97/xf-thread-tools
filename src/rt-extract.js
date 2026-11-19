@@ -52,6 +52,7 @@
       const images = [];
       const videos = [];
       const embeds = [];
+      let posters = undefined; // videoUrl -> unfurl-card poster (old records: undefined)
       const imgPages = {}; // embeddedUrl -> image landing page (/img/<id>)
       // Quoted content is a COPY of another post's media/links — collect only
       // what THIS post authored (probe 2026-10-29: 9 of 19 bbImage were inside
@@ -102,6 +103,25 @@
           if (!s || /^(data|blob):/i.test(s)) s = f.getAttribute('data-src') || '';
           if (/^https?:/i.test(s)) embeds.push(absolutize(s));
         });
+        // unfurl cards preceding a <video> carry the poster frame (hosts
+        // that embed a bare video tag + XF link-preview card — the video
+        // file itself has no og:image to fetch). One document-ordered walk
+        // pairs each video with its nearest preceding unconsumed card
+        // image; image-host cards without a following video are ignored.
+        const uSeq = [];
+        body.querySelectorAll(SEL.unfurlImage ? 'video, ' + SEL.unfurlImage : 'video').forEach((el) => {
+          if (skip(el)) return;
+          if (el.tagName === 'VIDEO') {
+            const srcEl = el.querySelector('source');
+            const s = (srcEl && srcEl.getAttribute('src')) || el.getAttribute('src') || '';
+            if (s) uSeq.push('v', absolutize(s));
+          } else {
+            let s = el.getAttribute('src') || '';
+            if (/^(data|blob):/i.test(s)) s = el.getAttribute('data-src') || el.getAttribute('data-url') || el.getAttribute('data-lazy-src') || '';
+            if (s && !isSmilieUrl(s)) uSeq.push('u', absolutize(s));
+          }
+        });
+        posters = pairUnfurlPosters(uSeq);
       }
       // XF2 attachment blocks (.message-attachments) sit OUTSIDE .bbWrapper —
       // scan the whole article; video-file attachments go to Videos by extension
@@ -150,7 +170,8 @@
         videos: Array.from(new Set(videos.filter(Boolean))),
         embeds: Array.from(new Set(embeds.filter(Boolean))),
         albums: albums.length ? Array.from(new Set(albums)) : undefined, // old records: undefined
-        imgPages: Object.keys(imgPages).length ? imgPages : undefined // old records: undefined
+        imgPages: Object.keys(imgPages).length ? imgPages : undefined, // old records: undefined
+        posters: posters && Object.keys(posters).length ? posters : undefined // old records: undefined
       };
     }
 
