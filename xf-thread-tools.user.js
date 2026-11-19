@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         xf-thread-tools
 // @namespace    xf-thread-tools
-// @version      0.26.1
+// @version      0.26.2
 // @description  XenForo 2: sort thread posts by reaction count across all pages (cached) + floating media panel (images / external links).
 // @author       xf-thread-tools
 // @match        *://*/threads/*
@@ -5399,11 +5399,18 @@
         // while a fetch is in flight Refresh locks (no re-Refresh mid-run).
         // Stop is the inverse (0.21 user ask: disable what cannot act): Stop
         // ONLY works mid-fetch — abortRef halts the page walk into a partial
-        // — so it enables while busy and disables when idle. Resume stays
-        // hidden unless a stopped/incomplete run has data worth resuming.
+        // — so it enables while busy and disables when idle. Resume (0.26.2
+        // user ask): ENABLED only when a partial state exists (stopped run,
+        // cached-partial revisit, or an unfetched remainder with autoFetch
+        // off — exactly the states the partial note describes); DISABLED
+        // while busy or when the thread is complete; hidden only when there
+        // is no data at all.
         if (panelCancelBtn) panelCancelBtn.disabled = !busy;
         if (panelRefreshBtn) panelRefreshBtn.disabled = busy;
-        if (panelResumeBtn) panelResumeBtn.hidden = busy || hub.meta.complete || hub.records.size === 0;
+        if (panelResumeBtn) {
+          panelResumeBtn.hidden = hub.records.size === 0;
+          panelResumeBtn.disabled = busy || hub.meta.complete;
+        }
         // NOT disabled while pending: the second click cancels + sorts partial
         if (sorterPending) setSortBtn('⚡ ' + t + '…', false);
       }
