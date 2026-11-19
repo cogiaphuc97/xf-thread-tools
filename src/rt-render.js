@@ -101,7 +101,7 @@
       const items = panelSubTab === 'all' ? all
         : panelSubTab === 'album' ? all.filter((it) => it.album)
         : all.filter((it) => it.kind === panelSubTab || (panelSubTab === 'video' && it.kind === 'embed'));
-      // user-facing order (page / reaction count) applies to the filtered
+      // user-facing order (default / latest / reaction count) applies to the filtered
       // list AFTER counting — ord still stamps the RAW stream position and
       // row identity reconciles by URL, so reordering breaks nothing. The
       // download list and viewer derive from this same list: one sort, one

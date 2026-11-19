@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         xf-thread-tools
 // @namespace    xf-thread-tools
-// @version      0.23.3
+// @version      0.24.0
 // @description  XenForo 2: sort thread posts by reaction count across all pages (cached) + floating media panel (images / external links).
 // @author       xf-thread-tools
 // @match        *://*/threads/*
@@ -30,7 +30,7 @@
     basePath: '',                // '' = forum at site root; '/forum' for subpath installs
     forceAnimations: 0,          // 1 = run UI animations even under prefers-reduced-motion
     mediaGroup: 'flat',          // media grid grouping: flat | post | page | user
-    mediaOrder: 'page',          // panel item order: page | react (one control, media + links; 'default' removed 0.23.2 — page IS stream order)
+    mediaOrder: 'default',       // panel item order: default | latest | react (one control, media + links)
     selectors: {},               // per-site selector overrides, merged over BASE_SEL
     aiProvider: 'ollama',        // AI tab provider preset (Ollama-only phase; engine stays provider-generic)
     aiBase: '',                  // '' = provider preset base URL
@@ -428,22 +428,25 @@
     return { totalBytes: total, capBytes: cap, stopPersist: total > cap };
   }
   
-  // Panel item ordering (0.23.0): order the collected panel items — media
-  // tiles and links rows share one item shape { r, url, pos, kind, ord } —
-  // by source-post page number or reaction count. `r.pageN` (missing -> 1)
-  // and `r.reactionCount` (missing -> 0 — every item carries its post's
-  // count, zero-react posts included) come from the extraction record; ties
-  // break by `pos` (post position) then `ord` (raw stream position) so the
-  // sort is total and stable. Any other mode (undefined, or legacy 'default'
-  // saved pre-0.23.2 before the option was removed) returns the SAME
-  // reference untouched — the default render path stays allocation-free.
+  // Panel item ordering (0.23.0, modes 0.24.0): order the collected panel
+  // items — media tiles and links rows share one item shape
+  // { r, url, pos, kind, ord } — by source-post page number or reaction
+  // count. Modes: 'default' (stream order — returns the SAME reference,
+  // allocation-free), 'latest' (newest first: pageN DESC, then pos DESC,
+  // then ord DESC — the exact reverse of the default walk), 'react'
+  // (reactionCount DESC). `r.pageN` (missing -> 1) and `r.reactionCount`
+  // (missing -> 0 — every item carries its post's count, zero-react posts
+  // included) come from the extraction record; react ties break by `pos`
+  // then `ord` so the sort is total and stable. Any other mode (undefined,
+  // or legacy 'page' stored 0.23.2–0.23.3, coerced at settings load)
+  // returns the same reference untouched.
   function orderItems(items, mode) {
-    if (mode !== 'page' && mode !== 'react') return items;
+    if (mode !== 'latest' && mode !== 'react') return items;
     const val = (it) => it && it.r || {};
     const tie = (a, b) => (a.pos - b.pos) || (a.ord - b.ord);
-    const byPage = (a, b) => ((val(a).pageN || 1) - (val(b).pageN || 1)) || tie(a, b);
+    const byLatest = (a, b) => ((val(b).pageN || 1) - (val(a).pageN || 1)) || ((b.pos - a.pos) || (b.ord - a.ord));
     const byReact = (a, b) => ((val(b).reactionCount || 0) - (val(a).reactionCount || 0)) || tie(a, b);
-    return items.slice().sort(mode === 'page' ? byPage : byReact);
+    return items.slice().sort(mode === 'react' ? byReact : byLatest);
   }
   /* ==== pure module: embed ==== */
   // embed: Pure video-host carriers: embed poster parse, sign-endpoint URL/response shapes, view-API parse, video file-page carrier parse, /v/ /f/ /d/ URL shapes. (split from the single-file userscript; see scripts/modules.json)
@@ -1467,9 +1470,10 @@
       // drop bases that point at the old default so the UI shows one truth
       if (settings.aiProvider !== 'ollama') settings.aiProvider = 'ollama';
       if (settings.aiBase === 'https://api.openai.com/v1') settings.aiBase = '';
-      // 0.23.2: 'default' left the order select (page IS the default stream
-      // order) — coerce stale stored values so the select never shows a ghost
-      if (settings.mediaOrder !== 'page' && settings.mediaOrder !== 'react') settings.mediaOrder = 'page';
+      // 0.24.0 order modes are default | latest | react — coerce anything
+      // else (incl. 'page' stored 0.23.2–0.23.3) so the select never shows
+      // a ghost option
+      if (settings.mediaOrder !== 'default' && settings.mediaOrder !== 'latest' && settings.mediaOrder !== 'react') settings.mediaOrder = 'default';
       if (!settings.selectors || typeof settings.selectors !== 'object') settings.selectors = {};
       const SEL = Object.assign({}, BASE_SEL, settings.selectors);
 
@@ -5197,7 +5201,7 @@
         const items = panelSubTab === 'all' ? all
           : panelSubTab === 'album' ? all.filter((it) => it.album)
           : all.filter((it) => it.kind === panelSubTab || (panelSubTab === 'video' && it.kind === 'embed'));
-        // user-facing order (page / reaction count) applies to the filtered
+        // user-facing order (default / latest / reaction count) applies to the filtered
         // list AFTER counting — ord still stamps the RAW stream position and
         // row identity reconciles by URL, so reordering breaks nothing. The
         // download list and viewer derive from this same list: one sort, one
@@ -6209,9 +6213,9 @@
         ordSel.className = 'xft-ordsel';
         ordSel.title = 'Order items by';
         ordSel.setAttribute('aria-label', 'Order items by');
-        // 'Default' removed 0.23.2 — it was byte-identical to Page for
-        // contiguous frontiers; stored 'default' coerces to 'page' at load
-        for (const o of [['page', 'Sort: Page'], ['react', 'Sort: Reactions']]) {
+        // 0.24.0: Default (stream order) | Latest (newest page/post first,
+        // the reverse walk) | Reactions — 'page' renamed into Default
+        for (const o of [['default', 'Sort: Default'], ['latest', 'Sort: Latest'], ['react', 'Sort: Reactions']]) {
           const op = document.createElement('option');
           op.value = o[0];
           op.textContent = o[1];

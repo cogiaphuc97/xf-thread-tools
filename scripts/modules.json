@@ -17,7 +17,7 @@
     {
       "name": "parse",
       "file": "src/parse.mjs",
-      "desc": "Pure parsing/classification: reaction-count text (EN/VI + truncated badge shapes), link filtering, link partition/group/filter, post sorting, panel item ordering (page / reaction), size estimation.",
+      "desc": "Pure parsing/classification: reaction-count text (EN/VI + truncated badge shapes), link filtering, link partition/group/filter, post sorting, panel item ordering (default / latest / reaction), size estimation.",
       "symbols": [
         "OTHERS_RE",
         "PLUS_RE",

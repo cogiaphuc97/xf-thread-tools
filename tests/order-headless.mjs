@@ -116,7 +116,7 @@ async function main() {
     await cdp.send('Page.navigate', { url: fx.url });
     await sleep(1500);
 
-    await ev(cdp, `localStorage.setItem('xft_xfThreadTools:settings', JSON.stringify({ autoFetch: 1, delayMs: 120, rowCap: 500, forceAnimations: 1, mediaGroup: 'flat', mediaOrder: 'default' })); true`);
+    await ev(cdp, `localStorage.setItem('xft_xfThreadTools:settings', JSON.stringify({ autoFetch: 1, delayMs: 120, rowCap: 500, forceAnimations: 1, mediaGroup: 'flat', mediaOrder: 'page' })); true`);
     const inject = STUB + '\n' + readFileSync(new URL('../xf-thread-tools.user.js', import.meta.url), 'utf8');
     writeFileSync(TMP + '/inject.js', inject);
     const inj = await cdp.send('Runtime.evaluate', { expression: inject });
@@ -138,12 +138,12 @@ async function main() {
     const afterCount = await ev(cdp, `(() => { const t = [...document.querySelectorAll('#xft-panel .xft-tabs > *')]; const i = t.findIndex((e) => e.classList.contains('xft-count')); const s = t[i + 1]; return { i: i, next: s ? s.className : '', tag: s ? s.tagName : '' }; })()`);
     check('sort select sits in the tab row right of the item count', afterCount.i === 3 && afterCount.tag === 'SELECT' && /xft-ordsel/.test(afterCount.next), JSON.stringify(afterCount));
 
-    // 0.23.2: legacy stored 'default' coerces to 'page' — the select must
-    // never hold a value that no longer exists as an option
+    // 0.24.0: legacy stored 'page' (0.23.2–0.23.3) coerces to 'default' —
+    // the select must never hold a value that no longer exists as an option
     const ordVal = await ev(cdp, `(document.querySelector('#xft-panel .xft-ordsel')||{value:''}).value`);
-    check("legacy stored mediaOrder='default' migrates to 'page'", ordVal === 'page', ordVal);
+    check("legacy stored mediaOrder='page' migrates to 'default'", ordVal === 'default', ordVal);
     const optCount = await ev(cdp, `document.querySelectorAll('#xft-panel .xft-ordsel option').length`);
-    check('order select offers exactly Page + Reactions (no Default)', optCount === 2, 'options=' + optCount);
+    check('order select offers exactly Default + Latest + Reactions', optCount === 3, 'options=' + optCount);
 
     const cellNs = () => ev(cdp, `[...document.querySelectorAll('#xft-panel .xft-cell')].map((c) => parseInt((c.dataset.xftUrl.match(/\\/img\\/(\\d+)\\.png$/)||[0,0])[1], 10))`);
     const setOrder = async (mode) => {
@@ -151,23 +151,23 @@ async function main() {
       await sleep(700); // clearVRows + full remount
     };
 
-    // (a) boot default (page, migrated from seeded legacy 'default') = extraction order
+    // (a) boot default (migrated from seeded legacy 'page') = extraction order
     let ns = await cellNs();
-    check('AC-a: boot order (page) = extraction sequence', JSON.stringify(ns) === JSON.stringify(PAGE_ORDER), JSON.stringify(ns));
+    check('AC-a: boot order (default) = extraction sequence', JSON.stringify(ns) === JSON.stringify(PAGE_ORDER), JSON.stringify(ns));
 
     // (b) react order — also proves a mounted grid re-renders on select change
     await setOrder('react');
     ns = await cellNs();
     check('AC-b: react order = reaction count descending (re-rendered in place)', JSON.stringify(ns) === JSON.stringify(REACT_ORDER), 'got=' + JSON.stringify(ns) + ' want=' + JSON.stringify(REACT_ORDER));
 
-    // (c) page order
-    await setOrder('page');
+    // (c) latest order — newest page/post first (the reverse walk)
+    await setOrder('latest');
     ns = await cellNs();
-    check('AC-c: page order = page ascending', JSON.stringify(ns) === JSON.stringify(PAGE_ORDER), JSON.stringify(ns));
+    check('AC-c: latest order = reverse of extraction sequence', JSON.stringify(ns) === JSON.stringify(PAGE_ORDER.slice().reverse()), JSON.stringify(ns));
 
     // (d) persisted
     const saved = await ev(cdp, `JSON.parse(localStorage.getItem('xft_xfThreadTools:settings') || '{}').mediaOrder`);
-    check('selection persists to settings', saved === 'page', JSON.stringify(saved));
+    check('selection persists to settings', saved === 'latest', JSON.stringify(saved));
 
     // (e) Links tab follows the same control (set react while on Links)
     await ev(cdp, `[...document.querySelectorAll('#xft-panel .xft-tab')].find((b) => b.textContent === 'Links').click(); true`);

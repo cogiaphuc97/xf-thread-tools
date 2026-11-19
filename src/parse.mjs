@@ -177,20 +177,23 @@ export function estimateSize(totalBytes, capBytes) {
   return { totalBytes: total, capBytes: cap, stopPersist: total > cap };
 }
 
-// Panel item ordering (0.23.0): order the collected panel items — media
-// tiles and links rows share one item shape { r, url, pos, kind, ord } —
-// by source-post page number or reaction count. `r.pageN` (missing -> 1)
-// and `r.reactionCount` (missing -> 0 — every item carries its post's
-// count, zero-react posts included) come from the extraction record; ties
-// break by `pos` (post position) then `ord` (raw stream position) so the
-// sort is total and stable. Any other mode (undefined, or legacy 'default'
-// saved pre-0.23.2 before the option was removed) returns the SAME
-// reference untouched — the default render path stays allocation-free.
+// Panel item ordering (0.23.0, modes 0.24.0): order the collected panel
+// items — media tiles and links rows share one item shape
+// { r, url, pos, kind, ord } — by source-post page number or reaction
+// count. Modes: 'default' (stream order — returns the SAME reference,
+// allocation-free), 'latest' (newest first: pageN DESC, then pos DESC,
+// then ord DESC — the exact reverse of the default walk), 'react'
+// (reactionCount DESC). `r.pageN` (missing -> 1) and `r.reactionCount`
+// (missing -> 0 — every item carries its post's count, zero-react posts
+// included) come from the extraction record; react ties break by `pos`
+// then `ord` so the sort is total and stable. Any other mode (undefined,
+// or legacy 'page' stored 0.23.2–0.23.3, coerced at settings load)
+// returns the same reference untouched.
 export function orderItems(items, mode) {
-  if (mode !== 'page' && mode !== 'react') return items;
+  if (mode !== 'latest' && mode !== 'react') return items;
   const val = (it) => it && it.r || {};
   const tie = (a, b) => (a.pos - b.pos) || (a.ord - b.ord);
-  const byPage = (a, b) => ((val(a).pageN || 1) - (val(b).pageN || 1)) || tie(a, b);
+  const byLatest = (a, b) => ((val(b).pageN || 1) - (val(a).pageN || 1)) || ((b.pos - a.pos) || (b.ord - a.ord));
   const byReact = (a, b) => ((val(b).reactionCount || 0) - (val(a).reactionCount || 0)) || tie(a, b);
-  return items.slice().sort(mode === 'page' ? byPage : byReact);
+  return items.slice().sort(mode === 'react' ? byReact : byLatest);
 }

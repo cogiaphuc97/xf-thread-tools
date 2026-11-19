@@ -250,22 +250,25 @@ test('hostKey: port kept, garbage coerced to empty string', () => {
 // orderItems (0.23.0) — item shape { r, url, pos, kind, ord }
 const oit = (pageN, reactionCount, pos, ord) => ({ r: { pageN: pageN, reactionCount: reactionCount }, url: 'u' + pos + '_' + ord, pos: pos, kind: 'image', ord: ord });
 
-test('orderItems: default/unknown modes return the SAME reference, input never mutated', () => {
+test('orderItems: default/unknown/legacy-page modes return the SAME reference, input never mutated', () => {
   const items = [oit(2, 5, 3, 0), oit(1, 0, 1, 1)];
   assert.equal(orderItems(items, 'default'), items);
   assert.equal(orderItems(items, undefined), items);
   assert.equal(orderItems(items, 'bogus'), items);
+  assert.equal(orderItems(items, 'page'), items); // legacy 0.23.2–0.23.3 value, coerced at load
   const copy = items.slice();
   const sorted = orderItems(items, 'react');
   assert.deepEqual(items, copy); // input array untouched by the sort
   assert.notEqual(sorted, items);
 });
 
-test('orderItems: page mode sorts pageN asc (missing pageN = 1), ties by pos then ord', () => {
+test('orderItems: latest mode sorts pageN DESC (missing pageN = 1), ties by pos DESC then ord DESC', () => {
   const items = [oit(3, 99, 7, 0), oit(1, 0, 2, 1), oit(undefined, 0, 1, 2), oit(1, 5, 2, 3), oit(2, 0, 4, 4)];
-  const urls = orderItems(items, 'page').map((it) => it.url);
-  // page-1 group first: missing-pageN item (pos 1), then the two pos-2 items by ord, then page 2, page 3
-  assert.deepEqual(urls, ['u1_2', 'u2_1', 'u2_3', 'u4_4', 'u7_0']);
+  const urls = orderItems(items, 'latest').map((it) => it.url);
+  // exact reverse of the default walk: page 3 first, then page 2, then
+  // page-1 items with the LATER post first (pos 2 ord 3 before pos 2 ord 1,
+  // then the missing-pageN pos-1 item last)
+  assert.deepEqual(urls, ['u7_0', 'u4_4', 'u2_3', 'u2_1', 'u1_2']);
 });
 
 test('orderItems: react mode sorts reactionCount DESC (missing = 0), ties by pos then ord', () => {
