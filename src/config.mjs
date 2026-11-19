@@ -11,7 +11,7 @@ export const DEFAULT_SETTINGS = {
   basePath: '',                // '' = forum at site root; '/forum' for subpath installs
   forceAnimations: 0,          // 1 = run UI animations even under prefers-reduced-motion
   mediaGroup: 'flat',          // media grid grouping: flat | post | page | user
-  mediaOrder: 'default',       // panel item order: default | page | react (one control, media + links)
+  mediaOrder: 'page',          // panel item order: page | react (one control, media + links; 'default' removed 0.23.2 — page IS stream order)
   selectors: {},               // per-site selector overrides, merged over BASE_SEL
   aiProvider: 'ollama',        // AI tab provider preset (Ollama-only phase; engine stays provider-generic)
   aiBase: '',                  // '' = provider preset base URL

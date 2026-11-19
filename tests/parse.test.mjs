@@ -21,6 +21,29 @@ test('parseReactionCount: comma list + terminal "và" (VI) -> 3', () => {
   assert.equal(parseReactionCount('A, B và C'), 3);
 });
 
+// ---- parseReactionCount truncated-list / badge shapes (0.23.2) ----
+// the MOST-reacted post is the only one whose name list gets truncated;
+// custom styles badge the tail instead of the stock "and N others" phrase
+test('parseReactionCount: "+N" badge tail -> names + N', () => {
+  assert.equal(parseReactionCount('UserA, UserB +247'), 249);
+});
+
+test('parseReactionCount: ellipsis + "+N" tail -> ellipsis not a name', () => {
+  assert.equal(parseReactionCount('UserA, UserB, … +247'), 249);
+  assert.equal(parseReactionCount('UserA, UserB... +247'), 249);
+});
+
+test('parseReactionCount: bare count badge (no letters) -> that count', () => {
+  assert.equal(parseReactionCount('247'), 247);
+  assert.equal(parseReactionCount('❤ 247'), 247);
+});
+
+test('parseReactionCount: icon-only text -> 0; stock "and N others" unchanged', () => {
+  assert.equal(parseReactionCount('❤ ❤'), 0);
+  assert.equal(parseReactionCount('longdevilk3, thead, adidasphatt and 15 others'), 18);
+  assert.equal(parseReactionCount('Aman899'), 1); // letters present -> still a name list
+});
+
 test('parseReactionCount: one name + "và 5 người khác" (VI) -> 6', () => {
   assert.equal(parseReactionCount('X và 5 người khác'), 6);
 });

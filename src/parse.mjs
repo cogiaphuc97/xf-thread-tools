@@ -4,6 +4,11 @@ import { IMG_EXT_RE, VID_EXT_RE } from './media.mjs';
 
 // --- step 5: reaction count text parser (EN + VI), pure ---
 export const OTHERS_RE = /(?:and|và)\s+(\d+)\s+(?:others|người khác)\s*$/i;
+// truncated-list badge tail (custom styles): "UserA, UserB +247",
+// "UserA, UserB, … +247" — the name list is cut and the count rides a
+// "+N" suffix instead of the stock "and N others" phrase
+export const PLUS_RE = /(?:…|\.\.\.|,)?\s*\+\s*(\d+)\s*$/;
+export const ELLIPSIS_RE = /…|\.{3}/g;
 export const NAME_SEP_RE = /\s+(?:and|và)\s+/i;
 
 /**
@@ -12,19 +17,38 @@ export const NAME_SEP_RE = /\s+(?:and|và)\s+/i;
  * 'longdevilk3, thead, adidasphatt and 15 others'; VI: 'A, B và C', 'X và 5 người khác'.
  * Names are split on ',' and on terminal 'and'/'và'; a trailing
  * 'and|và N others|người khác' contributes N. Empty/null/no-bar input yields 0.
+ *
+ * 0.23.2 truncated-list shapes: the MOST-reacted post is the only one whose
+ * name list XF truncates — stock renders 'A, B and N others', but custom
+ * styles badge the tail as 'A, B +N' / 'A, B, … +N' or collapse to a bare
+ * count ('247', '❤ 247'). Without these, a 200-react post parses as 2-3
+ * and sorts to the bottom. A text with NO letters anywhere is treated as a
+ * bare count badge (a name list always carries letters); ellipsis tokens
+ * never count as names.
  */
 export function parseReactionCount(text) {
   if (text === null || text === undefined) return 0;
   const s = String(text).trim().replace(/\s+/g, ' ');
   if (!s) return 0;
+  // bare count badge: digits + icon/symbol noise only, no letters
+  if (!/[a-zà-ỹ]/i.test(s)) {
+    const digits = s.replace(/\D+/g, ' ').trim();
+    if (digits && digits.indexOf(' ') === -1) return parseInt(digits, 10) || 0;
+    return 0; // icon-only / symbol noise — no count to read
+  }
   let names = s;
   let others = 0;
   const m = s.match(OTHERS_RE);
+  const p = m ? null : s.match(PLUS_RE);
   if (m) {
     others = parseInt(m[1], 10) || 0;
     names = s.slice(0, m.index);
+  } else if (p) {
+    others = parseInt(p[1], 10) || 0;
+    names = s.slice(0, p.index);
   }
   let count = 0;
+  names = names.replace(ELLIPSIS_RE, ','); // truncation markers are not names
   for (const commaPart of names.split(',')) {
     for (const part of commaPart.split(NAME_SEP_RE)) {
       if (part.trim()) count += 1;
@@ -150,9 +174,9 @@ export function estimateSize(totalBytes, capBytes) {
 // and `r.reactionCount` (missing -> 0 — every item carries its post's
 // count, zero-react posts included) come from the extraction record; ties
 // break by `pos` (post position) then `ord` (raw stream position) so the
-// sort is total and stable. Any other mode (incl. 'default'/undefined)
-// returns the SAME reference untouched — the default render path stays
-// allocation-free.
+// sort is total and stable. Any other mode (undefined, or legacy 'default'
+// saved pre-0.23.2 before the option was removed) returns the SAME
+// reference untouched — the default render path stays allocation-free.
 export function orderItems(items, mode) {
   if (mode !== 'page' && mode !== 'react') return items;
   const val = (it) => it && it.r || {};

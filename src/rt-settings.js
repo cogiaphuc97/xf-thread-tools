@@ -47,6 +47,9 @@
     // drop bases that point at the old default so the UI shows one truth
     if (settings.aiProvider !== 'ollama') settings.aiProvider = 'ollama';
     if (settings.aiBase === 'https://api.openai.com/v1') settings.aiBase = '';
+    // 0.23.2: 'default' left the order select (page IS the default stream
+    // order) — coerce stale stored values so the select never shows a ghost
+    if (settings.mediaOrder !== 'page' && settings.mediaOrder !== 'react') settings.mediaOrder = 'page';
     if (!settings.selectors || typeof settings.selectors !== 'object') settings.selectors = {};
     const SEL = Object.assign({}, BASE_SEL, settings.selectors);
 

@@ -240,7 +240,9 @@
       ordSel.className = 'xft-ordsel';
       ordSel.title = 'Order items by';
       ordSel.setAttribute('aria-label', 'Order items by');
-      for (const o of [['default', 'Sort: Default'], ['page', 'Sort: Page'], ['react', 'Sort: Reactions']]) {
+      // 'Default' removed 0.23.2 — it was byte-identical to Page for
+      // contiguous frontiers; stored 'default' coerces to 'page' at load
+      for (const o of [['page', 'Sort: Page'], ['react', 'Sort: Reactions']]) {
         const op = document.createElement('option');
         op.value = o[0];
         op.textContent = o[1];

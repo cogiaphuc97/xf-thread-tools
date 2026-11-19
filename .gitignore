@@ -1,3 +1,6 @@
 .omc/
 progress.txt
 node_modules/
+.claude.local.md
+docs/
+*.png

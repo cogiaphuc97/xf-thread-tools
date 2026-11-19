@@ -138,15 +138,22 @@ async function main() {
     const afterCount = await ev(cdp, `(() => { const t = [...document.querySelectorAll('#xft-panel .xft-tabs > *')]; const i = t.findIndex((e) => e.classList.contains('xft-count')); const s = t[i + 1]; return { i: i, next: s ? s.className : '', tag: s ? s.tagName : '' }; })()`);
     check('sort select sits in the tab row right of the item count', afterCount.i === 3 && afterCount.tag === 'SELECT' && /xft-ordsel/.test(afterCount.next), JSON.stringify(afterCount));
 
+    // 0.23.2: legacy stored 'default' coerces to 'page' — the select must
+    // never hold a value that no longer exists as an option
+    const ordVal = await ev(cdp, `(document.querySelector('#xft-panel .xft-ordsel')||{value:''}).value`);
+    check("legacy stored mediaOrder='default' migrates to 'page'", ordVal === 'page', ordVal);
+    const optCount = await ev(cdp, `document.querySelectorAll('#xft-panel .xft-ordsel option').length`);
+    check('order select offers exactly Page + Reactions (no Default)', optCount === 2, 'options=' + optCount);
+
     const cellNs = () => ev(cdp, `[...document.querySelectorAll('#xft-panel .xft-cell')].map((c) => parseInt((c.dataset.xftUrl.match(/\\/img\\/(\\d+)\\.png$/)||[0,0])[1], 10))`);
     const setOrder = async (mode) => {
       await ev(cdp, `(() => { const s = document.querySelector('#xft-panel .xft-ordsel'); s.value = ${JSON.stringify(mode)}; s.dispatchEvent(new Event('change')); return true; })()`);
       await sleep(700); // clearVRows + full remount
     };
 
-    // (a) default = extraction order
+    // (a) boot default (page, migrated from seeded legacy 'default') = extraction order
     let ns = await cellNs();
-    check('AC-a: default order = extraction sequence', JSON.stringify(ns) === JSON.stringify(PAGE_ORDER), JSON.stringify(ns));
+    check('AC-a: boot order (page) = extraction sequence', JSON.stringify(ns) === JSON.stringify(PAGE_ORDER), JSON.stringify(ns));
 
     // (b) react order — also proves a mounted grid re-renders on select change
     await setOrder('react');
