@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         xf-thread-tools
 // @namespace    xf-thread-tools
-// @version      0.26.2
+// @version      0.26.3
 // @description  XenForo 2: sort thread posts by reaction count across all pages (cached) + floating media panel (images / external links).
 // @author       xf-thread-tools
 // @match        *://*/threads/*
@@ -5455,7 +5455,7 @@
         if (subTabBtns.all) subTabBtns.all.textContent = 'All ' + c.all;
         if (subTabBtns.image) subTabBtns.image.textContent = 'Image ' + c.image;
         if (subTabBtns.video) subTabBtns.video.textContent = 'Video ' + c.video;
-        if (subTabBtns.album) subTabBtns.album.textContent = 'Album ' + (c.album || 0);
+        if (subTabBtns.album) subTabBtns.album.textContent = 'Album ' + (c.albums || 0); // badge = album count, not child items (0.26.3)
         // Download affordance re-evaluates with the counts (0.21): an empty
         // active list means nothing to zip. Mid-run the button IS the stop
         // control, so it stays enabled while running.
@@ -5663,12 +5663,17 @@
           }
         }
         // embeds are videos hosted elsewhere — they count under the Video tab
-        const mediaCounts = { all: all.length, image: 0, video: 0, album: 0 };
+        const mediaCounts = { all: all.length, image: 0, video: 0, album: 0, albums: 0 };
+        const albumContainers = new Set();
         for (const it of all) {
-          if (it.kind === 'album') continue; // the album PAGE tile is navigation, not media
+          if (it.kind === 'album') { albumContainers.add(it.url); continue; } // the album PAGE tile is navigation, not media
           mediaCounts[it.kind === 'embed' ? 'video' : it.kind] += 1;
-          if (it.album) mediaCounts.album += 1; // expanded album children (Album sub-tab)
+          if (it.album) { mediaCounts.album += 1; albumContainers.add(it.album); } // expanded album children (Album sub-tab)
         }
+        // badge shows ALBUM COUNT (0.26.3): distinct containers — a tile and
+        // its expanded children share one number; `album` (children) still
+        // feeds the Download-empty gate
+        mediaCounts.albums = albumContainers.size;
         const items = panelSubTab === 'all' ? all
           : panelSubTab === 'album' ? all.filter((it) => it.album)
           : all.filter((it) => it.kind === panelSubTab || (panelSubTab === 'video' && it.kind === 'embed'));

@@ -197,6 +197,12 @@ async function main() {
     const albumTabUrls = await cellUrls(cdp);
     const onAlbumTab = albumTabUrls.filter((u) => /\/img\/e[12]\.png$/.test(u) || /\/vz\/e1_720p\.mp4$/.test(u) || /\/f\/slug90[123]$/.test(u)).length;
     check('US-002 children visible on the Album sub-tab', onAlbumTab === 6, JSON.stringify(albumTabUrls));
+    // 0.26.3: the Album badge counts ALBUMS (distinct containers), not
+    // child items — 4 albums here (ab12, erome1, gf1 + the unexpanded
+    // netfail tile) with 9 children
+    const badge = await ev(cdp, `[...document.querySelectorAll('.xft-subtab')].find((b) => /^Album/.test(b.textContent)).textContent`);
+    const albumTabTotal = albumTabUrls.length;
+    check('0.26.3 Album badge = album count, not item count', /^Album 4$/.test(badge) && albumTabTotal === 9, 'badge=' + JSON.stringify(badge) + ' items=' + albumTabTotal);
     await ev(cdp, `[...document.querySelectorAll('.xft-subtab')].find((b) => /^All/.test(b.textContent)).click(); true`);
     await sleep(400);
 

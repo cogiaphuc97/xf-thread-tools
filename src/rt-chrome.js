@@ -66,7 +66,7 @@
       if (subTabBtns.all) subTabBtns.all.textContent = 'All ' + c.all;
       if (subTabBtns.image) subTabBtns.image.textContent = 'Image ' + c.image;
       if (subTabBtns.video) subTabBtns.video.textContent = 'Video ' + c.video;
-      if (subTabBtns.album) subTabBtns.album.textContent = 'Album ' + (c.album || 0);
+      if (subTabBtns.album) subTabBtns.album.textContent = 'Album ' + (c.albums || 0); // badge = album count, not child items (0.26.3)
       // Download affordance re-evaluates with the counts (0.21): an empty
       // active list means nothing to zip. Mid-run the button IS the stop
       // control, so it stays enabled while running.
