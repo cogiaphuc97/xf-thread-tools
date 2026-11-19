@@ -5,9 +5,10 @@
     // hosts answer the page HTML itself (item grid inline); SPA hosts answer
     // an empty shell and serve the list from <origin>/api/albums/<id>. One
     // expansion per album per session (6h GM-storage cache, failures cool
-    // down 60s — never cached as empty). Fetches ride the shared 2-concurrent
-    // /350ms landing-page queue: a thread with dozens of albums must not
-    // burst the host the way the poster queue once did.
+    // down 60s — never cached as empty). Page-HTML fetches ride the shared
+    // 2-concurrent /350ms landing-page queue; the JSON API walk goes direct
+    // (one sequential request per page) because it must read HTTP status —
+    // 404/410 resolve the album, network errors retry.
     const ALBUMS_KEY = 'xfThreadTools:albumExpansions';
     const albumStore = readStore(ALBUMS_KEY, {}) || {};
     const albumChildren = new Map();  // albumUrl -> children[] (runtime mirror of the store)
@@ -91,15 +92,17 @@
         } catch (e) { /* fall through to fetch */ }
       }
       const ctl = new AbortController();
-      const t = setTimeout(() => { try { ctl.abort(); } catch (e) {} onErr(); }, 10000);
+      let fired = false; // abort's catch must not double-fire after a timeout
+      const err = () => { if (fired) return; fired = true; onErr(); };
+      const t = setTimeout(() => { try { ctl.abort(); } catch (e) {} err(); }, 10000);
       fetch(apiUrl, { signal: ctl.signal, credentials: 'omit' })
         .then(async (r) => {
           clearTimeout(t);
-          if (r.status === 404 || r.status === 410) { try { await r.text(); } catch (e) {} onGone(); }
+          if (r.status === 404 || r.status === 410) { try { await r.text(); } catch (e) {} if (fired) return; fired = true; onGone(); }
           else if (r.status >= 200 && r.status < 400) onOk(await r.text());
-          else onErr();
+          else err();
         })
-        .catch(() => { clearTimeout(t); onErr(); });
+        .catch(err);
     }
     // gofile-shaped SPA expansion (0.26 US-003): the /d/<id> page is an
     // empty shell; content lives at api.<registrable-domain> behind a
