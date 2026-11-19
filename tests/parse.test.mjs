@@ -21,6 +21,22 @@ test('parseReactionCount: comma list + terminal "và" (VI) -> 3', () => {
   assert.equal(parseReactionCount('A, B và C'), 3);
 });
 
+// ---- parseReactionCount thousands separators (0.23.3, live-observed) ----
+// XF number-formats the others count: EN comma, VI dot. Live element:
+// "1ofones, joedyhoeman, FelixLengyel12 and 1,007 others"
+test('parseReactionCount: "and 1,007 others" (EN comma) -> names + 1007', () => {
+  assert.equal(parseReactionCount('A, B, C and 1,007 others'), 1010);
+});
+
+test('parseReactionCount: "và 1.007 người khác" (VI dot) -> names + 1007', () => {
+  assert.equal(parseReactionCount('A, B và 1.007 người khác'), 1009);
+});
+
+test('parseReactionCount: separator count in badge/bare shapes too', () => {
+  assert.equal(parseReactionCount('1,007'), 1007);
+  assert.equal(parseReactionCount('UserA +1,007'), 1008);
+});
+
 // ---- parseReactionCount truncated-list / badge shapes (0.23.2) ----
 // the MOST-reacted post is the only one whose name list gets truncated;
 // custom styles badge the tail instead of the stock "and N others" phrase

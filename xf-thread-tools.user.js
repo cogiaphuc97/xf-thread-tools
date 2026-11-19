@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         xf-thread-tools
 // @namespace    xf-thread-tools
-// @version      0.23.2
+// @version      0.23.3
 // @description  XenForo 2: sort thread posts by reaction count across all pages (cached) + floating media panel (images / external links).
 // @author       xf-thread-tools
 // @match        *://*/threads/*
@@ -254,13 +254,16 @@
   // parse: Pure parsing/classification: reaction-count text (EN/VI), link filtering, link partition/group/filter, post sorting, size estimation. (split from the single-file userscript; see scripts/modules.json)
   
   // --- step 5: reaction count text parser (EN + VI), pure ---
-  const OTHERS_RE = /(?:and|và)\s+(\d+)\s+(?:others|người khác)\s*$/i;
+  // numbers carry XF's thousands separator (live 2026-11-19: "and 1,007
+  // others" — EN comma, VI dot); capture digits + separators, strip later
+  const OTHERS_RE = /(?:and|và)\s+(\d[\d.,]*)\s+(?:others|người khác)\s*$/i;
   // truncated-list badge tail (custom styles): "UserA, UserB +247",
   // "UserA, UserB, … +247" — the name list is cut and the count rides a
   // "+N" suffix instead of the stock "and N others" phrase
-  const PLUS_RE = /(?:…|\.\.\.|,)?\s*\+\s*(\d+)\s*$/;
+  const PLUS_RE = /(?:…|\.\.\.|,)?\s*\+\s*(\d[\d.,]*)\s*$/;
   const ELLIPSIS_RE = /…|\.{3}/g;
   const NAME_SEP_RE = /\s+(?:and|và)\s+/i;
+  const parseGroupedInt = (t) => parseInt(String(t).replace(/[\s.,]/g, ''), 10) || 0;
   
   /**
    * Parse an XF reactionsBar-link text into a reaction count.
@@ -276,6 +279,12 @@
    * and sorts to the bottom. A text with NO letters anywhere is treated as a
    * bare count badge (a name list always carries letters); ellipsis tokens
    * never count as names.
+   *
+   * 0.23.3 root cause (live element, 2026-11-19): XF number-formats the
+   * count — 'A, B and 1,007 others' (EN ',' / VI '.'). \d+ stopped at the
+   * separator, the others-phrase never matched, and '1,007 others' parsed
+   * as two more NAMES. Every 1000+ post has mis-sorted since 0.4.1; the
+   * badge shapes below are harmless extra robustness.
    */
   function parseReactionCount(text) {
     if (text === null || text === undefined) return 0;
@@ -283,8 +292,8 @@
     if (!s) return 0;
     // bare count badge: digits + icon/symbol noise only, no letters
     if (!/[a-zà-ỹ]/i.test(s)) {
-      const digits = s.replace(/\D+/g, ' ').trim();
-      if (digits && digits.indexOf(' ') === -1) return parseInt(digits, 10) || 0;
+      const digits = s.replace(/[^0-9]/g, '');
+      if (digits) return parseInt(digits, 10) || 0;
       return 0; // icon-only / symbol noise — no count to read
     }
     let names = s;
@@ -292,10 +301,10 @@
     const m = s.match(OTHERS_RE);
     const p = m ? null : s.match(PLUS_RE);
     if (m) {
-      others = parseInt(m[1], 10) || 0;
+      others = parseGroupedInt(m[1]);
       names = s.slice(0, m.index);
     } else if (p) {
-      others = parseInt(p[1], 10) || 0;
+      others = parseGroupedInt(p[1]);
       names = s.slice(0, p.index);
     }
     let count = 0;
