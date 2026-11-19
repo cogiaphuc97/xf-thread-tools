@@ -168,6 +168,16 @@ export function startFixtureServer({ pages = 30, perPage = 50, port = 0, imgUrl 
   let mainPort = 0, albumPort = 0;
   const albumHost = http.createServer((req, res) => {
     const u = new URL(req.url, 'http://127.0.0.1');
+    // CORS preflight (0.26 US-003): probe GM stubs are plain fetch — a
+    // cross-origin JSON POST (guest-account token) sends OPTIONS first
+    if (req.method === 'OPTIONS') {
+      ACAO(res);
+      res.setHeader('Access-Control-Allow-Methods', 'GET,POST,OPTIONS');
+      res.setHeader('Access-Control-Allow-Headers', 'content-type');
+      res.statusCode = 204;
+      res.end();
+      return;
+    }
     // cross-host media anchor for the links probe: a real PNG on the OTHER
     // origin — ext-matched anchor dual-lists (Links row + Media item)
     if (u.pathname.startsWith('/ximg/')) {
@@ -203,6 +213,56 @@ export function startFixtureServer({ pages = 30, perPage = 50, port = 0, imgUrl 
       const items = [901, 902, 903].map((i2) =>
         '<div class="theItem"><a title="img' + i2 + '.jpg" href="/f/slug' + i2 + '"><img src="' + main + '/img/' + i2 + '.png"></a></div>').join('');
       res.end('<!doctype html><html><head><title>album</title></head><body>' + items + '</body></html>');
+      return;
+    }
+    // 0.26 US-001: an album page with NO item markers at all — expansion
+    // resolves EMPTY and the tile must vanish (and its /api/albums/<id>
+    // fallback 404s like a host without a JSON API)
+    if (u.pathname === '/a/empty1') {
+      hits.set(u.pathname, (hits.get(u.pathname) || 0) + 1);
+      ACAO(res); res.setHeader('content-type', 'text/html; charset=utf-8');
+      res.end('<!doctype html><html><head><title>empty album</title></head><body><div class="media-group-none"></div></body></html>');
+      return;
+    }
+    // 0.26 US-002: erome-shaped server-rendered album (lightboxes: div.img
+    // data-src originals; videos with res-labelled sources + poster)
+    if (u.pathname === '/a/erome1') {
+      hits.set(u.pathname, (hits.get(u.pathname) || 0) + 1);
+      ACAO(res); res.setHeader('content-type', 'text/html; charset=utf-8');
+      const main = 'http://127.0.0.1:' + mainPort;
+      const img = (f) => '<div class="media-group" id="i' + f + '"><div class="img" data-src="' + main + '/img/e' + f + '.png"><div class="img-box"><img class="img-front" src="' + main + '/img/e' + f + '.png"></div></div></div>';
+      const vid = '<div class="media-group" id="v1"><div class="img" data-html="#video1"></div>' +
+        '<div class="video-lg" id="video1"><video poster="' + main + '/img/e9.png"><source src="' + main + '/vz/e1_720p.mp4" type=\'video/mp4\' label=\'HD\' res=\'720\'><source src="' + main + '/vz/e1_360p.mp4" type=\'video/mp4\' label=\'SD\' res=\'360\'></video></div>' +
+        '<div class="video"><video poster="' + main + '/img/e9.png"><source src="' + main + '/vz/e1_720p.mp4" type=\'video/mp4\' label=\'HD\' res=\'720\'></video></div></div>';
+      res.end('<!doctype html><html><head><title>erome-shaped album</title></head><body>' + img(1) + img(2) + vid + '</body></html>');
+      return;
+    }
+    // 0.26 US-003: gofile-shaped SPA album — empty shell page, guest-token
+    // accounts endpoint, contents API with a children map (one folder child
+    // the parser must skip)
+    if (u.pathname === '/d/gf1') {
+      hits.set(u.pathname, (hits.get(u.pathname) || 0) + 1);
+      ACAO(res); res.setHeader('content-type', 'text/html; charset=utf-8');
+      res.end('<!doctype html><html><head><title>gf</title></head><body><div id="app"></div><script src="/assets/app.js"></script></body></html>');
+      return;
+    }
+    if (u.pathname === '/accounts' && req.method === 'POST') {
+      hits.set('POST /accounts', (hits.get('POST /accounts') || 0) + 1);
+      ACAO(res); res.setHeader('content-type', 'application/json');
+      res.end('{"status":"ok","data":{"id":"acc1","tier":"guest","token":"fixture-token"}}');
+      return;
+    }
+    if (u.pathname === '/contents/gf1') {
+      hits.set(u.pathname, (hits.get(u.pathname) || 0) + 1);
+      ACAO(res); res.setHeader('content-type', 'application/json');
+      if (u.searchParams.get('wt') !== 'fixture-token') { res.statusCode = 401; res.end('{"status":"error"}'); return; }
+      const main = 'http://127.0.0.1:' + mainPort;
+      res.end(JSON.stringify({ status: 'ok', data: { id: 'gf1', name: 'gofile album', type: 'folder', children: {
+        i1: { id: 'i1', name: 'g1.png', type: 'file', mimetype: 'image/png', link: main + '/img/g1.png' },
+        i2: { id: 'i2', name: 'g2.png', type: 'file', mimetype: 'image/png', link: main + '/img/g2.png' },
+        v1: { id: 'v1', name: 'gv.mp4', type: 'file', mimeType: 'video/mp4', link: main + '/vz/gv.mp4' },
+        d1: { id: 'd1', name: 'sub', type: 'folder', link: 'https://app.example.io/d/sub' }
+      } } }));
       return;
     }
     res.statusCode = 404; res.end('nope');
@@ -288,7 +348,7 @@ export function startFixtureServer({ pages = 30, perPage = 50, port = 0, imgUrl 
   return Promise.all([listen(server, port), listen(albumHost, 0)]).then(([mp, ap]) => {
     mainPort = mp;
     albumPort = ap;
-    page = threadHtml(pages, perPage, (n, p) => (imgUrl || mixImg)(n, p, 'http://127.0.0.1:' + albumPort), reactCounts, richPosts);
+    page = threadHtml(pages, perPage, (n, p) => (imgUrl || mixImg)(n, p, 'http://127.0.0.1:' + albumPort), reactCounts, richPosts ? (n) => richPosts(n, 'http://127.0.0.1:' + albumPort) : null);
     return {
       port: mp,
       albumPort: ap,

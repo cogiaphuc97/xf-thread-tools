@@ -21,6 +21,7 @@
       const inAuto = mkField('auto fetch on load (1/0)', settings.autoFetch ? 1 : 0);
       const inAnim = mkField('force animations (1/0)', settings.forceAnimations ? 1 : 0);
       const inBase = mkField('base path (subpath installs)', settings.basePath);
+      const inAlbumHosts = mkField('album hosts (/d/ links, comma-separated)', (settings.albumHosts || []).join(', '));
       const save = mkBtn('Save', () => {
         const num = (v, def) => {
           const n = parseInt(v, 10);
@@ -32,6 +33,7 @@
         settings.autoFetch = parseInt(inAuto.value, 10) === 1 ? 1 : 0;
         settings.forceAnimations = parseInt(inAnim.value, 10) === 1 ? 1 : 0;
         settings.basePath = inBase.value.trim().replace(/\/+$/, '');
+        settings.albumHosts = inAlbumHosts.value.split(',').map((h) => h.trim().toLowerCase().replace(/^[*.]+/, '')).filter((h) => h.length >= 3 && /^[a-z0-9.*-]+$/.test(h));
         applyAnimOverride();
         saveSettings();
         wrap.hidden = true;

@@ -57,7 +57,9 @@
         // album links surface as their own tile (All tab); children join the
         // grid as normal items tagged with their album once expanded
         for (const a of (r.albums || [])) {
-          if (keep(a)) all.push({ r: r, url: String(a || ''), pos: d.posMap.get(r.postId) || 0, kind: 'album', ord: raw });
+          // resolved-empty albums (0.26) drop out of the grid entirely —
+          // the "album…" placeholder tile was eternal noise
+          if (keep(a) && !albumEmpty(a)) all.push({ r: r, url: String(a || ''), pos: d.posMap.get(r.postId) || 0, kind: 'album', ord: raw });
           raw++;
         }
       }

@@ -161,6 +161,34 @@ export function parseAlbumPage(html, baseUrl) {
     const th = b.match(/src="(https?:\/\/[^"]+)"/); // icons are relative — absolute srcs only
     out.push({ url: url, kind: kind, thumb: th ? unesc(th[1]) : '' });
   }
+  // ---- erome-shaped album pages (0.26 US-002): server-rendered lightbox
+  // markup. Images: <div class="img" data-src="FULL"> (data-src is the
+  // original; the inline img shares its URL — reuse it as the tile thumb,
+  // the thumb-cache caps it). Videos: <video poster=...><source src=...
+  // res='720'> — lightbox and inline players duplicate each video; dedupe
+  // by src, keep the highest-res source.
+  const seen = new Set(out.map((c) => c.url));
+  for (const m of h.matchAll(/<div\b[^>]*class="img"[^>]*data-src="(https?:\/\/[^"]+)"/g)) {
+    const u = unesc(m[1]);
+    if (!u || seen.has(u) || !IMG_EXT_RE.test(u)) continue;
+    seen.add(u);
+    out.push({ url: u, kind: 'image', thumb: u });
+  }
+  for (const m of h.matchAll(/<video\b([^>]*)>([\s\S]*?)<\/video>/g)) {
+    const attrs = m[1] || '';
+    const body = m[2] || '';
+    const pm = attrs.match(/poster="([^"]+)"/);
+    let best = '', bestRes = -1;
+    for (const s of body.matchAll(/<source\b[^>]*\ssrc="([^"]+)"[^>]*>/g)) {
+      const rm = s[0].match(/res=["'](\d+)["']/);
+      const res = rm ? parseInt(rm[1], 10) : 0;
+      if (res > bestRes || (res === bestRes && !best)) { best = unesc(s[1]); bestRes = res; }
+    }
+    if (best && !seen.has(best) && VID_EXT_RE.test(best)) {
+      seen.add(best);
+      out.push({ url: best, kind: 'video', thumb: pm ? unesc(pm[1]) : '' });
+    }
+  }
   return out;
 }
 
@@ -212,4 +240,78 @@ export function pairUnfurlPosters(seq) {
     else if (seq[i] === 'v' && pending) { out[seq[i + 1]] = pending; pending = ''; }
   }
   return out;
+}
+
+// ---- gofile-shaped SPA albums (0.26 US-003) ----
+// These hosts serve an empty app shell for /d/<id> and answer content from
+// a JSON API at api.<registrable-domain> with a guest-account token. The
+// /d/ path shape is shared with the file-page VIDEO adapter family, so
+// album routing is gated by a USER-SET host list (settings.albumHosts) —
+// the committed default is empty and carries no hostname.
+export function albumHostMatches(url, hosts) {
+  let h = '';
+  try { h = new URL(String(url || '')).hostname.toLowerCase(); } catch (e) { return false; }
+  if (!h) return false;
+  const list = Array.isArray(hosts) ? hosts : [];
+  for (const raw of list) {
+    const s = String(raw || '').trim().toLowerCase().replace(/^[*.]+/, '');
+    if (s && (h === s || h.slice(-(s.length + 1)) === '.' + s)) return true;
+  }
+  return false;
+}
+
+// pageUrl -> API origin: drop the first DNS label when the host has 3+
+// (app host -> registrable domain), then prefix api. No port kept: the
+// content API is a separate service, not the page origin.
+export function gofileApiOrigin(pageUrl) {
+  try {
+    const u = new URL(String(pageUrl || ''));
+    const parts = u.hostname.split('.');
+    const dom = parts.length > 2 ? parts.slice(-2).join('.') : u.hostname;
+    return u.protocol + '//api.' + dom;
+  } catch (e) { return ''; }
+}
+
+export function gofileAccountsUrl(apiOrigin) {
+  return String(apiOrigin || '').replace(/\/+$/, '') + '/accounts';
+}
+
+export function gofileContentsUrl(apiOrigin, contentId, token) {
+  return String(apiOrigin || '').replace(/\/+$/, '') + '/contents/' + encodeURIComponent(String(contentId || '')) + '?wt=' + encodeURIComponent(String(token || ''));
+}
+
+// POST /accounts response -> guest token ('' on any parse failure)
+export function parseGofileAccounts(text) {
+  try {
+    const j = JSON.parse(String(text || ''));
+    const tok = j && j.data && j.data.token;
+    return typeof tok === 'string' && tok ? tok : '';
+  } catch (e) { return ''; }
+}
+
+// GET /contents/<id> response -> {children:[{url,kind,thumb}], name} or
+// null on parse failure (caller treats null as a FETCH FAILURE, [] as a
+// resolved-empty album). Files only — folder children are skipped (nested
+// folders are rare in shared media links; v1 stays flat).
+export function parseGofileContents(text) {
+  try {
+    const j = JSON.parse(String(text || ''));
+    const d = j && j.data;
+    if (!d || typeof d !== 'object' || !d.children || typeof d.children !== 'object') return null;
+    const children = [];
+    for (const c of Object.values(d.children)) {
+      if (!c || c.type === 'folder') continue;
+      const link = typeof c.link === 'string' ? c.link : '';
+      if (!/^https?:\/\//.test(link)) continue;
+      const name = typeof c.name === 'string' ? c.name : '';
+      const mime = String(c.mimetype || c.mimeType || '');
+      let kind = '';
+      if (/^image\//i.test(mime)) kind = 'image';
+      else if (/^video\//i.test(mime)) kind = 'video';
+      else if (name) kind = VID_EXT_RE.test(name) ? 'video' : (IMG_EXT_RE.test(name) ? 'image' : '');
+      if (!kind) continue;
+      children.push({ url: link, kind: kind, thumb: '' });
+    }
+    return { children: children, name: typeof d.name === 'string' ? d.name : '' };
+  } catch (e) { return null; }
 }

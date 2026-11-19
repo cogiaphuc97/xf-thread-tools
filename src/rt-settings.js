@@ -43,6 +43,12 @@
 
     const settings = Object.assign({}, DEFAULT_SETTINGS, readStore(SETTINGS_KEY, {}));
     settings.aiKey = readAiKey();
+    // albumHosts (0.26): tolerate garbage — keep trimmed lowercase non-empty
+    // substrings only, so a mistyped settings blob can never break routing
+    if (!Array.isArray(settings.albumHosts)) settings.albumHosts = [];
+    settings.albumHosts = settings.albumHosts
+      .map((h) => String(h || '').trim().toLowerCase().replace(/^[*.]+/, ''))
+      .filter((h) => h.length >= 3 && /^[a-z0-9.*-]+$/.test(h));
     // Ollama-only phase: no provider picker — coerce stale stored presets and
     // drop bases that point at the old default so the UI shows one truth
     if (settings.aiProvider !== 'ollama') settings.aiProvider = 'ollama';

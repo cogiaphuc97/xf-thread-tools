@@ -35,6 +35,16 @@
           albumStore[url] = { children: children, at: Date.now(), name: albumMeta.get(url) || '' };
           saveAlbumStore();
         }
+      } else if (children && !children.length) {
+        // 0.26: a CONFIRMED-empty album (parse or full API walk ran, zero
+        // children) resolves empty instead of retrying forever — the tile
+        // drops from the grid for the TTL. Fetch FAILURES still cool down.
+        albumChildren.set(url, []);
+        if (name) albumMeta.set(url, name);
+        if (persist !== false) {
+          albumStore[url] = { children: [], at: Date.now(), name: albumMeta.get(url) || '', empty: true };
+          saveAlbumStore();
+        }
       } else {
         albumCooldown.set(url, Date.now() + 60000);
       }
@@ -58,6 +68,32 @@
       if (!id) { onErr(); return; }
       imgPageGet(origin + '/api/albums/' + encodeURIComponent(id) + '?per_page=100&page=' + page, onOk, onErr);
     }
+    // gofile-shaped SPA expansion (0.26 US-003): the /d/<id> page is an
+    // empty shell; content lives at api.<registrable-domain> behind a
+    // guest-account token (session-cached per API origin). Parsed failures
+    // are FETCH failures (cooldown); a valid folder with zero media is a
+    // resolved-empty album (US-001 semantics apply).
+    const gofileTokens = new Map(); // apiOrigin -> guest token
+    function expandGofileAlbum(url, onErr) {
+      const api = (typeof window !== 'undefined' && window.__XFT_GOFILE_API_FOR_TESTS) || gofileApiOrigin(url);
+      let id = '';
+      try { id = new URL(url).pathname.split('/').pop() || ''; } catch (e) {}
+      if (!api || !id) { onErr(); return; }
+      const walk = (token) => {
+        imgPageGet(gofileContentsUrl(api, id, token), (t) => {
+          const p = parseGofileContents(t);
+          if (!p) albumDone(url, null, true, ''); // parse failure -> cooldown
+          else albumDone(url, p.children, true, p.name);
+        }, onErr);
+      };
+      if (gofileTokens.has(api)) { walk(gofileTokens.get(api)); return; }
+      gmPostJson(gofileAccountsUrl(api), {}, (t) => {
+        const tok = parseGofileAccounts(t);
+        if (!tok) { albumDone(url, null, true, ''); return; }
+        gofileTokens.set(api, tok);
+        walk(tok);
+      }, onErr);
+    }
     function expandAlbum(url) {
       // HTML first: server-rendered hosts answer the full item grid in the
       // page (one request, children + thumbs together). An SPA shell (no
@@ -65,6 +101,11 @@
       imgPageGet(url, (text) => {
         const kids = parseAlbumPage(text, url);
         if (kids.length) { albumDone(url, kids, true, parseAlbumTitle(text)); return; }
+        // gofile-shaped SPA shell: content API walk, not the /api/albums one
+        if (isFileDPageUrl(url) && albumHostMatches(url, settings.albumHosts)) {
+          expandGofileAlbum(url, () => albumDone(url, null, true, ''));
+          return;
+        }
         const acc = [];
         const seen = new Set();
         let nm = '';
@@ -82,7 +123,11 @@
         };
         step(1);
       }, () => {
-        // page GET failed outright — still try the API before giving up
+        // page GET failed outright — gofile hosts still deserve the API try
+        if (isFileDPageUrl(url) && albumHostMatches(url, settings.albumHosts)) {
+          expandGofileAlbum(url, () => albumDone(url, null, true, ''));
+          return;
+        }
         fetchAlbumApiPage(url, 1, (t) => {
           const p = parseAlbumApiResponse(t);
           albumDone(url, p ? p.children : null, true, p ? p.name : '');
@@ -108,10 +153,12 @@
       const done = (c) => { if (cb) cb(c); };
       if (albumChildren.has(url)) { done(albumChildren.get(url)); return; }
       const st = albumStore[url];
-      if (st && Array.isArray(st.children) && st.children.length && Date.now() - (st.at || 0) < ALBUM_TTL_MS) {
+      if (st && Array.isArray(st.children) && (st.children.length || st.empty) && Date.now() - (st.at || 0) < ALBUM_TTL_MS) {
         albumChildren.set(url, st.children);
         if (st.name) albumMeta.set(url, st.name);
         done(st.children);
+        // warm-cache hit: one deferred re-render — full albums surface their
+        // children, resolved-empty albums drop their tile
         albumPrimeRender();
         return;
       }
@@ -125,4 +172,10 @@
     function albumLabelFor(url) {
       const s = String(url || '');
       return '[' + (extractDomain(s) || '?') + '] - ' + albumDisplayName(s, albumMeta.get(s));
+    }
+    // 0.26: an album whose expansion RESOLVED to zero children (not a fetch
+    // failure) is removed from the grid — collectMediaItems skips it.
+    function albumEmpty(url) {
+      const c = albumChildren.get(String(url || ''));
+      return !!c && c.length === 0;
     }

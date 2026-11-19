@@ -54,7 +54,13 @@
         "parseAlbumTitle",
         "albumDisplayName",
         "parseAlbumApiResponse",
-        "pairUnfurlPosters"
+        "pairUnfurlPosters",
+        "albumHostMatches",
+        "gofileApiOrigin",
+        "gofileAccountsUrl",
+        "gofileContentsUrl",
+        "parseGofileAccounts",
+        "parseGofileContents"
       ]
     },
     {

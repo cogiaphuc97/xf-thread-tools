@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         xf-thread-tools
 // @namespace    xf-thread-tools
-// @version      0.25.2
+// @version      0.26.0
 // @description  XenForo 2: sort thread posts by reaction count across all pages (cached) + floating media panel (images / external links).
 // @author       xf-thread-tools
 // @match        *://*/threads/*
@@ -31,6 +31,7 @@
     forceAnimations: 0,          // 1 = run UI animations even under prefers-reduced-motion
     mediaGroup: 'flat',          // media grid grouping: flat | post | page | user
     mediaOrder: 'default',       // panel item order: default | latest | react (one control, media + links)
+    albumHosts: [],              // hosts whose /d/<id> links are ALBUMS (SPA file hosts with an api.<domain> content API); /d/ otherwise stays video-page routed
     selectors: {},               // per-site selector overrides, merged over BASE_SEL
     aiProvider: 'ollama',        // AI tab provider preset (Ollama-only phase; engine stays provider-generic)
     aiBase: '',                  // '' = provider preset base URL
@@ -220,6 +221,34 @@
       const th = b.match(/src="(https?:\/\/[^"]+)"/); // icons are relative — absolute srcs only
       out.push({ url: url, kind: kind, thumb: th ? unesc(th[1]) : '' });
     }
+    // ---- erome-shaped album pages (0.26 US-002): server-rendered lightbox
+    // markup. Images: <div class="img" data-src="FULL"> (data-src is the
+    // original; the inline img shares its URL — reuse it as the tile thumb,
+    // the thumb-cache caps it). Videos: <video poster=...><source src=...
+    // res='720'> — lightbox and inline players duplicate each video; dedupe
+    // by src, keep the highest-res source.
+    const seen = new Set(out.map((c) => c.url));
+    for (const m of h.matchAll(/<div\b[^>]*class="img"[^>]*data-src="(https?:\/\/[^"]+)"/g)) {
+      const u = unesc(m[1]);
+      if (!u || seen.has(u) || !IMG_EXT_RE.test(u)) continue;
+      seen.add(u);
+      out.push({ url: u, kind: 'image', thumb: u });
+    }
+    for (const m of h.matchAll(/<video\b([^>]*)>([\s\S]*?)<\/video>/g)) {
+      const attrs = m[1] || '';
+      const body = m[2] || '';
+      const pm = attrs.match(/poster="([^"]+)"/);
+      let best = '', bestRes = -1;
+      for (const s of body.matchAll(/<source\b[^>]*\ssrc="([^"]+)"[^>]*>/g)) {
+        const rm = s[0].match(/res=["'](\d+)["']/);
+        const res = rm ? parseInt(rm[1], 10) : 0;
+        if (res > bestRes || (res === bestRes && !best)) { best = unesc(s[1]); bestRes = res; }
+      }
+      if (best && !seen.has(best) && VID_EXT_RE.test(best)) {
+        seen.add(best);
+        out.push({ url: best, kind: 'video', thumb: pm ? unesc(pm[1]) : '' });
+      }
+    }
     return out;
   }
   
@@ -270,6 +299,80 @@
       else if (seq[i] === 'v' && pending) { out[seq[i + 1]] = pending; pending = ''; }
     }
     return out;
+  }
+  
+  // ---- gofile-shaped SPA albums (0.26 US-003) ----
+  // These hosts serve an empty app shell for /d/<id> and answer content from
+  // a JSON API at api.<registrable-domain> with a guest-account token. The
+  // /d/ path shape is shared with the file-page VIDEO adapter family, so
+  // album routing is gated by a USER-SET host list (settings.albumHosts) —
+  // the committed default is empty and carries no hostname.
+  function albumHostMatches(url, hosts) {
+    let h = '';
+    try { h = new URL(String(url || '')).hostname.toLowerCase(); } catch (e) { return false; }
+    if (!h) return false;
+    const list = Array.isArray(hosts) ? hosts : [];
+    for (const raw of list) {
+      const s = String(raw || '').trim().toLowerCase().replace(/^[*.]+/, '');
+      if (s && (h === s || h.slice(-(s.length + 1)) === '.' + s)) return true;
+    }
+    return false;
+  }
+  
+  // pageUrl -> API origin: drop the first DNS label when the host has 3+
+  // (app host -> registrable domain), then prefix api. No port kept: the
+  // content API is a separate service, not the page origin.
+  function gofileApiOrigin(pageUrl) {
+    try {
+      const u = new URL(String(pageUrl || ''));
+      const parts = u.hostname.split('.');
+      const dom = parts.length > 2 ? parts.slice(-2).join('.') : u.hostname;
+      return u.protocol + '//api.' + dom;
+    } catch (e) { return ''; }
+  }
+  
+  function gofileAccountsUrl(apiOrigin) {
+    return String(apiOrigin || '').replace(/\/+$/, '') + '/accounts';
+  }
+  
+  function gofileContentsUrl(apiOrigin, contentId, token) {
+    return String(apiOrigin || '').replace(/\/+$/, '') + '/contents/' + encodeURIComponent(String(contentId || '')) + '?wt=' + encodeURIComponent(String(token || ''));
+  }
+  
+  // POST /accounts response -> guest token ('' on any parse failure)
+  function parseGofileAccounts(text) {
+    try {
+      const j = JSON.parse(String(text || ''));
+      const tok = j && j.data && j.data.token;
+      return typeof tok === 'string' && tok ? tok : '';
+    } catch (e) { return ''; }
+  }
+  
+  // GET /contents/<id> response -> {children:[{url,kind,thumb}], name} or
+  // null on parse failure (caller treats null as a FETCH FAILURE, [] as a
+  // resolved-empty album). Files only — folder children are skipped (nested
+  // folders are rare in shared media links; v1 stays flat).
+  function parseGofileContents(text) {
+    try {
+      const j = JSON.parse(String(text || ''));
+      const d = j && j.data;
+      if (!d || typeof d !== 'object' || !d.children || typeof d.children !== 'object') return null;
+      const children = [];
+      for (const c of Object.values(d.children)) {
+        if (!c || c.type === 'folder') continue;
+        const link = typeof c.link === 'string' ? c.link : '';
+        if (!/^https?:\/\//.test(link)) continue;
+        const name = typeof c.name === 'string' ? c.name : '';
+        const mime = String(c.mimetype || c.mimeType || '');
+        let kind = '';
+        if (/^image\//i.test(mime)) kind = 'image';
+        else if (/^video\//i.test(mime)) kind = 'video';
+        else if (name) kind = VID_EXT_RE.test(name) ? 'video' : (IMG_EXT_RE.test(name) ? 'image' : '');
+        if (!kind) continue;
+        children.push({ url: link, kind: kind, thumb: '' });
+      }
+      return { children: children, name: typeof d.name === 'string' ? d.name : '' };
+    } catch (e) { return null; }
   }
   /* ==== pure module: parse ==== */
   // parse: Pure parsing/classification: reaction-count text (EN/VI), link filtering, link partition/group/filter, post sorting, size estimation. (split from the single-file userscript; see scripts/modules.json)
@@ -1548,6 +1651,12 @@
 
       const settings = Object.assign({}, DEFAULT_SETTINGS, readStore(SETTINGS_KEY, {}));
       settings.aiKey = readAiKey();
+      // albumHosts (0.26): tolerate garbage — keep trimmed lowercase non-empty
+      // substrings only, so a mistyped settings blob can never break routing
+      if (!Array.isArray(settings.albumHosts)) settings.albumHosts = [];
+      settings.albumHosts = settings.albumHosts
+        .map((h) => String(h || '').trim().toLowerCase().replace(/^[*.]+/, ''))
+        .filter((h) => h.length >= 3 && /^[a-z0-9.*-]+$/.test(h));
       // Ollama-only phase: no provider picker — coerce stale stored presets and
       // drop bases that point at the old default so the UI shows one truth
       if (settings.aiProvider !== 'ollama') settings.aiProvider = 'ollama';
@@ -1770,7 +1879,14 @@
         const dual = parts.imageLinks.concat(parts.videoLinks); // re-routed anchors that keep link rows
         for (const u of parts.links) {
           const abs = absolutize(u);
-          if (isFileDPageUrl(abs) && extractDomain(abs) !== hostKey(location.host)) { videos.push(abs); dual.push(u); }
+          if (isFileDPageUrl(abs) && extractDomain(abs) !== hostKey(location.host)) {
+            // 0.26: SPA file hosts whose /d/<id> pages are ALBUM containers
+            // (user-set host list — /d/ is otherwise the video-page family).
+            // Host-match wins: a listed host never falls into the video
+            // resolver, so its links group/expand like /a/ albums.
+            if (albumHostMatches(abs, settings.albumHosts)) { albums.push(abs); dual.push(u); }
+            else { videos.push(abs); dual.push(u); }
+          }
           else if (isAlbumPageUrl(abs) && extractDomain(abs) !== hostKey(location.host)) { albums.push(abs); dual.push(u); }
           else restLinks.push(u);
         }
@@ -3393,6 +3509,16 @@
             albumStore[url] = { children: children, at: Date.now(), name: albumMeta.get(url) || '' };
             saveAlbumStore();
           }
+        } else if (children && !children.length) {
+          // 0.26: a CONFIRMED-empty album (parse or full API walk ran, zero
+          // children) resolves empty instead of retrying forever — the tile
+          // drops from the grid for the TTL. Fetch FAILURES still cool down.
+          albumChildren.set(url, []);
+          if (name) albumMeta.set(url, name);
+          if (persist !== false) {
+            albumStore[url] = { children: [], at: Date.now(), name: albumMeta.get(url) || '', empty: true };
+            saveAlbumStore();
+          }
         } else {
           albumCooldown.set(url, Date.now() + 60000);
         }
@@ -3416,6 +3542,32 @@
         if (!id) { onErr(); return; }
         imgPageGet(origin + '/api/albums/' + encodeURIComponent(id) + '?per_page=100&page=' + page, onOk, onErr);
       }
+      // gofile-shaped SPA expansion (0.26 US-003): the /d/<id> page is an
+      // empty shell; content lives at api.<registrable-domain> behind a
+      // guest-account token (session-cached per API origin). Parsed failures
+      // are FETCH failures (cooldown); a valid folder with zero media is a
+      // resolved-empty album (US-001 semantics apply).
+      const gofileTokens = new Map(); // apiOrigin -> guest token
+      function expandGofileAlbum(url, onErr) {
+        const api = (typeof window !== 'undefined' && window.__XFT_GOFILE_API_FOR_TESTS) || gofileApiOrigin(url);
+        let id = '';
+        try { id = new URL(url).pathname.split('/').pop() || ''; } catch (e) {}
+        if (!api || !id) { onErr(); return; }
+        const walk = (token) => {
+          imgPageGet(gofileContentsUrl(api, id, token), (t) => {
+            const p = parseGofileContents(t);
+            if (!p) albumDone(url, null, true, ''); // parse failure -> cooldown
+            else albumDone(url, p.children, true, p.name);
+          }, onErr);
+        };
+        if (gofileTokens.has(api)) { walk(gofileTokens.get(api)); return; }
+        gmPostJson(gofileAccountsUrl(api), {}, (t) => {
+          const tok = parseGofileAccounts(t);
+          if (!tok) { albumDone(url, null, true, ''); return; }
+          gofileTokens.set(api, tok);
+          walk(tok);
+        }, onErr);
+      }
       function expandAlbum(url) {
         // HTML first: server-rendered hosts answer the full item grid in the
         // page (one request, children + thumbs together). An SPA shell (no
@@ -3423,6 +3575,11 @@
         imgPageGet(url, (text) => {
           const kids = parseAlbumPage(text, url);
           if (kids.length) { albumDone(url, kids, true, parseAlbumTitle(text)); return; }
+          // gofile-shaped SPA shell: content API walk, not the /api/albums one
+          if (isFileDPageUrl(url) && albumHostMatches(url, settings.albumHosts)) {
+            expandGofileAlbum(url, () => albumDone(url, null, true, ''));
+            return;
+          }
           const acc = [];
           const seen = new Set();
           let nm = '';
@@ -3440,7 +3597,11 @@
           };
           step(1);
         }, () => {
-          // page GET failed outright — still try the API before giving up
+          // page GET failed outright — gofile hosts still deserve the API try
+          if (isFileDPageUrl(url) && albumHostMatches(url, settings.albumHosts)) {
+            expandGofileAlbum(url, () => albumDone(url, null, true, ''));
+            return;
+          }
           fetchAlbumApiPage(url, 1, (t) => {
             const p = parseAlbumApiResponse(t);
             albumDone(url, p ? p.children : null, true, p ? p.name : '');
@@ -3466,10 +3627,12 @@
         const done = (c) => { if (cb) cb(c); };
         if (albumChildren.has(url)) { done(albumChildren.get(url)); return; }
         const st = albumStore[url];
-        if (st && Array.isArray(st.children) && st.children.length && Date.now() - (st.at || 0) < ALBUM_TTL_MS) {
+        if (st && Array.isArray(st.children) && (st.children.length || st.empty) && Date.now() - (st.at || 0) < ALBUM_TTL_MS) {
           albumChildren.set(url, st.children);
           if (st.name) albumMeta.set(url, st.name);
           done(st.children);
+          // warm-cache hit: one deferred re-render — full albums surface their
+          // children, resolved-empty albums drop their tile
           albumPrimeRender();
           return;
         }
@@ -3483,6 +3646,12 @@
       function albumLabelFor(url) {
         const s = String(url || '');
         return '[' + (extractDomain(s) || '?') + '] - ' + albumDisplayName(s, albumMeta.get(s));
+      }
+      // 0.26: an album whose expansion RESOLVED to zero children (not a fetch
+      // failure) is removed from the grid — collectMediaItems skips it.
+      function albumEmpty(url) {
+        const c = albumChildren.get(String(url || ''));
+        return !!c && c.length === 0;
       }
   // rt-replies: per-post replies table (0.25.0). A "View replies" bar under
   // every post; first open asks the forum search (XF2 shape, q=post-<id>
@@ -5408,7 +5577,9 @@
           // album links surface as their own tile (All tab); children join the
           // grid as normal items tagged with their album once expanded
           for (const a of (r.albums || [])) {
-            if (keep(a)) all.push({ r: r, url: String(a || ''), pos: d.posMap.get(r.postId) || 0, kind: 'album', ord: raw });
+            // resolved-empty albums (0.26) drop out of the grid entirely —
+            // the "album…" placeholder tile was eternal noise
+            if (keep(a) && !albumEmpty(a)) all.push({ r: r, url: String(a || ''), pos: d.posMap.get(r.postId) || 0, kind: 'album', ord: raw });
             raw++;
           }
         }
@@ -5696,6 +5867,7 @@
         const inAuto = mkField('auto fetch on load (1/0)', settings.autoFetch ? 1 : 0);
         const inAnim = mkField('force animations (1/0)', settings.forceAnimations ? 1 : 0);
         const inBase = mkField('base path (subpath installs)', settings.basePath);
+        const inAlbumHosts = mkField('album hosts (/d/ links, comma-separated)', (settings.albumHosts || []).join(', '));
         const save = mkBtn('Save', () => {
           const num = (v, def) => {
             const n = parseInt(v, 10);
@@ -5707,6 +5879,7 @@
           settings.autoFetch = parseInt(inAuto.value, 10) === 1 ? 1 : 0;
           settings.forceAnimations = parseInt(inAnim.value, 10) === 1 ? 1 : 0;
           settings.basePath = inBase.value.trim().replace(/\/+$/, '');
+          settings.albumHosts = inAlbumHosts.value.split(',').map((h) => h.trim().toLowerCase().replace(/^[*.]+/, '')).filter((h) => h.length >= 3 && /^[a-z0-9.*-]+$/.test(h));
           applyAnimOverride();
           saveSettings();
           wrap.hidden = true;
@@ -6955,5 +7128,5 @@
       })();
   }
 // UMD export of the pure functions for node:test (no DOM / GM usage in them).
-  if (typeof module !== 'undefined' && module.exports) module.exports = { parseReactionCount, filterLinks, sortPosts, estimateSize, partitionLinks, extractDomain, groupLinkItems, applyLinkFilters, boilerplateUrls, isSmilieUrl, parseEmbedPoster, embedSignUrl, parseSignResponse, parseSignToken, parseVideoPage, isVideoPageUrl, isFileDPageUrl, embedViewApiUrl, parseViewApiResponse, isAlbumPageUrl, parseAlbumPage, parseAlbumApiResponse, hqCandidates, sanitizeFileSeg, siteTagFromHost, cleanThreadTitle, zipKindTag, zipFileName, imagePageHref, parseImagePage, parseImageApiResponse, dlBasename, buildDlJobs, dlChunkPlan, dlFailClass, crc32, zipStoreU8, layoutMetrics, windowRange, originBurstingFromHist, hostKey, dosDateTime, fmtSpeed, fmtEta, buildMediaLayout, htmlToText, buildAiTranscript, aiMessages, aiEndpoint, aiOllamaOrigin, aiNativeChatUrl, aiContextStats, aiNumCtx, aiTranscriptBudget, aiQueryTerms, aiScorePost, aiSearchPosts, parseAiModels, parseAiReply, mdInlineTokens, mdParse, aiSseParser, repliesSearchUrl, parseRepliesPage, pairUnfurlPosters };
+  if (typeof module !== 'undefined' && module.exports) module.exports = { parseReactionCount, filterLinks, sortPosts, estimateSize, partitionLinks, extractDomain, groupLinkItems, applyLinkFilters, boilerplateUrls, isSmilieUrl, parseEmbedPoster, embedSignUrl, parseSignResponse, parseSignToken, parseVideoPage, isVideoPageUrl, isFileDPageUrl, embedViewApiUrl, parseViewApiResponse, isAlbumPageUrl, parseAlbumPage, parseAlbumApiResponse, hqCandidates, sanitizeFileSeg, siteTagFromHost, cleanThreadTitle, zipKindTag, zipFileName, imagePageHref, parseImagePage, parseImageApiResponse, dlBasename, buildDlJobs, dlChunkPlan, dlFailClass, crc32, zipStoreU8, layoutMetrics, windowRange, originBurstingFromHist, hostKey, dosDateTime, fmtSpeed, fmtEta, buildMediaLayout, htmlToText, buildAiTranscript, aiMessages, aiEndpoint, aiOllamaOrigin, aiNativeChatUrl, aiContextStats, aiNumCtx, aiTranscriptBudget, aiQueryTerms, aiScorePost, aiSearchPosts, parseAiModels, parseAiReply, mdInlineTokens, mdParse, aiSseParser, repliesSearchUrl, parseRepliesPage, pairUnfurlPosters, albumHostMatches, gofileApiOrigin, gofileAccountsUrl, gofileContentsUrl, parseGofileAccounts, parseGofileContents };
 })();

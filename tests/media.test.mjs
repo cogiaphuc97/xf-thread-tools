@@ -1,7 +1,7 @@
 // Unit tests for the media module (src/media.mjs). Regrouped to mirror the src/ split.
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { albumDisplayName, boilerplateUrls, hqCandidates, imagePageHref, isAlbumPageUrl, isSmilieUrl, pairUnfurlPosters, parseAlbumApiResponse, parseAlbumPage, parseAlbumTitle, parseImageApiResponse, parseImagePage } from '../src/media.mjs';
+import { albumDisplayName, albumHostMatches, boilerplateUrls, gofileAccountsUrl, gofileApiOrigin, gofileContentsUrl, hqCandidates, imagePageHref, isAlbumPageUrl, isSmilieUrl, pairUnfurlPosters, parseAlbumApiResponse, parseAlbumPage, parseAlbumTitle, parseGofileAccounts, parseGofileContents, parseImageApiResponse, parseImagePage } from '../src/media.mjs';
 
 
 // ---- boilerplateUrls (signature / "sent via app" footer fingerprint) ----
@@ -212,4 +212,85 @@ test('pairUnfurlPosters: card with no following video is ignored; posterless vid
 test('pairUnfurlPosters: one card never feeds two videos (consumed on use)', () => {
   const out = pairUnfurlPosters(['u', 'https://c/one.fr.jpeg', 'v', 'https://c/one.webm', 'v', 'https://c/two.webm']);
   assert.deepEqual(Object.keys(out), ['https://c/one.webm']);
+});
+
+// ---- parseAlbumPage: erome shapes (0.26 US-002) ----
+test('parseAlbumPage: erome images (div.img data-src = original, reused as thumb)', () => {
+  const html = `<div class="media-group" id="1">
+    <div class="img" data-src="https://s20.example.com/9551/abc/tMr1.jpg?v=1"><div class="img-box"><img class="img-front" src="https://s20.example.com/9551/abc/tMr1.jpg?v=1"></div></div>
+  </div>
+  <div class="media-group" id="2">
+    <div class="img" data-src="https://s20.example.com/9551/abc/l7U2.png"><div class="img-box"><img class="img-back" src="https://s20.example.com/9551/abc/l7U2.png"></div></div>
+  </div>`;
+  const kids = parseAlbumPage(html, 'https://www.example.org/a/abc');
+  assert.equal(kids.length, 2);
+  assert.deepEqual(kids[0], { url: 'https://s20.example.com/9551/abc/tMr1.jpg?v=1', kind: 'image', thumb: 'https://s20.example.com/9551/abc/tMr1.jpg?v=1' });
+  assert.equal(kids[1].kind, 'image');
+});
+test('parseAlbumPage: erome videos pick highest-res source, poster as thumb, dedupe player copies', () => {
+  const html = `<div class="media-group" id="1">
+    <div class="img" data-html="#video1"></div>
+    <div class="video-lg" id="video1"><video poster="https://s93.example.com/9551/abc/v1.jpg"><source src="https://v60.example.com/9551/abc/v1_720p.mp4" type='video/mp4' label='HD' res='720'><source src="https://v60.example.com/9551/abc/v1_360p.mp4" type='video/mp4' label='SD' res='360'></video></div>
+    <div class="video"><video poster="https://s93.example.com/9551/abc/v1.jpg"><source src="https://v60.example.com/9551/abc/v1_720p.mp4" type='video/mp4' label='HD' res='720'></video></div>
+  </div>
+  <div class="media-group" id="2">
+    <div class="img" data-html="#video2"></div>
+    <div class="video"><video poster="https://s93.example.com/9551/abc/v2.jpg"><source src="https://v60.example.com/9551/abc/v2.webm" type='video/webm'></video></div>
+  </div>`;
+  const kids = parseAlbumPage(html, 'https://www.example.org/a/abc');
+  assert.equal(kids.length, 2);
+  assert.deepEqual(kids[0], { url: 'https://v60.example.com/9551/abc/v1_720p.mp4', kind: 'video', thumb: 'https://s93.example.com/9551/abc/v1.jpg' });
+  assert.deepEqual(kids[1], { url: 'https://v60.example.com/9551/abc/v2.webm', kind: 'video', thumb: 'https://s93.example.com/9551/abc/v2.jpg' });
+});
+test('parseAlbumPage: video-ref div.img (data-html) yields nothing; theItem path unaffected', () => {
+  const onlyRef = '<div class="img" data-html="#video9"></div>';
+  assert.deepEqual(parseAlbumPage(onlyRef, 'https://www.example.org/a/x'), []);
+  const item = '<div class="theItem"><a title="a.jpg" href="/f/slug1"><img src="https://x.example/t.png"></a></div>';
+  const kids = parseAlbumPage(item, 'https://www.example.org/a/x');
+  assert.equal(kids.length, 1);
+  assert.equal(kids[0].url, 'https://www.example.org/f/slug1');
+});
+
+// ---- gofile-shaped albums (0.26 US-003) ----
+test('albumHostMatches: exact, subdomain, wildcard-ish, non-match, garbage', () => {
+  assert.equal(albumHostMatches('https://app.example.io/d/abc', ['example.io']), true);
+  assert.equal(albumHostMatches('https://example.io/d/abc', ['example.io']), true);
+  assert.equal(albumHostMatches('https://www.example.io/d/abc', ['*.example.io']), true);
+  assert.equal(albumHostMatches('https://notexample.io/d/abc', ['example.io']), false);
+  assert.equal(albumHostMatches('https://example.io/d/abc', []), false);
+  assert.equal(albumHostMatches('https://example.io/d/abc', ['', '  ', 'x']), false);
+  assert.equal(albumHostMatches('not a url', ['example.io']), false);
+  assert.equal(albumHostMatches('https://example.io/d/abc', 'example.io'), false); // non-array tolerated
+});
+test('gofileApiOrigin: drops the first DNS label on 3+ label hosts, keeps ports out', () => {
+  assert.equal(gofileApiOrigin('https://app.example.io/d/abc'), 'https://api.example.io');
+  assert.equal(gofileApiOrigin('https://example.io/d/abc'), 'https://api.example.io');
+  assert.equal(gofileApiOrigin('https://example.io:8443/d/abc'), 'https://api.example.io');
+  assert.equal(gofileApiOrigin(''), '');
+});
+test('gofile URL builders', () => {
+  assert.equal(gofileAccountsUrl('https://api.example.io/'), 'https://api.example.io/accounts');
+  assert.equal(gofileContentsUrl('https://api.example.io', 'aBc/12', 'T K'), 'https://api.example.io/contents/aBc%2F12?wt=T%20K');
+});
+test('parseGofileAccounts / parseGofileContents', () => {
+  assert.equal(parseGofileAccounts('{"status":"ok","data":{"token":"tok123"}}'), 'tok123');
+  assert.equal(parseGofileAccounts('{"status":"error"}'), '');
+  assert.equal(parseGofileAccounts('not json'), '');
+  const j = JSON.stringify({ status: 'ok', data: { id: 'f1', name: 'folder name', type: 'folder', children: {
+    a: { id: 'a', name: 'pic1.jpg', type: 'file', mimetype: 'image/jpeg', link: 'https://store.example.io/dl/pic1.jpg' },
+    b: { id: 'b', name: 'clip.mp4', type: 'file', mimeType: 'video/mp4', link: 'https://store.example.io/dl/clip.mp4' },
+    c: { id: 'c', name: 'weird.bin', type: 'file', link: 'https://store.example.io/dl/weird.bin' },   // no kind -> skipped
+    d: { id: 'd', name: 'sub', type: 'folder', link: 'https://app.example.io/d/sub' },               // folder -> skipped
+    e: { id: 'e', name: 'noext.gif', type: 'file', link: 'rel/x.gif' }                                // relative -> skipped
+  } } });
+  const p = parseGofileContents(j);
+  assert.deepEqual(p.children, [
+    { url: 'https://store.example.io/dl/pic1.jpg', kind: 'image', thumb: '' },
+    { url: 'https://store.example.io/dl/clip.mp4', kind: 'video', thumb: '' }
+  ]);
+  assert.equal(p.name, 'folder name');
+  assert.equal(parseGofileContents('not json'), null);
+  assert.equal(parseGofileContents('{"status":"ok","data":{}}'), null); // data without children keys later? data exists, children missing -> {children:[],name:''}
+  const empty = parseGofileContents('{"status":"ok","data":{"children":{}}}');
+  assert.deepEqual(empty, { children: [], name: '' }); // resolved-empty album
 });

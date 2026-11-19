@@ -152,7 +152,14 @@
       const dual = parts.imageLinks.concat(parts.videoLinks); // re-routed anchors that keep link rows
       for (const u of parts.links) {
         const abs = absolutize(u);
-        if (isFileDPageUrl(abs) && extractDomain(abs) !== hostKey(location.host)) { videos.push(abs); dual.push(u); }
+        if (isFileDPageUrl(abs) && extractDomain(abs) !== hostKey(location.host)) {
+          // 0.26: SPA file hosts whose /d/<id> pages are ALBUM containers
+          // (user-set host list — /d/ is otherwise the video-page family).
+          // Host-match wins: a listed host never falls into the video
+          // resolver, so its links group/expand like /a/ albums.
+          if (albumHostMatches(abs, settings.albumHosts)) { albums.push(abs); dual.push(u); }
+          else { videos.push(abs); dual.push(u); }
+        }
         else if (isAlbumPageUrl(abs) && extractDomain(abs) !== hostKey(location.host)) { albums.push(abs); dual.push(u); }
         else restLinks.push(u);
       }
