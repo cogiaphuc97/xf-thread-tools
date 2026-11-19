@@ -94,11 +94,11 @@ function postHtml(n, imgs, reactCounts = null) {
     ? `<div class="reactionsBar js-reactionsList is-active"><a class="reactionsBar-link">${rc === 1 ? 'u1' : rc === 2 ? 'u1, u2' : 'u1, u2 and ' + fmt(rc - 2) + ' others'}</a></div>`
     : '<div class="reactionsBar js-reactionsList"></div>';
   return `<article class="message message--post" data-content="post-${n}">
-    <div class="message-inner"><div class="message-cell">
+    <div class="message-inner"><div class="message-cell"><div class="message-main js-quickEditTarget">
       <header><a class="username message-name">u${n % 17}</a></header>
       <div class="message-body"><div class="bbWrapper">${inner}</div></div>
       <footer>${bar}</footer>
-    </div></div>
+    </div></div></div>
   </article>`;
 }
 
@@ -127,6 +127,22 @@ export function threadHtml(pages, perPage, imgUrl, reactCounts = null) {
 <div class="pageContent">${navs}</div>
 <div class="block">${pagesHtml[pageNo - 1]}</div>
 </div></div></body></html>`;
+}
+
+// XF-shaped search result page for the replies lookup (0.25.0): rows carry
+// the stock contentRow anatomy the parser and the cloned feature select on.
+function searchHtml(k, ids) {
+  const rows = ids.map((id2, i2) =>
+    `<li class="block-row block-row--separated js-inlineModContainer" data-author="u${id2 % 17}">
+      <div class="contentRow"><div class="contentRow-main">
+        <h3 class="contentRow-title"><a href="/threads/777/post-${id2}/">fixture thread</a></h3>
+        <div class="contentRow-minor"><time class="u-dt" datetime="2026-01-0${id2 % 9 + 1}T0${id2 % 9}:1${id2 % 9}:00+00:00" data-time-string="0${id2 % 9}:11" dir="auto">Jan ${id2 % 9 + 1}, 2026</time></div>
+        <div class="contentRow-snippet">re: post-${k} &amp; agreed${i2 === 0 ? ' see https://example.net/x' : ''}</div>
+      </div></div>
+    </li>`).join('');
+  return `<!doctype html><html lang="en"><head><title>Search</title></head><body>
+  <div class="block"><div class="block-container"><ol class="block-body">${rows}</ol></div></div>
+  </body></html>`;
 }
 
 export function startFixtureServer({ pages = 30, perPage = 50, port = 0, imgUrl = null, reactCounts = null } = {}) {
@@ -244,6 +260,21 @@ export function startFixtureServer({ pages = 30, perPage = 50, port = 0, imgUrl 
       res.end(page(Math.min(pages, parseInt(pm[1] || '1', 10))));
       return;
     }
+    // replies lookup (0.25.0): XF search shape q=post-<id>&t=post&c[thread]
+    // — deterministic answers: post K is quoted by K+1 and K+2 when they
+    // exist; the K+1 row carries a URL in its snippet to exercise the
+    // DOM-safe linkifier. No pager => single result page.
+    if (u.pathname === '/search/1/') {
+      const q = u.searchParams;
+      const m2 = (q.get('q') || '').match(/^post-(\d+)$/);
+      const k = m2 ? parseInt(m2[1], 10) : 0;
+      const total = pages * perPage;
+      const ids = k > 0 ? [k + 1, k + 2].filter((id2) => id2 <= total) : [];
+      hits.set(u.pathname, (hits.get(u.pathname) || 0) + 1);
+      ACAO(res); res.setHeader('content-type', 'text/html; charset=utf-8');
+      res.end(searchHtml(k, ids));
+      return;
+    }
     // video file-page: og:image poster (absolute — parseEmbedPoster keeps only http(s) srcs)
     if (u.pathname === '/v/clip1.mp4') {
       hits.set(u.pathname, (hits.get(u.pathname) || 0) + 1);
@@ -262,6 +293,7 @@ export function startFixtureServer({ pages = 30, perPage = 50, port = 0, imgUrl 
       port: mp,
       albumPort: ap,
       url: `http://127.0.0.1:${mp}/threads/777/`,
+      searchHits: () => hits.get('/search/1/') || 0,
       stats: async () => { try { return await (await fetch(`http://127.0.0.1:${mp}/__stats`)).json(); } catch (e) { return {}; } },
       reset: () => fetch(`http://127.0.0.1:${mp}/__reset`).then(() => {}),
       close: () => Promise.all([new Promise((r) => server.close(r)), new Promise((r) => albumHost.close(r))])

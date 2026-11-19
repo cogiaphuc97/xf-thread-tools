@@ -300,6 +300,22 @@
         '.xft-pulse{outline:3px solid transparent;animation:xftpulse 1.6s ease-out 2}',
         '@keyframes xftpulse{0%{outline-color:hsl(38 92% 50%)}100%{outline-color:transparent}}',
         '#xft-sort-btn{margin-left:4px;cursor:pointer}',
+        // ---- per-post replies table (host-page surface) ----
+        '.xft-rbtn{display:block;width:100%;margin:8px 0 0;padding:6px 10px;cursor:pointer;font-size:12px;color:hsl(var(--xft-muted-fg));background:transparent;border:1px solid hsl(var(--xft-border)/.8);border-radius:var(--xft-radius)}',
+        '.xft-rbtn:hover{border-color:hsl(var(--xft-accent)/.6);color:hsl(var(--xft-accent))}',
+        '.xft-rwrap{margin:8px 0 2px;border:1px solid hsl(var(--xft-border)/.8);border-radius:var(--xft-radius);overflow:hidden;font-size:12px}',
+        '.xft-rwrap[hidden]{display:none!important}',
+        '.xft-rrow{display:grid;grid-template-columns:72px 132px 1fr;gap:8px;padding:6px 10px;align-items:baseline}',
+        '.xft-rrow+.xft-rrow{border-top:1px solid hsl(var(--xft-border)/.5)}',
+        '.xft-rrow:not(.xft-rhead):nth-child(even){background:hsl(var(--xft-muted)/.35)}',
+        '.xft-rhead{background:hsl(var(--xft-muted)/.4);color:hsl(var(--xft-muted-fg));font-weight:600;font-size:11px;letter-spacing:.02em}',
+        '.xft-rwrap a{color:hsl(var(--xft-accent));text-decoration:none}',
+        '.xft-rwrap a:hover{text-decoration:underline}',
+        '.xft-rnum{white-space:nowrap}',
+        '.xft-rdate{color:hsl(var(--xft-muted-fg));white-space:nowrap;overflow:hidden;text-overflow:ellipsis}',
+        '.xft-rsnip{min-width:0;word-break:break-word;color:hsl(var(--xft-fg))}',
+        '.xft-rload{padding:8px 10px;color:hsl(var(--xft-muted-fg))}',
+        '.xft-rmore{display:block;padding:5px 10px;font-size:11px;color:hsl(var(--xft-muted-fg));border-top:1px solid hsl(var(--xft-border)/.5)}',
         '@media (prefers-reduced-motion:reduce){html:not(.xft-anim-force) #xft-panel,html:not(.xft-anim-force) .xft-btn,html:not(.xft-anim-force) #xft-edge-btn,html:not(.xft-anim-force) .xft-cell{transition:none}html:not(.xft-anim-force) .xft-pulse{animation:none}html:not(.xft-anim-force) .xft-hq-top{transition:none}html:not(.xft-anim-force) .xft-dlzip .xft-dlprog>i{animation:none;background:hsl(var(--xft-ring))}html:not(.xft-anim-force) .xft-dlprog>i{transition:none}}'
       ].join('');
       document.head.appendChild(st);
@@ -346,6 +362,7 @@
       buildPanel();
       applyAnimOverride();
       updateProgressText();
+      attachRepliesButtons();
       // background full-thread fetch: starts on page load, resumes partials,
       // never waits for the user to open the panel (setting: autoFetch)
       if (settings.autoFetch && !hub.meta.complete && !currentRun) {

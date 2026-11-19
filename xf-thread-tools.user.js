@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         xf-thread-tools
 // @namespace    xf-thread-tools
-// @version      0.24.1
+// @version      0.25.0
 // @description  XenForo 2: sort thread posts by reaction count across all pages (cached) + floating media panel (images / external links).
 // @author       xf-thread-tools
 // @match        *://*/threads/*
@@ -45,6 +45,7 @@
     date: 'time[datetime]',
     reactionsBar: '.reactionsBar.js-reactionsList',
     reactionsLink: 'a.reactionsBar-link',
+    repliesHost: '.message-main',
     image: 'img.bbImage',
     attachment: 'a[href*="attachments"]',
     quote: 'blockquote.bbCodeBlock--quote',
@@ -1359,6 +1360,67 @@
       if (fallback < 0) fallback = i; // first startable non-urgent (FIFO)
     }
     return fallback;
+  }
+  /* ==== pure module: replies ==== */
+  // replies: pure helpers for the per-post replies lookup (0.25.0).
+  // "Who replied to this post?" has no local edge in XF2 — a quote is a
+  // rendered copy living in the REPLIER's body — so the forum's own search
+  // engine is the index: q=post-<id> scoped to the thread, date-sorted.
+  // The result page is parsed with regexes (no DOM) like parseImagePage.
+  
+  // Generic XF2 search wire shape (works on stock search):
+  //   <origin>/search/1/?q=post-<postId>&t=post&c[thread]=<threadId>&o=date
+  function repliesSearchUrl(origin, postId, threadId) {
+    const o = String(origin || '').replace(/\/+$/, '');
+    return o + '/search/1/?q=post-' + encodeURIComponent(postId) +
+      '&t=post&c[thread]=' + encodeURIComponent(threadId) + '&o=date';
+  }
+  
+  const REPLY_ROW_RE = /<li\b[^>]*class="[^"]*\bblock-row--separated\b[^"]*"[^>]*>[\s\S]*?<\/li>/g;
+  const POST_LINK_RE = /<a\b[^>]*href="([^"]*\/post-(\d+)[^"]*)"/;
+  const TIME_TAG_RE = /<time\b([^>]*)>([\s\S]*?)<\/time>/;
+  const DATETIME_RE = /datetime="([^"]*)"/;
+  const SNIPPET_RE = /<div\b[^>]*class="[^"]*\bcontentRow-snippet\b[^"]*"[^>]*>([\s\S]*?)<\/div>/;
+  const PAGENAV_RE = /class="[^"]*\bpageNav\b[^"]*"/;
+  
+  const REPLY_ENTITIES = { amp: '&', lt: '<', gt: '>', quot: '"', apos: "'", nbsp: ' ' };
+  function decodeReplyEntities(s) {
+    return String(s)
+      .replace(/&#x([0-9a-f]+);/gi, (_, h) => {
+        try { return String.fromCodePoint(parseInt(h, 16)); } catch (e) { return ''; }
+      })
+      .replace(/&#(\d+);/g, (_, d) => {
+        try { return String.fromCodePoint(parseInt(d, 10)); } catch (e) { return ''; }
+      })
+      .replace(/&([a-z]+);/gi, (m, name) => (name.toLowerCase() in REPLY_ENTITIES ? REPLY_ENTITIES[name.toLowerCase()] : m));
+  }
+  
+  // parseRepliesPage(html) -> { rows, more }
+  //   rows: [{ postId, href, date, dateIso, snippet }] in result order
+  //   (XF date sort = newest first). href stays as-written (usually relative);
+  //   the runtime absolutizes against the page origin. Rows whose post link
+  //   can't be found are skipped. `more` = a pager is present (we only ever
+  //   read page 1 — the footer links to the search for the rest).
+  function parseRepliesPage(html) {
+    const rows = [];
+    const s = String(html || '');
+    if (!s) return { rows, more: false };
+    for (const m of s.matchAll(REPLY_ROW_RE)) {
+      const chunk = m[0];
+      const link = chunk.match(POST_LINK_RE);
+      if (!link) continue;
+      const time = chunk.match(TIME_TAG_RE);
+      const dtm = time ? (time[1] || '').match(DATETIME_RE) : null;
+      const snip = chunk.match(SNIPPET_RE);
+      rows.push({
+        postId: link[2],
+        href: decodeReplyEntities(link[1]),
+        date: time ? decodeReplyEntities(time[2].replace(/<[^>]*>/g, '')).replace(/\s+/g, ' ').trim() : '',
+        dateIso: dtm ? dtm[1] : '',
+        snippet: snip ? decodeReplyEntities(snip[1].replace(/<[^>]*>/g, ' ')).replace(/\s+/g, ' ').trim() : ''
+      });
+    }
+    return { rows, more: PAGENAV_RE.test(s) };
   }
   /* ==== pure module: thumb ==== */
   // thumb: Pure preview-thumb cache math: identity key, LRU prune plan (hits-then-ts), downscale target (never upscale, aspect kept), gif detection, byte caps. No DOM, no GM_*. (split-era module for the 0.20.0 preview lifecycle; see scripts/modules.json)
@@ -3381,6 +3443,149 @@
         const s = String(url || '');
         return '[' + (extractDomain(s) || '?') + '] - ' + albumDisplayName(s, albumMeta.get(s));
       }
+  // rt-replies: per-post replies table (0.25.0). A "View replies" bar under
+  // every post; first open asks the forum search (XF2 shape, q=post-<id>
+  // scoped to the thread) for posts quoting that post and renders a
+  // Post # / Date / Reply table. Session-cached per post id; failures cool
+  // down 30s. Shape-based: host selector in BASE_SEL, URL from
+  // location.origin at runtime. Sorter clones (built from scratch in
+  // buildClone) never carry the button; sorter-moved ORIGINALS keep theirs.
+  const repliesCache = new Map();   // postId -> rows[]
+  const repliesCool = new Map();    // postId -> ms of last failure
+  const REPLIES_COOL_MS = 30000;
+
+  function attachRepliesButtons() {
+    for (const art of document.querySelectorAll(SEL.post)) {
+      const host = (SEL.repliesHost && art.querySelector(SEL.repliesHost)) || art;
+      if (host.querySelector('.xft-rbtn')) continue;
+      const dc = art.getAttribute('data-content') || '';
+      if (dc.indexOf('post-') !== 0) continue;
+      const pid = dc.slice(5);
+      const btn = document.createElement('button');
+      btn.type = 'button';
+      btn.className = 'xft-rbtn';
+      btn.dataset.xftPid = pid;
+      btn.textContent = 'View replies';
+      btn.addEventListener('click', () => onRepliesToggle(btn, host, pid));
+      host.appendChild(btn);
+    }
+  }
+
+  function onRepliesToggle(btn, host, pid) {
+    let wrap = host.querySelector('.xft-rwrap[data-xft-pid="' + pid + '"]');
+    if (wrap) {
+      const hidden = wrap.hasAttribute('hidden');
+      if (hidden) wrap.removeAttribute('hidden'); else wrap.setAttribute('hidden', '');
+      btn.textContent = hidden ? 'Hide replies' : 'View replies';
+      return;
+    }
+    wrap = document.createElement('div');
+    wrap.className = 'xft-rwrap';
+    wrap.dataset.xftPid = pid;
+    const load = document.createElement('div');
+    load.className = 'xft-rload';
+    load.textContent = 'Loading replies…';
+    wrap.appendChild(load);
+    host.appendChild(wrap);
+    btn.textContent = 'Hide replies';
+    if (repliesCache.has(pid)) { renderReplies(wrap, repliesCache.get(pid), false, ''); return; }
+    if (Date.now() - (repliesCool.get(pid) || 0) < REPLIES_COOL_MS) { renderRepliesError(wrap); return; }
+    const url = repliesSearchUrl(location.origin, pid, threadId);
+    let settled = false;
+    const done = (html) => {
+      if (settled) return; settled = true;
+      const parsed = parseRepliesPage(html);
+      // a post matching its own reference is not a reply to itself
+      const rows = parsed.rows.filter((r) => r.postId !== pid);
+      repliesCache.set(pid, rows);
+      renderReplies(wrap, rows, parsed.more, url);
+    };
+    const fail = () => {
+      if (settled) return; settled = true;
+      repliesCool.set(pid, Date.now());
+      renderRepliesError(wrap);
+    };
+    gmGetText(url, done, fail);
+  }
+
+  function renderReplies(wrap, rows, more, searchUrl) {
+    wrap.replaceChildren();
+    if (!rows.length) {
+      const empty = document.createElement('div');
+      empty.className = 'xft-rload';
+      empty.textContent = 'No replies found.';
+      wrap.appendChild(empty);
+      return;
+    }
+    const table = document.createElement('div');
+    table.className = 'xft-rtable';
+    const head = document.createElement('div');
+    head.className = 'xft-rrow xft-rhead';
+    for (const t of ['Post #', 'Date', 'Reply']) {
+      const c = document.createElement('span');
+      c.textContent = t;
+      head.appendChild(c);
+    }
+    table.appendChild(head);
+    for (const r of rows) {
+      const row = document.createElement('div');
+      row.className = 'xft-rrow';
+      const num = document.createElement('span');
+      num.className = 'xft-rnum';
+      const a = document.createElement('a');
+      try { a.href = new URL(r.href, location.origin).href; } catch (e) { a.href = r.href; }
+      a.textContent = '#' + r.postId;
+      a.target = '_blank';
+      a.rel = 'noopener noreferrer';
+      num.appendChild(a);
+      const dt = document.createElement('span');
+      dt.className = 'xft-rdate';
+      dt.textContent = r.date || '';
+      if (r.dateIso) dt.title = r.dateIso;
+      const sn = document.createElement('span');
+      sn.className = 'xft-rsnip';
+      appendLinkedText(sn, r.snippet);
+      row.append(num, dt, sn);
+      table.appendChild(row);
+    }
+    wrap.appendChild(table);
+    if (more && searchUrl) {
+      const m = document.createElement('a');
+      m.className = 'xft-rmore';
+      m.href = searchUrl;
+      m.target = '_blank';
+      m.rel = 'noopener noreferrer';
+      m.textContent = 'Older replies may exist — open search';
+      wrap.appendChild(m);
+    }
+  }
+
+  // text + http(s) links only — model output-style discipline: raw text never
+  // touches innerHTML, link hrefs locked to http(s) at parse time
+  function appendLinkedText(el, text) {
+    const URL_RE = /(https?:\/\/[^\s<>"']+)/g;
+    const s = String(text || '');
+    let last = 0, m;
+    while ((m = URL_RE.exec(s))) {
+      if (m.index > last) el.appendChild(document.createTextNode(s.slice(last, m.index)));
+      const a = document.createElement('a');
+      a.href = m[1];
+      a.target = '_blank';
+      a.rel = 'noopener noreferrer';
+      a.textContent = m[1];
+      el.appendChild(a);
+      last = m.index + m[1].length;
+    }
+    if (last < s.length) el.appendChild(document.createTextNode(s.slice(last)));
+  }
+
+  function renderRepliesError(wrap) {
+    wrap.replaceChildren();
+    const err = document.createElement('div');
+    err.className = 'xft-rload';
+    err.textContent = 'Replies unavailable — try again shortly.';
+    wrap.appendChild(err);
+  }
       let settingsView = null;
       let panelTab = 'files';
       let panelSubTab = 'all';        // media sub-tab: all | image | video | album
@@ -6629,6 +6834,22 @@
           '.xft-pulse{outline:3px solid transparent;animation:xftpulse 1.6s ease-out 2}',
           '@keyframes xftpulse{0%{outline-color:hsl(38 92% 50%)}100%{outline-color:transparent}}',
           '#xft-sort-btn{margin-left:4px;cursor:pointer}',
+          // ---- per-post replies table (host-page surface) ----
+          '.xft-rbtn{display:block;width:100%;margin:8px 0 0;padding:6px 10px;cursor:pointer;font-size:12px;color:hsl(var(--xft-muted-fg));background:transparent;border:1px solid hsl(var(--xft-border)/.8);border-radius:var(--xft-radius)}',
+          '.xft-rbtn:hover{border-color:hsl(var(--xft-accent)/.6);color:hsl(var(--xft-accent))}',
+          '.xft-rwrap{margin:8px 0 2px;border:1px solid hsl(var(--xft-border)/.8);border-radius:var(--xft-radius);overflow:hidden;font-size:12px}',
+          '.xft-rwrap[hidden]{display:none!important}',
+          '.xft-rrow{display:grid;grid-template-columns:72px 132px 1fr;gap:8px;padding:6px 10px;align-items:baseline}',
+          '.xft-rrow+.xft-rrow{border-top:1px solid hsl(var(--xft-border)/.5)}',
+          '.xft-rrow:not(.xft-rhead):nth-child(even){background:hsl(var(--xft-muted)/.35)}',
+          '.xft-rhead{background:hsl(var(--xft-muted)/.4);color:hsl(var(--xft-muted-fg));font-weight:600;font-size:11px;letter-spacing:.02em}',
+          '.xft-rwrap a{color:hsl(var(--xft-accent));text-decoration:none}',
+          '.xft-rwrap a:hover{text-decoration:underline}',
+          '.xft-rnum{white-space:nowrap}',
+          '.xft-rdate{color:hsl(var(--xft-muted-fg));white-space:nowrap;overflow:hidden;text-overflow:ellipsis}',
+          '.xft-rsnip{min-width:0;word-break:break-word;color:hsl(var(--xft-fg))}',
+          '.xft-rload{padding:8px 10px;color:hsl(var(--xft-muted-fg))}',
+          '.xft-rmore{display:block;padding:5px 10px;font-size:11px;color:hsl(var(--xft-muted-fg));border-top:1px solid hsl(var(--xft-border)/.5)}',
           '@media (prefers-reduced-motion:reduce){html:not(.xft-anim-force) #xft-panel,html:not(.xft-anim-force) .xft-btn,html:not(.xft-anim-force) #xft-edge-btn,html:not(.xft-anim-force) .xft-cell{transition:none}html:not(.xft-anim-force) .xft-pulse{animation:none}html:not(.xft-anim-force) .xft-hq-top{transition:none}html:not(.xft-anim-force) .xft-dlzip .xft-dlprog>i{animation:none;background:hsl(var(--xft-ring))}html:not(.xft-anim-force) .xft-dlprog>i{transition:none}}'
         ].join('');
         document.head.appendChild(st);
@@ -6675,6 +6896,7 @@
         buildPanel();
         applyAnimOverride();
         updateProgressText();
+        attachRepliesButtons();
         // background full-thread fetch: starts on page load, resumes partials,
         // never waits for the user to open the panel (setting: autoFetch)
         if (settings.autoFetch && !hub.meta.complete && !currentRun) {
@@ -6683,5 +6905,5 @@
       })();
   }
 // UMD export of the pure functions for node:test (no DOM / GM usage in them).
-  if (typeof module !== 'undefined' && module.exports) module.exports = { parseReactionCount, filterLinks, sortPosts, estimateSize, partitionLinks, extractDomain, groupLinkItems, applyLinkFilters, boilerplateUrls, isSmilieUrl, parseEmbedPoster, embedSignUrl, parseSignResponse, parseSignToken, parseVideoPage, isVideoPageUrl, isFileDPageUrl, embedViewApiUrl, parseViewApiResponse, isAlbumPageUrl, parseAlbumPage, parseAlbumApiResponse, hqCandidates, sanitizeFileSeg, siteTagFromHost, cleanThreadTitle, zipKindTag, zipFileName, imagePageHref, parseImagePage, parseImageApiResponse, dlBasename, buildDlJobs, dlChunkPlan, dlFailClass, crc32, zipStoreU8, layoutMetrics, windowRange, originBurstingFromHist, hostKey, dosDateTime, fmtSpeed, fmtEta, buildMediaLayout, htmlToText, buildAiTranscript, aiMessages, aiEndpoint, aiOllamaOrigin, aiNativeChatUrl, aiContextStats, aiNumCtx, aiTranscriptBudget, aiQueryTerms, aiScorePost, aiSearchPosts, parseAiModels, parseAiReply, mdInlineTokens, mdParse, aiSseParser };
+  if (typeof module !== 'undefined' && module.exports) module.exports = { parseReactionCount, filterLinks, sortPosts, estimateSize, partitionLinks, extractDomain, groupLinkItems, applyLinkFilters, boilerplateUrls, isSmilieUrl, parseEmbedPoster, embedSignUrl, parseSignResponse, parseSignToken, parseVideoPage, isVideoPageUrl, isFileDPageUrl, embedViewApiUrl, parseViewApiResponse, isAlbumPageUrl, parseAlbumPage, parseAlbumApiResponse, hqCandidates, sanitizeFileSeg, siteTagFromHost, cleanThreadTitle, zipKindTag, zipFileName, imagePageHref, parseImagePage, parseImageApiResponse, dlBasename, buildDlJobs, dlChunkPlan, dlFailClass, crc32, zipStoreU8, layoutMetrics, windowRange, originBurstingFromHist, hostKey, dosDateTime, fmtSpeed, fmtEta, buildMediaLayout, htmlToText, buildAiTranscript, aiMessages, aiEndpoint, aiOllamaOrigin, aiNativeChatUrl, aiContextStats, aiNumCtx, aiTranscriptBudget, aiQueryTerms, aiScorePost, aiSearchPosts, parseAiModels, parseAiReply, mdInlineTokens, mdParse, aiSseParser, repliesSearchUrl, parseRepliesPage };
 })();

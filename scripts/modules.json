@@ -158,6 +158,15 @@
       ]
     },
     {
+      "name": "replies",
+      "file": "src/replies.mjs",
+      "desc": "Pure per-post replies lookup: search URL shape (q=post-<id> scoped to thread, date sort) + regex parse of the XF search result rows (post link, u-dt time, contentRow-snippet, pager flag).",
+      "symbols": [
+        "repliesSearchUrl",
+        "parseRepliesPage"
+      ]
+    },
+    {
       "name": "thumb",
       "file": "src/thumb.mjs",
       "desc": "Pure preview-thumb cache math: identity key (hash-stripped, query kept), LRU prune plan (hits-then-ts), downscale target (never upscale, aspect kept), gif detection, byte caps.",
@@ -246,6 +255,12 @@
       "file": "src/rt-albums.js",
       "anchor": "ALBUMS_KEY",
       "desc": "Album expansion runtime: GM-storage store (TTL, prune), HTML/API walk, albumDone rerender, ensureAlbum lazy trigger."
+    },
+    {
+      "name": "rt-replies",
+      "file": "src/rt-replies.js",
+      "anchor": "repliesCache",
+      "desc": "Per-post replies table: View/Hide bar under each post, on-demand forum-search lookup (q=post-<id> scoped to thread) via gmGetText, session cache + failure cooldown, DOM-safe linkified rendering (Post # / Date / Reply)."
     },
     {
       "name": "rt-viewstate",

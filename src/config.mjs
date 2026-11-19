@@ -26,6 +26,7 @@ export const BASE_SEL = {
   date: 'time[datetime]',
   reactionsBar: '.reactionsBar.js-reactionsList',
   reactionsLink: 'a.reactionsBar-link',
+  repliesHost: '.message-main',
   image: 'img.bbImage',
   attachment: 'a[href*="attachments"]',
   quote: 'blockquote.bbCodeBlock--quote',
