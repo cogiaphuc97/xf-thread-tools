@@ -101,7 +101,7 @@ async function main() {
     pages: 1, perPage: 2,
     imgUrl: (n) => (n === 1 ? ['/img/1.png'] : n === 2 ? ['/img/2.png'] : null),
     richPosts: (n, albumOrigin) => (n === 1
-      ? '<a href="' + albumOrigin + '/a/ab12">album a</a><a href="' + albumOrigin + '/a/empty1">album b</a>'
+      ? '<a href="' + albumOrigin + '/a/ab12">album a</a><a href="' + albumOrigin + '/a/empty1">album b</a><a href="' + albumOrigin + '/a/netfail1">album c</a>'
       : n === 2
         ? '<a href="' + albumOrigin + '/a/erome1">erome album</a><a href="' + albumOrigin + '/d/gf1">gofile album</a>'
         : null)
@@ -159,6 +159,16 @@ async function main() {
     }
     check('US-001 empty album tile removed from grid', gone, JSON.stringify(urls));
     check('US-001 sibling album tile stays', stayed, JSON.stringify(urls));
+    // 0.26.1 regression: a NETWORK-level API failure (socket destroyed) is a
+    // cooldown failure, not a resolved-empty album — the tile must SURVIVE
+    let nfGone = true;
+    for (let i = 0; i < 30; i++) {
+      urls = await cellUrls(cdp);
+      nfGone = !urls.some((u) => /\/a\/netfail1$/.test(u));
+      if (!nfGone) break; // tile still there = pass; also give it a beat to (wrongly) drop
+      await sleep(300);
+    }
+    check('US-001 network-failed album tile SURVIVES (cooldown, not empty)', !nfGone, JSON.stringify(urls));
     // the sibling expands: children cells (3 files) appear
     let nKids = 0;
     for (let i = 0; i < 60; i++) {

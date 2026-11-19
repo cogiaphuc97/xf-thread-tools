@@ -224,6 +224,20 @@ export function startFixtureServer({ pages = 30, perPage = 50, port = 0, imgUrl 
       res.end('<!doctype html><html><head><title>empty album</title></head><body><div class="media-group-none"></div></body></html>');
       return;
     }
+    // 0.26.1 regression: network-level failure on the API walk (socket
+    // destroyed mid-flight) must NOT resolve the album empty — the tile
+    // stays on cooldown+retry
+    if (u.pathname === '/a/netfail1') {
+      hits.set(u.pathname, (hits.get(u.pathname) || 0) + 1);
+      ACAO(res); res.setHeader('content-type', 'text/html; charset=utf-8');
+      res.end('<!doctype html><html><head><title>netfail album</title></head><body></body></html>');
+      return;
+    }
+    if (u.pathname === '/api/albums/netfail1') {
+      hits.set(u.pathname, (hits.get(u.pathname) || 0) + 1);
+      try { res.destroy(); } catch (e) { try { res.socket.destroy(); } catch (e2) {} }
+      return;
+    }
     // 0.26 US-002: erome-shaped server-rendered album (lightboxes: div.img
     // data-src originals; videos with res-labelled sources + poster)
     if (u.pathname === '/a/erome1') {
@@ -265,7 +279,7 @@ export function startFixtureServer({ pages = 30, perPage = 50, port = 0, imgUrl 
       } } }));
       return;
     }
-    res.statusCode = 404; res.end('nope');
+    ACAO(res); res.statusCode = 404; res.end('nope'); // ACAO: cross-origin 404 status must be readable (real GM XHR ignores CORS)
   });
   let id = 0;
   const mixImg = (n) => {

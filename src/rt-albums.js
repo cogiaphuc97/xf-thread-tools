@@ -57,7 +57,15 @@
       if (panelIsOpen() && panelTab === 'media') { lastPanelSignature = ''; deferGridRebuild(); }
       for (const fn of q) fn(children && children.length ? children : null);
     }
-    function fetchAlbumApiPage(url, page, onOk, onErr) {
+    // Album API page fetch with STATUS split (0.26.1): 404/410 = the host
+    // has no such API (permanent — caller resolves the album, [] children
+    // = resolved-empty); network error / 5xx / timeout = transient (caller
+    // fails, cooldown + retry). Collapsing both into one onErr is what
+    // made a page-1 network failure read as "confirmed empty album" —
+    // and, inverted, made 404s read as transient. Direct GM/fetch (not
+    // imgPageGet): the queue hides HTTP status, and the walk is one
+    // sequential request per album page anyway.
+    function fetchAlbumApiPage(url, page, onOk, onErr, onGone) {
       let origin = '';
       let id = '';
       try {
@@ -66,7 +74,32 @@
         id = u.pathname.split('/').pop() || '';
       } catch (e) { onErr(); return; }
       if (!id) { onErr(); return; }
-      imgPageGet(origin + '/api/albums/' + encodeURIComponent(id) + '?per_page=100&page=' + page, onOk, onErr);
+      const apiUrl = origin + '/api/albums/' + encodeURIComponent(id) + '?per_page=100&page=' + page;
+      if (typeof GM_xmlhttpRequest === 'function') {
+        try {
+          GM_xmlhttpRequest({
+            method: 'GET', url: apiUrl, timeout: 10000,
+            onload: (r) => {
+              const st = r && r.status || 0;
+              if (st === 404 || st === 410) onGone();
+              else if (st >= 200 && st < 400) onOk(r && r.responseText || '');
+              else onErr();
+            },
+            onerror: onErr, ontimeout: onErr
+          });
+          return;
+        } catch (e) { /* fall through to fetch */ }
+      }
+      const ctl = new AbortController();
+      const t = setTimeout(() => { try { ctl.abort(); } catch (e) {} onErr(); }, 10000);
+      fetch(apiUrl, { signal: ctl.signal, credentials: 'omit' })
+        .then(async (r) => {
+          clearTimeout(t);
+          if (r.status === 404 || r.status === 410) { try { await r.text(); } catch (e) {} onGone(); }
+          else if (r.status >= 200 && r.status < 400) onOk(await r.text());
+          else onErr();
+        })
+        .catch(() => { clearTimeout(t); onErr(); });
     }
     // gofile-shaped SPA expansion (0.26 US-003): the /d/<id> page is an
     // empty shell; content lives at api.<registrable-domain> behind a
@@ -82,8 +115,13 @@
       const walk = (token) => {
         imgPageGet(gofileContentsUrl(api, id, token), (t) => {
           const p = parseGofileContents(t);
-          if (!p) albumDone(url, null, true, ''); // parse failure -> cooldown
-          else albumDone(url, p.children, true, p.name);
+          if (!p) {
+            // parse failure -> cooldown; the token may be stale/rotated —
+            // drop it so the post-cooldown retry re-authenticates instead
+            // of cooldown-looping all session
+            gofileTokens.delete(api);
+            albumDone(url, null, true, '');
+          } else albumDone(url, p.children, true, p.name);
         }, onErr);
       };
       if (gofileTokens.has(api)) { walk(gofileTokens.get(api)); return; }
@@ -119,7 +157,8 @@
             }
             if (p && page < p.lastPage) step(page + 1);
             else albumDone(url, acc, true, nm); // walked to the last page
-          }, () => albumDone(url, acc, false, nm)); // mid-walk error: session-only
+          }, () => albumDone(url, acc.length ? acc : null, false, nm), // network error: an EMPTY acc is a FAILURE (cooldown + retry), a partial acc stays session-only
+          () => albumDone(url, acc, true, nm)); // 404/410: no such API — [] resolves empty, a partial acc persists as the walk's end
         };
         step(1);
       }, () => {
@@ -131,7 +170,7 @@
         fetchAlbumApiPage(url, 1, (t) => {
           const p = parseAlbumApiResponse(t);
           albumDone(url, p ? p.children : null, true, p ? p.name : '');
-        }, () => albumDone(url, null, true, ''));
+        }, () => albumDone(url, null, true, ''), () => albumDone(url, [], true, '')); // API also 404s -> resolved-empty
       });
     }
     // warm-cache hits must also surface children: the first collect pass runs
