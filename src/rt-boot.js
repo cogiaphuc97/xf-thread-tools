@@ -301,21 +301,25 @@
         '@keyframes xftpulse{0%{outline-color:hsl(38 92% 50%)}100%{outline-color:transparent}}',
         '#xft-sort-btn{margin-left:4px;cursor:pointer}',
         // ---- per-post replies table (host-page surface) ----
-        '.xft-rbtn{display:block;width:100%;margin:8px 0 0;padding:6px 10px;cursor:pointer;font-size:12px;color:hsl(var(--xft-muted-fg));background:transparent;border:1px solid hsl(var(--xft-border)/.8);border-radius:var(--xft-radius)}',
-        '.xft-rbtn:hover{border-color:hsl(var(--xft-accent)/.6);color:hsl(var(--xft-accent))}',
-        '.xft-rwrap{margin:8px 0 2px;border:1px solid hsl(var(--xft-border)/.8);border-radius:var(--xft-radius);overflow:hidden;font-size:12px}',
+        // Host surface sits on the SITE's background, not the panel's — never
+        // paint text with --xft-* palette tokens here (they key off OS scheme
+        // and vanish when it disagrees with the site theme, e.g. dark site +
+        // dark tokens made hover text near-black). Derive from currentColor
+        // (page text color, contrasts by construction); links keep UA blue.
+        '.xft-rbtn{display:block;width:100%;margin:8px 0 0;padding:6px 10px;cursor:pointer;font-size:12px;color:inherit;opacity:.75;background:transparent;border:1px solid color-mix(in srgb,currentColor 35%,transparent);border-radius:var(--xft-radius)}',
+        '.xft-rbtn:hover{opacity:1;border-color:color-mix(in srgb,currentColor 80%,transparent)}',
+        '.xft-rwrap{margin:8px 0 2px;border:1px solid color-mix(in srgb,currentColor 35%,transparent);border-radius:var(--xft-radius);overflow:hidden;font-size:12px;color:inherit}',
         '.xft-rwrap[hidden]{display:none!important}',
         '.xft-rrow{display:grid;grid-template-columns:72px 132px 1fr;gap:8px;padding:6px 10px;align-items:baseline}',
-        '.xft-rrow+.xft-rrow{border-top:1px solid hsl(var(--xft-border)/.5)}',
-        '.xft-rrow:not(.xft-rhead):nth-child(even){background:hsl(var(--xft-muted)/.35)}',
-        '.xft-rhead{background:hsl(var(--xft-muted)/.4);color:hsl(var(--xft-muted-fg));font-weight:600;font-size:11px;letter-spacing:.02em}',
-        '.xft-rwrap a{color:hsl(var(--xft-accent));text-decoration:none}',
-        '.xft-rwrap a:hover{text-decoration:underline}',
+        '.xft-rrow+.xft-rrow{border-top:1px solid color-mix(in srgb,currentColor 14%,transparent)}',
+        '.xft-rrow:not(.xft-rhead):nth-child(even){background:color-mix(in srgb,currentColor 5%,transparent)}',
+        '.xft-rhead{background:color-mix(in srgb,currentColor 9%,transparent);color:inherit;font-weight:600;font-size:11px;letter-spacing:.02em}',
+        '.xft-rwrap a{text-decoration:underline}',
         '.xft-rnum{white-space:nowrap}',
-        '.xft-rdate{color:hsl(var(--xft-muted-fg));white-space:nowrap;overflow:hidden;text-overflow:ellipsis}',
-        '.xft-rsnip{min-width:0;word-break:break-word;color:hsl(var(--xft-fg))}',
-        '.xft-rload{padding:8px 10px;color:hsl(var(--xft-muted-fg))}',
-        '.xft-rmore{display:block;padding:5px 10px;font-size:11px;color:hsl(var(--xft-muted-fg));border-top:1px solid hsl(var(--xft-border)/.5)}',
+        '.xft-rdate{color:inherit;opacity:.7;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}',
+        '.xft-rsnip{min-width:0;word-break:break-word;color:inherit}',
+        '.xft-rload{padding:8px 10px;color:inherit;opacity:.7}',
+        '.xft-rmore{display:block;padding:5px 10px;font-size:11px;border-top:1px solid color-mix(in srgb,currentColor 14%,transparent)}',
         '@media (prefers-reduced-motion:reduce){html:not(.xft-anim-force) #xft-panel,html:not(.xft-anim-force) .xft-btn,html:not(.xft-anim-force) #xft-edge-btn,html:not(.xft-anim-force) .xft-cell{transition:none}html:not(.xft-anim-force) .xft-pulse{animation:none}html:not(.xft-anim-force) .xft-hq-top{transition:none}html:not(.xft-anim-force) .xft-dlzip .xft-dlprog>i{animation:none;background:hsl(var(--xft-ring))}html:not(.xft-anim-force) .xft-dlprog>i{transition:none}}'
       ].join('');
       document.head.appendChild(st);

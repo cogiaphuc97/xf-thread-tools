@@ -122,6 +122,12 @@ async function main() {
     const inHost = await ev(cdp, `[...document.querySelectorAll('.xft-rbtn')].every((b) => !!b.closest('.message-main'))`);
     check('view-replies bar under every post (4)', nBtns === 4 && inHost, 'btns=' + nBtns);
 
+    // host-surface theme guard: button text derives from the PAGE's text
+    // color (currentColor), never a --xft-* palette token — token-keyed text
+    // vanished on hover on dark sites (0.25.0 bug, fixed 0.25.1)
+    const inheritOk = await ev(cdp, `[...document.querySelectorAll('.xft-rbtn')].every((b) => getComputedStyle(b).color === getComputedStyle(b.parentElement).color)`);
+    check('button text color = inherited page color (theme-safe)', inheritOk, 'inherit=' + inheritOk);
+
     // click post 1's bar -> fetch + table
     await ev(cdp, `[...document.querySelectorAll('.xft-rbtn')].find((b) => b.dataset.xftPid === '1').click(); true`);
     let rows = null;
