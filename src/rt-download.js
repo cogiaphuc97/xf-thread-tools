@@ -403,7 +403,7 @@
             // a "file" that is really an HTML page (direct URL 301'd to a
             // landing page, e.g. bunkr cdn -> /f/): re-resolve through the
             // page carrier ONCE instead of zipping HTML as media
-            dlSniffHtml(r.blob).then((isHtml) => {
+            dlSniffHtml(r.blob).then(async (isHtml) => {
               if (dlRun.cancel || ctx.killed || ctx.released) { release(); return; }
               if (isHtml && !job.movedPage) {
                 job.movedPage = true;
@@ -422,18 +422,38 @@
               // with a reason instead (0.20.0 at least said "size cap
               // reached"; per-part splitting cannot help one huge file)
               if (r.blob.size > 0xFFFFFFF0) { failWith('file exceeds the 4 GB zip limit', 0, 0, 'perm'); return; }
+              // 0.26.4: snapshot the bytes NOW. GM-bridged blobs (MV3
+              // responseType blob) can go UNREADABLE minutes later when
+              // their backing store is dropped — the seal-time
+              // arrayBuffer() then rejects NotReadableError ("The
+              // requested file could not be read...") and kills the whole
+              // part. A heap Uint8Array cannot be invalidated. dlSniffHtml
+              // already read this blob while it was young.
+              const u8 = new Uint8Array(await r.blob.arrayBuffer());
               job.state = 'done';
               job.badge = '';
               dlRun.done++;
-              dlRun.bytes += r.blob.size;
-              job.blob = r.blob;
+              dlRun.bytes += u8.length;
+              job.blob = u8;
               // assign to the part being filled; a full part seals+saves+
               // frees immediately so memory never grows with list size
               dlPartJobs.push(job);
-              dlPartBytes += r.blob.size;
+              dlPartBytes += u8.length;
               if (dlPartBytes >= dlPartCap()) dlSealPart();
               dlAfter(release);
             });
+            return;
+          }
+          // 0.26.4: referer walls cut both ways — some CDNs REQUIRE the
+          // forum referer (the header above), the scdn family 403s ANY
+          // referer and serves no-referer. Previews already ladder policies
+          // (loadSwapImg); downloads sent the forum referer only, which is
+          // why previews could show what downloads failed to fetch. ONE
+          // no-referer retry on a plain 403 before the URL burns.
+          if (/^HTTP 403$/.test(r.why || '') && !job.xftNoRef) {
+            job.xftNoRef = true;
+            job.badge = '…';
+            stream(url);
             return;
           }
           failWith(r.why || 'failed', r.status | 0, r.retryAfter | 0, r.cls);
@@ -498,7 +518,7 @@
           }
         };
       };
-      dlConnFetch(ctx, origin, url, { range: canChunk ? [0, DL_CHUNK_MIN - 1] : null, onProg: mkProg() }, (r) => {
+      dlConnFetch(ctx, origin, url, { range: canChunk ? [0, DL_CHUNK_MIN - 1] : null, onProg: mkProg(), noRef: !!job.xftNoRef }, (r) => {
         if (ctx.killed || ctx.released || dlRun.cancel) { cb({ why: 'cancel', cls: 'trans' }); return; }
         if (!r.blob) { cb(r); return; }
         if (r.status === 206 && !r.total) {
@@ -607,7 +627,10 @@
           // accepts the FORUM referer — send it (GM may set Referer, fetch
           // cannot). Range rides the same header set.
           const dlHdrs = Object.assign({}, opts.range ? { Range: 'bytes=' + opts.range[0] + '-' + opts.range[1] } : null);
-          if (extractDomain(url) !== hostKey(location.host)) dlHdrs.Referer = location.origin + '/';
+          // noRef (0.26.4): the one-referer-policy retry — scdn-family CDNs
+          // 403 ANY referer and serve no-referer, the mirror image of the
+          // cuckcapital wall the forum referer exists for
+          if (!opts.noRef && extractDomain(url) !== hostKey(location.host)) dlHdrs.Referer = location.origin + '/';
           const gmRq = GM_xmlhttpRequest({
             method: 'GET',
             url: url,
@@ -640,8 +663,13 @@
       const ctl = (typeof AbortController !== 'undefined') ? new AbortController() : null;
       leash = ctl ? setTimeout(() => { try { ctl.abort(); } catch (e) {} }, DL_READ) : 0;
       // fetch cannot set the Referer header, but the spec-legal `referrer`
-      // init option sends the forum origin — the policy cuckcapital requires
-      fetch(url, { referrer: location.origin + '/', signal: ctl ? ctl.signal : undefined })
+      // init option sends the forum origin — the policy cuckcapital requires.
+      // noRef uses referrerPolicy, NOT the 'no-referrer' referrer TOKEN:
+      // Chrome parses a non-URL referrer string as a RELATIVE URL, so the
+      // token resolved to <page>/no-referrer and still sent a Referer
+      // (probe-caught, 0.26.4).
+      fetch(url, Object.assign({ signal: ctl ? ctl.signal : undefined },
+        opts.noRef ? { referrerPolicy: 'no-referrer' } : { referrer: location.origin + '/' }))
         .then(async (r) => {
           if (!r.ok) {
             const ra = parseInt(r.headers.get('retry-after') || '0', 10) || 0;
@@ -664,18 +692,18 @@
         .catch(() => finish({ why: 'fetch failed', status: 0, cls: 'trans' }));
       return { abort: () => { try { if (ctl) ctl.abort(); } catch (e) {} } };
     }
-    async function buildZipBlob(files) { // files: [{ name, blob }]
+    async function buildZipBlob(files) { // files: [{ name, blob }] — blob is a Uint8Array (bytes snapshotted at arrival, 0.26.4); a Blob still works for stray callers
       const enc = new TextEncoder();
       const dt = dosDateTime(new Date());
       const parts = [];
       const cds = [];
       let off = 0;
       for (const f of files) {
-        const buf = new Uint8Array(await f.blob.arrayBuffer()); // one full read for the CRC
+        const buf = (f.blob instanceof Uint8Array) ? f.blob : new Uint8Array(await f.blob.arrayBuffer()); // one full read for the CRC
         const crc = crc32(buf);
         const nameU8 = enc.encode(f.name);
         const lh = zipLocalHeader(nameU8, crc, buf.length, dt);
-        parts.push(lh, f.blob); // splice the original blob — bytes are not copied twice
+        parts.push(lh, buf); // splice the byte array itself — no second copy
         cds.push(zipCentralEntry(nameU8, crc, buf.length, dt, off));
         off += lh.length + buf.length;
       }

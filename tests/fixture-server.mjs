@@ -318,6 +318,18 @@ export function startFixtureServer({ pages = 30, perPage = 50, port = 0, imgUrl 
       res.end(want > png.length ? Buffer.concat([png, Buffer.alloc(want - png.length)]) : png);
       return;
     }
+    // 0.26.4 referer-wall: 403 ANY request carrying a Referer, serve the
+    // bytes no-referer — the scdn-family shape. Downloads must retry
+    // without the forum referer after the first 403.
+    if (u.pathname.startsWith('/dlref/')) {
+      const k = (req.headers.referer ? 'wall403|' : 'wallok|') + (req.headers.range ? 'dl|' : '') + u.pathname;
+      hits.set(k, (hits.get(k) || 0) + 1);
+      ACAO(res); res.setHeader('content-type', 'image/png');
+      if (req.headers.referer) { res.statusCode = 403; res.end('referer wall'); return; }
+      const want = parseInt(u.searchParams.get('b') || '0', 10) || png.length;
+      res.end(want > png.length ? Buffer.concat([png, Buffer.alloc(want - png.length)]) : png);
+      return;
+    }
     if (u.pathname.startsWith('/img/') || u.pathname.startsWith('/big/') || u.pathname === '/anim.gif') {
       hits.set(u.pathname, (hits.get(u.pathname) || 0) + 1);
       if (u.pathname.startsWith('/img/')) logTl(res, u, 'main'); // thumb-traffic timing only for /img/

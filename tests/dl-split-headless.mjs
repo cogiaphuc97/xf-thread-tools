@@ -40,7 +40,7 @@ window.GM_xmlhttpRequest = function (o) {
   const t = o.timeout ? setTimeout(() => { try { ctl.abort(); } catch (e) {} if (o.ontimeout) o.ontimeout(); }, o.timeout) : 0;
   const hs = Object.assign({}, o.headers || {});
   const ref = hs.Referer; delete hs.Referer;
-  fetch(o.url, { method: o.method || 'GET', signal: ctl.signal, headers: hs, referrer: ref, credentials: 'omit' })
+  fetch(o.url, Object.assign({ method: o.method || 'GET', signal: ctl.signal, headers: hs, credentials: 'omit' }, ref ? { referrer: ref } : { referrerPolicy: 'no-referrer' }))
     .then(async (r) => {
       clearTimeout(t);
       const res = { status: r.status, responseHeaders: [...r.headers.entries()].map(([k2, v2]) => k2 + ': ' + v2).join('\\r\\n') };
@@ -96,7 +96,7 @@ async function pageWs() {
 }
 
 const N_FILES = 699;   // live /dl/<n>.jpg files
-const N_TOTAL = N_FILES + 3; // + anim.gif + dead404 + dead500
+const N_TOTAL = N_FILES + 4; // + anim.gif + dead404 + dead500 + referer-walled
 
 async function main() {
   mkdirSync(TMP, { recursive: true });
@@ -107,6 +107,7 @@ async function main() {
     imgUrl: (n) => n === N_FILES + 1 ? '/dldead/dead404.jpg'
       : n === N_FILES + 2 ? '/dldead/dead500.jpg'
       : n === N_FILES + 3 ? '/anim.gif'
+      : n === N_FILES + 4 ? '/dlref/wall.jpg?b=1500'
       : '/dl/' + n + '.jpg?b=2000'
   });
 
@@ -230,6 +231,11 @@ async function main() {
   check('AC-DL-4: perm 404 burned after 1 hit', (stats1['dl|/dldead/dead404.jpg'] || 0) === 1, 'hits=' + (stats1['dl|/dldead/dead404.jpg'] || 0));
   check('AC-DL-4: trans 500 retried to 3 hits', (stats1['dl|/dldead/dead500.jpg'] || 0) === 3, 'hits=' + (stats1['dl|/dldead/dead500.jpg'] || 0));
   check('AC-DL-4: both dead files pinned as fails', (ledger1.fails | 0) === 2, 'fails=' + (ledger1.fails | 0));
+  // 0.26.4: the referer-walled file 403s the forum-referer attempt, the
+  // no-referer retry lands it — exactly 2 download hits, entry in the zip
+  check('AC-REF: referer wall retried no-referer (2 hits)', ((stats1['wall403|dl|/dlref/wall.jpg'] || 0) === 1 || (stats1['wall403|/dlref/wall.jpg'] || 0) === 1) && ((stats1['wallok|dl|/dlref/wall.jpg'] || 0) + (stats1['wallok|/dlref/wall.jpg'] || 0)) >= 1,
+    JSON.stringify({ w403dl: stats1['wall403|dl|/dlref/wall.jpg'], w403: stats1['wall403|/dlref/wall.jpg'], wokdl: stats1['wallok|dl|/dlref/wall.jpg'], wok: stats1['wallok|/dlref/wall.jpg'] }));
+  check('AC-REF: walled file saved into the zip', union.some((n2) => /wall\.jpg$/.test(n2)), JSON.stringify(union.filter((n2) => /wall/.test(n2))));
 
   // ---- run 2: default-size cap -> single part, exact 0.20.0 name --------
   await ev(cdp, `(() => {
@@ -246,8 +252,8 @@ async function main() {
   const stopBtn = `[...document.querySelectorAll('#xft-panel .xft-head button')].find((b) => b.textContent.includes('Stop'))`;
   check('AC-UI-2: header Stop disabled while idle', await ev(cdp, stopBtn + ' ? ' + stopBtn + '.disabled : null') === true,
     'stop=' + await ev(cdp, stopBtn + ' ? ' + stopBtn + '.disabled : \'missing\''));
-  const resumeHidden = await ev(cdp, `(() => { const b = [...document.querySelectorAll('#xft-panel .xft-head button')].find((x) => x.textContent.includes('Resume')); return !b || b.hidden; })()`);
-  check('AC-UI-2: Resume hidden when nothing to resume', resumeHidden === true, 'hidden=' + resumeHidden);
+  const resumeState = await ev(cdp, `(() => { const b = [...document.querySelectorAll('#xft-panel .xft-head button')].find((x) => x.textContent.includes('Resume')); return b ? { hidden: b.hidden, disabled: b.disabled } : null; })()`);
+  check('AC-UI-2: Resume visible but disabled on a complete thread', resumeState && resumeState.hidden === false && resumeState.disabled === true, JSON.stringify(resumeState));
   await ev(cdp, `[...document.querySelectorAll('#xft-panel .xft-subtab')].find((b) => /^Video/.test(b.textContent)).click(); true`);
   await sleep(250);
   check('AC-UI-1: Download disabled on an empty sub-tab', await ev(cdp, `document.querySelector('.xft-dlbtn').disabled`) === true, '');
