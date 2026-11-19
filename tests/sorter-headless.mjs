@@ -109,7 +109,7 @@ async function main() {
   mkdirSync(TMP + '/profile', { recursive: true });
   const fx = await startFixtureServer({
     pages: 3, perPage: 4,
-    imgUrl: (n) => ['/img/' + n + '.png'],
+    imgUrl: (n) => '/img/' + n + '.png',
     reactCounts: (n) => (n === 1 ? 1010 : null)
   });
 
