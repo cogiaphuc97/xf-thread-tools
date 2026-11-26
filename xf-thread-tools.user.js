@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         xf-thread-tools
 // @namespace    xf-thread-tools
-// @version      0.29.1
+// @version      0.29.2
 // @description  XenForo 2: sort thread posts by reaction count across all pages (cached) + floating media panel (images / external links).
 // @author       xf-thread-tools
 // @match        *://*/threads/*
@@ -419,9 +419,13 @@
   //   X-BL: <lang>   (+ gofile Origin/Referer)
   // The salt lives inside the rotating wt.obf.js bundle — derivable only by
   // eval-ing obfuscated code (rejected), so it ships BAKED here and can be
-  // overridden via the settings field when gofile rotates it again (three
-  // rotations observed in 2026; gallery-dl chases the same constant).
-  const GOFILE_WT_SALT = '5d4f7g8sd45fsd';
+  // overridden via the settings field when gofile rotates it again. NOTE:
+  // the live API accepts the OLDER salt (12af056dacea0b, verified
+  // 2026-11-26 with status:ok + children) and REJECTS gallery-dl master's
+  // newer 5d4f7g8sd45fsd with error-notPremium — a wrong salt reads as
+  // notPremium, not error-token. Do not "update" this constant from
+  // gallery-dl without live-verifying.
+  const GOFILE_WT_SALT = '12af056dacea0b';
   
   // compact sync SHA-256 -> hex (crypto.subtle is async and absent on
   // insecure origins; vector-tested against node:crypto in media.test.mjs)
