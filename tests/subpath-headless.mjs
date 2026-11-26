@@ -103,7 +103,13 @@ async function main() {
   const fx = await startFixtureServer({
     pages: 2, perPage: 1,
     imgUrl: (n) => ['/img/' + n + '.png'],
-    attachPosts: (n) => (n === 1 ? att(1) + att(2) : n === 2 ? att(3) : null)
+    attachPosts: (n) => (n === 1 ? att(1) + att(2) : n === 2 ? att(3) : null),
+    // 0.28.1: inline attachment <video> (bbMediaWrapper shape) — no anchor, no
+    // wrapped thumb, no unfurl card; the poster must be DERIVED from the
+    // /data/video/ url as the /data/attachments/ sibling
+    richPosts: (n) => (n === 1
+      ? '<div class="bbMediaWrapper"><div class="bbMediaWrapper-inner"><video controls="" data-xf-init="video-init"><source src="/phpBB2/data/video/78/781-cafecafecafef0sd.mp4?hash=xY12"></video></div></div>'
+      : null)
   });
 
   const chrome = spawn(CHROME, [
@@ -165,6 +171,15 @@ async function main() {
       await sleep(400);
     }
     check('file-preview video tiles carry the wrapped thumb as poster', pv === 3, 'posters=' + pv);
+    // 0.28.1: the INLINE attachment video (no record poster) derives its
+    // /data/attachments/ sibling and shows it
+    let iv = 0;
+    for (let i = 0; i < 30; i++) {
+      iv = await ev(cdp, `[...document.querySelectorAll('.xft-cell')].filter((c) => /\\/phpBB2\\/data\\/video\\/78\\/781-/.test(c.dataset.xftUrl || '') && c.querySelectorAll('.xft-vtile img').length).length`);
+      if (iv === 1) break;
+      await sleep(400);
+    }
+    check('inline video tile shows the derived sibling poster', iv === 1, 'posters=' + iv);
     // no regression: plain bbWrapper images still collected
     check('bbWrapper images still collected', urls.some((u) => /\/img\/[12]\.png$/.test(u)), JSON.stringify(urls.filter((u) => u.indexOf('/img/') >= 0)));
   } finally {

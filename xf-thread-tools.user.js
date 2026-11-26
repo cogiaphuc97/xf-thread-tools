@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         xf-thread-tools
 // @namespace    xf-thread-tools
-// @version      0.28.0
+// @version      0.28.1
 // @description  XenForo 2: sort thread posts by reaction count across all pages (cached) + floating media panel (images / external links).
 // @author       xf-thread-tools
 // @match        *://*/threads/*
@@ -170,6 +170,17 @@
     cands.push(url);
     return cands;
   }
+  // Attachment servers that store video files under /data/video/<dir>/<id>-<hash>.mp4
+  // render a sibling thumb at /data/attachments/<dir>/<id>-<hash>.jpg — same
+  // id and hash, different family dir and extension. Inline <video> posts
+  // carry no poster and no unfurl card, so this sibling is the only preview
+  // source. Returns '' for any other URL shape (non-video dirs, foreign
+  // extensions, non-http).
+  function derivedVideoPoster(u) {
+    const m = String(u || '').match(/^(https?:\/\/[^?#]+?)\/data\/video\/(\d+)\/([A-Za-z0-9_-]+)\.mp4(?:[?#]|$)/);
+    return m ? m[1] + '/data/attachments/' + m[2] + '/' + m[3] + '.jpg' : '';
+  }
+  
   // Forum "external link exit" gates: the href points back at the forum
   // itself (an interstitial the addon serves) while the real target is the
   // anchor's visible text (XF autolinks render the full URL) or a base64url
@@ -5870,7 +5881,10 @@
         for (const r of d.orderedShown) {
           const push = (list, kind) => {
             for (const url of (list || [])) {
-              if (keep(url)) all.push({ r: r, url: String(url || ''), pos: d.posMap.get(r.postId) || 0, kind: kind, poster: kind === 'video' ? ((r.posters || {})[String(url)]) || '' : '', ord: raw });
+              // inline attachment <video> tags carry no poster and no unfurl card — the
+              // attachment server's sibling /data/attachments/ thumb (same id+hash) is
+              // the only preview source; miss shapes return '' and tiles stay bare
+              if (keep(url)) all.push({ r: r, url: String(url || ''), pos: d.posMap.get(r.postId) || 0, kind: kind, poster: kind === 'video' ? ((r.posters || {})[String(url)]) || derivedVideoPoster(String(url)) : '', ord: raw });
               raw++;
             }
           };

@@ -47,7 +47,10 @@
       for (const r of d.orderedShown) {
         const push = (list, kind) => {
           for (const url of (list || [])) {
-            if (keep(url)) all.push({ r: r, url: String(url || ''), pos: d.posMap.get(r.postId) || 0, kind: kind, poster: kind === 'video' ? ((r.posters || {})[String(url)]) || '' : '', ord: raw });
+            // inline attachment <video> tags carry no poster and no unfurl card — the
+            // attachment server's sibling /data/attachments/ thumb (same id+hash) is
+            // the only preview source; miss shapes return '' and tiles stay bare
+            if (keep(url)) all.push({ r: r, url: String(url || ''), pos: d.posMap.get(r.postId) || 0, kind: kind, poster: kind === 'video' ? ((r.posters || {})[String(url)]) || derivedVideoPoster(String(url)) : '', ord: raw });
             raw++;
           }
         };

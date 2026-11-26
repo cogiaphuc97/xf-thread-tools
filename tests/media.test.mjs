@@ -1,7 +1,7 @@
 // Unit tests for the media module (src/media.mjs). Regrouped to mirror the src/ split.
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { albumDisplayName, albumHostMatches, boilerplateUrls, gofileAccountsUrl, gofileApiOrigin, gofileContentsUrl, hqCandidates, imagePageHref, isAlbumPageUrl, isSmilieUrl, pairUnfurlPosters, parseAlbumApiResponse, parseAlbumPage, parseAlbumTitle, parseCyberdropAuth, parseCyberdropFileAnchors, parseCyberdropFileinfo, parseGofileAccounts, parseGofileContents, parseImageApiResponse, parseImagePage, unwrapExitLink } from '../src/media.mjs';
+import { albumDisplayName, albumHostMatches, boilerplateUrls, derivedVideoPoster, gofileAccountsUrl, gofileApiOrigin, gofileContentsUrl, hqCandidates, imagePageHref, isAlbumPageUrl, isSmilieUrl, pairUnfurlPosters, parseAlbumApiResponse, parseAlbumPage, parseAlbumTitle, parseCyberdropAuth, parseCyberdropFileAnchors, parseCyberdropFileinfo, parseGofileAccounts, parseGofileContents, parseImageApiResponse, parseImagePage, unwrapExitLink } from '../src/media.mjs';
 
 
 // ---- boilerplateUrls (signature / "sent via app" footer fingerprint) ----
@@ -367,6 +367,19 @@ test('unwrapExitLink: keeps plain / same-host / non-gate anchors', () => {
   assert.equal(unwrapExitLink('/threads/777/', 'https://forum.example/threads/777/', 'https://forum.example'), ''); // text same host
   assert.equal(unwrapExitLink('/attachments/a-b.jpg', 'pic.jpg', 'https://forum.example'), ''); // no URL text, no token
   assert.equal(unwrapExitLink('not a url', 'nope', 'https://forum.example'), ''); // unparseable href
+});
+
+// ---- derivedVideoPoster (inline attachment videos, 0.28.1) ----
+test('derivedVideoPoster: /data/video sibling thumb under /data/attachments', () => {
+  assert.equal(derivedVideoPoster('https://forum.example/phpBB2/data/video/5093/5093796-29057c1afaf660a9168e933a1de934aa.mp4?hash=_Fe1QbExkW'), 'https://forum.example/phpBB2/data/attachments/5093/5093796-29057c1afaf660a9168e933a1de934aa.jpg');
+  assert.equal(derivedVideoPoster('https://forum.example/data/video/12/ab-cd_123.mp4'), 'https://forum.example/data/attachments/12/ab-cd_123.jpg'); // root install
+});
+test('derivedVideoPoster: non-matching shapes stay empty', () => {
+  assert.equal(derivedVideoPoster('https://cdn.example/vz/e1_720p.mp4'), '');            // no /data/video/ family
+  assert.equal(derivedVideoPoster('https://forum.example/phpBB2/data/video/5093/x.jpg'), ''); // not mp4
+  assert.equal(derivedVideoPoster('https://forum.example/phpBB2/data/video/abc/x.mp4'), '');  // dir not digits
+  assert.equal(derivedVideoPoster('/phpBB2/data/video/5093/x.mp4'), '');               // relative (callers pass absolute)
+  assert.equal(derivedVideoPoster(''), '');
 });
 
 // ---- cyberdrop-shaped albums (0.27) ----

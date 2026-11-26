@@ -108,6 +108,17 @@ export function hqCandidates(url) {
   cands.push(url);
   return cands;
 }
+// Attachment servers that store video files under /data/video/<dir>/<id>-<hash>.mp4
+// render a sibling thumb at /data/attachments/<dir>/<id>-<hash>.jpg — same
+// id and hash, different family dir and extension. Inline <video> posts
+// carry no poster and no unfurl card, so this sibling is the only preview
+// source. Returns '' for any other URL shape (non-video dirs, foreign
+// extensions, non-http).
+export function derivedVideoPoster(u) {
+  const m = String(u || '').match(/^(https?:\/\/[^?#]+?)\/data\/video\/(\d+)\/([A-Za-z0-9_-]+)\.mp4(?:[?#]|$)/);
+  return m ? m[1] + '/data/attachments/' + m[2] + '/' + m[3] + '.jpg' : '';
+}
+
 // Forum "external link exit" gates: the href points back at the forum
 // itself (an interstitial the addon serves) while the real target is the
 // anchor's visible text (XF autolinks render the full URL) or a base64url
