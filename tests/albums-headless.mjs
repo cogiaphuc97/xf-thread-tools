@@ -10,7 +10,7 @@
 // Chrome (headless) + the BUILT bundle. Not part of npm test.
 import { spawn } from 'node:child_process';
 import { readFileSync, writeFileSync, mkdirSync, rmSync } from 'node:fs';
-import { startFixtureServer } from './fixture-server.mjs';
+import { startFixtureServer, GOFIX_SALT } from './fixture-server.mjs';
 
 const CHROME = '/opt/google/chrome/chrome';
 const TMP = '/tmp/xf-albums-' + process.pid;
@@ -120,7 +120,7 @@ async function main() {
     await cdp.send('Page.navigate', { url: fx.url });
     await sleep(1500);
 
-    await ev(cdp, `localStorage.setItem('xft_xfThreadTools:settings', JSON.stringify({ autoFetch: 0, delayMs: 120, rowCap: 500, chunkSize: 50, albumHosts: ['127.0.0.1'] })); true`);
+    await ev(cdp, `localStorage.setItem('xft_xfThreadTools:settings', JSON.stringify({ autoFetch: 0, delayMs: 120, rowCap: 500, chunkSize: 50, albumHosts: ['127.0.0.1'], gofileSalt: ${JSON.stringify(GOFIX_SALT)} })); true`);
     // gofile API origin override: localhost cannot host api.<domain> — the
     // runtime test hook stands in for the derived api.<registrable-domain>
     await ev(cdp, `window.__XFT_GOFILE_API_FOR_TESTS = 'http://127.0.0.1:${fx.albumPort}'; true`);
@@ -298,6 +298,7 @@ async function main() {
     const stats = await fx.stats();
     check('US-003 guest token POSTed once (session cache)', (stats['POST /accounts'] || 0) === 1, JSON.stringify(stats));
     check('US-003 contents fetched with the token', (stats['/contents/gf1'] || 0) >= 1, JSON.stringify(stats));
+    check('US-003 contents call carries Bearer + X-Website-Token hash (0.29 header auth)', (stats['contents-hdr-ok'] || 0) >= 1 && !(stats['contents-hdr-bad'] > 0), JSON.stringify({ ok: stats['contents-hdr-ok'] || 0, bad: stats['contents-hdr-bad'] || 0 }));
 
     const fails = results.filter((r) => !r.ok).length;
     console.log(fails ? '\n' + fails + ' FAIL' : '\nALL PASS');

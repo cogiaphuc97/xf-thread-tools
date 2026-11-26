@@ -115,8 +115,47 @@
       let id = '';
       try { id = new URL(url).pathname.split('/').pop() || ''; } catch (e) {}
       if (!api || !id) { onErr(); return; }
+      const salt = settings.gofileSalt || GOFILE_WT_SALT;
+      // header auth (0.29): ?wt= died (error-token). X-Website-Token buckets
+      // by 4h — recompute per request from the cached token so a session
+      // crossing a bucket boundary stays valid; UA + lang must hash exactly
+      // what the request sends
+      const wtHeaders = (token) => {
+        const lang = (typeof navigator !== 'undefined' && navigator.language) || 'en-US';
+        let pageOrigin = api;
+        try { pageOrigin = new URL(url).origin; } catch (e) { /* keep api */ }
+        return {
+          'Authorization': 'Bearer ' + token,
+          'X-Website-Token': gofileWebsiteToken((typeof navigator !== 'undefined' && navigator.userAgent) || '', lang, token, Math.floor(Date.now() / 1000), salt),
+          'X-BL': lang,
+          'Referer': pageOrigin + '/'
+        };
+      };
+      // direct GM XHR (not imgPageNet): HTTP status must stay visible for
+      // the permanent/transient split — the same reason fetchAlbumApiPage
+      // went direct in 0.26.1
+      const gofileJsonGet = (u, headers, onOk, onFail) => {
+        if (typeof GM_xmlhttpRequest === 'function') {
+          try {
+            GM_xmlhttpRequest({
+              method: 'GET', url: u, timeout: 10000, headers: headers,
+              onload: (r) => {
+                const st = (r && r.status) || 0;
+                if (st >= 200 && st < 400) onOk((r && r.responseText) || '');
+                else onFail();
+              },
+              onerror: onFail, ontimeout: onFail
+            });
+            return;
+          } catch (e) { /* fall through to fetch */ }
+        }
+        fetch(u, { credentials: 'omit', headers: headers })
+          .then((r) => { if (!r.ok) throw new Error('http ' + r.status); return r.text(); })
+          .then(onOk)
+          .catch(onFail);
+      };
       const walk = (token) => {
-        imgPageGet(gofileContentsUrl(api, id, token), (t) => {
+        gofileJsonGet(gofileContentsUrl(api, id), wtHeaders(token), (t) => {
           const p = parseGofileContents(t);
           if (!p) {
             // parse failure -> cooldown; the token may be stale/rotated —
@@ -124,7 +163,9 @@
             // of cooldown-looping all session
             gofileTokens.delete(api);
             albumDone(url, null, true, '');
-          } else albumDone(url, p.children, true, p.name);
+          } else if (p.error === 'error-notFound') albumDone(url, [], true, ''); // dead link: resolved-empty
+          else if (p.error) { gofileTokens.delete(api); albumDone(url, null, true, ''); } // error-token / notPremium / …: cooldown + fresh auth next round
+          else albumDone(url, p.children, true, p.name);
         }, onErr);
       };
       if (gofileTokens.has(api)) { walk(gofileTokens.get(api)); return; }

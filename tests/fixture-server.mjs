@@ -16,6 +16,11 @@ import http from 'node:http';
 const ACAO = (res) => res.setHeader('access-control-allow-origin', '*');
 import zlib from 'node:zlib';
 import { crc32 } from '../src/zip.mjs';
+import { gofileWebsiteToken } from '../src/media.mjs';
+
+// shared salt for the 0.29 gofile X-Website-Token check: the probe injects
+// it as settings.gofileSalt, this server verifies against it
+export const GOFIX_SALT = 'xft-fix-salt-029';
 
 export function tinyPng() {
   // 200x150 (above the 140px sticker-retire gate), one 8-bit RGB row pattern; bytes are shared by every /img/<n>.png
@@ -173,7 +178,7 @@ export function startFixtureServer({ pages = 30, perPage = 50, port = 0, imgUrl 
     if (req.method === 'OPTIONS') {
       ACAO(res);
       res.setHeader('Access-Control-Allow-Methods', 'GET,POST,OPTIONS');
-      res.setHeader('Access-Control-Allow-Headers', 'content-type');
+      res.setHeader('Access-Control-Allow-Headers', 'content-type,authorization,x-website-token,x-bl,referer');
       res.statusCode = 204;
       res.end();
       return;
@@ -329,7 +334,18 @@ export function startFixtureServer({ pages = 30, perPage = 50, port = 0, imgUrl 
     if (u.pathname === '/contents/gf1') {
       hits.set(u.pathname, (hits.get(u.pathname) || 0) + 1);
       ACAO(res); res.setHeader('content-type', 'application/json');
-      if (u.searchParams.get('wt') !== 'fixture-token') { res.statusCode = 401; res.end('{"status":"error"}'); return; }
+      // 0.29 header auth: Bearer guest token + X-Website-Token hash of
+      // UA::lang::token::4h-bucket::salt (bucket ±1 tolerated against clock
+      // skew between page and server)
+      const auth = req.headers.authorization || '';
+      const xwt = req.headers['x-website-token'] || '';
+      const xbl = req.headers['x-bl'] || 'en-US';
+      const ua = req.headers['user-agent'] || '';
+      const win = Math.floor(Date.now() / 1000 / 14400);
+      const want = (w) => gofileWebsiteToken(ua, xbl, 'fixture-token', w * 14400, GOFIX_SALT);
+      const authOk = auth === 'Bearer fixture-token' && (xwt === want(win) || xwt === want(win - 1) || xwt === want(win + 1));
+      hits.set(authOk ? 'contents-hdr-ok' : 'contents-hdr-bad', (hits.get(authOk ? 'contents-hdr-ok' : 'contents-hdr-bad') || 0) + 1);
+      if (!authOk) { res.statusCode = 401; res.end('{"status":"error-token","data":{}}'); return; }
       const main = 'http://127.0.0.1:' + mainPort;
       res.end(JSON.stringify({ status: 'ok', data: { id: 'gf1', name: 'gofile album', type: 'folder', children: {
         i1: { id: 'i1', name: 'g1.png', type: 'file', mimetype: 'image/png', link: main + '/img/g1.png' },

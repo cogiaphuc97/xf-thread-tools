@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         xf-thread-tools
 // @namespace    xf-thread-tools
-// @version      0.28.2
+// @version      0.29.0
 // @description  XenForo 2: sort thread posts by reaction count across all pages (cached) + floating media panel (images / external links).
 // @author       xf-thread-tools
 // @match        *://*/threads/*
@@ -34,6 +34,7 @@
     mediaGroup: 'flat',          // media grid grouping: flat | post | page | user
     mediaOrder: 'default',       // panel item order: default | latest | react (one control, media + links)
     albumHosts: ['gofile.io'],   // hosts whose /d/<id> links are ALBUMS (SPA file hosts with an api.<domain> content API); /d/ otherwise stays video-page routed. gofile default-on (public API); blank/absent adopts this default, 'none' opts out
+    gofileSalt: '',              // override for the gofile X-Website-Token salt ('' = baked constant; gofile rotates it inside wt.obf.js)
     selectors: {},               // per-site selector overrides, merged over BASE_SEL
     aiProvider: 'ollama',        // AI tab provider preset (Ollama-only phase; engine stays provider-generic)
     aiBase: '',                  // '' = provider preset base URL
@@ -411,6 +412,70 @@
     } catch (e) { return ''; }
   }
   
+  // Contents auth (0.29): the old ?wt=<guest token> query param is REJECTED
+  // (error-token). The SPA now sends header auth:
+  //   Authorization: Bearer <guest token>
+  //   X-Website-Token: sha256(UA::lang::token::floor(epoch/14400)::salt)
+  //   X-BL: <lang>   (+ gofile Origin/Referer)
+  // The salt lives inside the rotating wt.obf.js bundle — derivable only by
+  // eval-ing obfuscated code (rejected), so it ships BAKED here and can be
+  // overridden via the settings field when gofile rotates it again (three
+  // rotations observed in 2026; gallery-dl chases the same constant).
+  const GOFILE_WT_SALT = '5d4f7g8sd45fsd';
+  
+  // compact sync SHA-256 -> hex (crypto.subtle is async and absent on
+  // insecure origins; vector-tested against node:crypto in media.test.mjs)
+  function sha256Hex(str) {
+    const K = [0x428a2f98, 0x71374491, 0xb5c0fbcf, 0xe9b5dba5, 0x3956c25b, 0x59f111f1, 0x923f82a4, 0xab1c5ed5,
+      0xd807aa98, 0x12835b01, 0x243185be, 0x550c7dc3, 0x72be5d74, 0x80deb1fe, 0x9bdc06a7, 0xc19bf174,
+      0xe49b69c1, 0xefbe4786, 0x0fc19dc6, 0x240ca1cc, 0x2de92c6f, 0x4a7484aa, 0x5cb0a9dc, 0x76f988da,
+      0x983e5152, 0xa831c66d, 0xb00327c8, 0xbf597fc7, 0xc6e00bf3, 0xd5a79147, 0x06ca6351, 0x14292967,
+      0x27b70a85, 0x2e1b2138, 0x4d2c6dfc, 0x53380d13, 0x650a7354, 0x766a0abb, 0x81c2c92e, 0x92722c85,
+      0xa2bfe8a1, 0xa81a664b, 0xc24b8b70, 0xc76c51a3, 0xd192e819, 0xd6990624, 0xf40e3585, 0x106aa070,
+      0x19a4c116, 0x1e376c08, 0x2748774c, 0x34b0bcb5, 0x391c0cb3, 0x4ed8aa4a, 0x5b9cca4f, 0x682e6ff3,
+      0x748f82ee, 0x78a5636f, 0x84c87814, 0x8cc70208, 0x90befffa, 0xa4506ceb, 0xbef9a3f7, 0xc67178f2];
+    const rr = (x, n) => (x >>> n) | (x << (32 - n));
+    const msg = new TextEncoder().encode(String(str));
+    const bitLen = msg.length * 8;
+    const padded = new Uint8Array((((msg.length + 8) >> 6) + 1) << 6);
+    padded.set(msg);
+    padded[msg.length] = 0x80;
+    const dv = new DataView(padded.buffer);
+    dv.setUint32(padded.length - 4, bitLen >>> 0);
+    dv.setUint32(padded.length - 8, Math.floor(bitLen / 0x100000000));
+    const H = [0x6a09e667, 0xbb67ae85, 0x3c6ef372, 0xa54ff53a, 0x510e527f, 0x9b05688c, 0x1f83d9ab, 0x5be0cd19];
+    const w = new Uint32Array(64);
+    for (let off = 0; off < padded.length; off += 64) {
+      for (let i = 0; i < 16; i++) w[i] = dv.getUint32(off + i * 4);
+      for (let i = 16; i < 64; i++) {
+        const s0 = rr(w[i - 15], 7) ^ rr(w[i - 15], 18) ^ (w[i - 15] >>> 3);
+        const s1 = rr(w[i - 2], 17) ^ rr(w[i - 2], 19) ^ (w[i - 2] >>> 10);
+        w[i] = (w[i - 16] + s0 + w[i - 7] + s1) >>> 0;
+      }
+      let [a, b, c, d, e, f, g, h] = H;
+      for (let i = 0; i < 64; i++) {
+        const S1 = rr(e, 6) ^ rr(e, 11) ^ rr(e, 25);
+        const ch = (e & f) ^ (~e & g);
+        const t1 = (h + S1 + ch + K[i] + w[i]) >>> 0;
+        const S0 = rr(a, 2) ^ rr(a, 13) ^ rr(a, 22);
+        const mj = (a & b) ^ (a & c) ^ (b & c);
+        const t2 = (S0 + mj) >>> 0;
+        h = g; g = f; f = e; e = (d + t1) >>> 0; d = c; c = b; b = a; a = (t1 + t2) >>> 0;
+      }
+      H[0] = (H[0] + a) >>> 0; H[1] = (H[1] + b) >>> 0; H[2] = (H[2] + c) >>> 0; H[3] = (H[3] + d) >>> 0;
+      H[4] = (H[4] + e) >>> 0; H[5] = (H[5] + f) >>> 0; H[6] = (H[6] + g) >>> 0; H[7] = (H[7] + h) >>> 0;
+    }
+    return H.map((x) => x.toString(16).padStart(8, '0')).join('');
+  }
+  
+  // the X-Website-Token value: UA + lang must match what the request itself
+  // sends (hash the SAME navigator.userAgent the XHR carries, X-BL = lang)
+  function gofileWebsiteToken(userAgent, lang, token, nowSec, salt) {
+    const data = String(userAgent || '') + '::' + String(lang || '') + '::' + String(token || '')
+      + '::' + Math.floor(Number(nowSec || 0) / 14400) + '::' + String(salt || '');
+    return sha256Hex(data);
+  }
+  
   // ---- cyberdrop-shaped server-rendered albums (0.27) ----
   // The /a/ page lists files as anchors <a id="file" href="/f/<id>"> (attr
   // order varies); the direct url is NOT in the page — a public per-file
@@ -457,8 +522,9 @@
     return String(apiOrigin || '').replace(/\/+$/, '') + '/accounts';
   }
   
-  function gofileContentsUrl(apiOrigin, contentId, token) {
-    return String(apiOrigin || '').replace(/\/+$/, '') + '/contents/' + encodeURIComponent(String(contentId || '')) + '?wt=' + encodeURIComponent(String(token || ''));
+  function gofileContentsUrl(apiOrigin, contentId) {
+    return String(apiOrigin || '').replace(/\/+$/, '') + '/contents/' + encodeURIComponent(String(contentId || ''))
+      + '?contentFilter=&page=1&pageSize=1000&sortField=name&sortDirection=1';
   }
   
   // POST /accounts response -> guest token ('' on any parse failure)
@@ -477,6 +543,10 @@
   function parseGofileContents(text) {
     try {
       const j = JSON.parse(String(text || ''));
+      // gofile answers 200-OK with a status field for soft errors (token,
+      // premium-gated content, not-found) — surface the status so callers
+      // can split permanent (gone) from retryable failures
+      if (j && typeof j.status === 'string' && j.status !== 'ok') return { children: [], name: '', error: j.status };
       const d = j && j.data;
       if (!d || typeof d !== 'object' || !d.children || typeof d.children !== 'object') return null;
       const children = [];
@@ -1784,6 +1854,9 @@
       // "opted out", so it adopts the shipped default. 'none' (or any host
       // that never matches) is the explicit opt-out.
       if (!settings.albumHosts.length) settings.albumHosts = DEFAULT_SETTINGS.albumHosts.slice();
+      // gofile wt salt override: keep it a compact token shape when present
+      if (typeof settings.gofileSalt !== 'string') settings.gofileSalt = '';
+      settings.gofileSalt = settings.gofileSalt.trim().slice(0, 64);
       // Ollama-only phase: no provider picker — coerce stale stored presets and
       // drop bases that point at the old default so the UI shows one truth
       if (settings.aiProvider !== 'ollama') settings.aiProvider = 'ollama';
@@ -3747,8 +3820,47 @@
         let id = '';
         try { id = new URL(url).pathname.split('/').pop() || ''; } catch (e) {}
         if (!api || !id) { onErr(); return; }
+        const salt = settings.gofileSalt || GOFILE_WT_SALT;
+        // header auth (0.29): ?wt= died (error-token). X-Website-Token buckets
+        // by 4h — recompute per request from the cached token so a session
+        // crossing a bucket boundary stays valid; UA + lang must hash exactly
+        // what the request sends
+        const wtHeaders = (token) => {
+          const lang = (typeof navigator !== 'undefined' && navigator.language) || 'en-US';
+          let pageOrigin = api;
+          try { pageOrigin = new URL(url).origin; } catch (e) { /* keep api */ }
+          return {
+            'Authorization': 'Bearer ' + token,
+            'X-Website-Token': gofileWebsiteToken((typeof navigator !== 'undefined' && navigator.userAgent) || '', lang, token, Math.floor(Date.now() / 1000), salt),
+            'X-BL': lang,
+            'Referer': pageOrigin + '/'
+          };
+        };
+        // direct GM XHR (not imgPageNet): HTTP status must stay visible for
+        // the permanent/transient split — the same reason fetchAlbumApiPage
+        // went direct in 0.26.1
+        const gofileJsonGet = (u, headers, onOk, onFail) => {
+          if (typeof GM_xmlhttpRequest === 'function') {
+            try {
+              GM_xmlhttpRequest({
+                method: 'GET', url: u, timeout: 10000, headers: headers,
+                onload: (r) => {
+                  const st = (r && r.status) || 0;
+                  if (st >= 200 && st < 400) onOk((r && r.responseText) || '');
+                  else onFail();
+                },
+                onerror: onFail, ontimeout: onFail
+              });
+              return;
+            } catch (e) { /* fall through to fetch */ }
+          }
+          fetch(u, { credentials: 'omit', headers: headers })
+            .then((r) => { if (!r.ok) throw new Error('http ' + r.status); return r.text(); })
+            .then(onOk)
+            .catch(onFail);
+        };
         const walk = (token) => {
-          imgPageGet(gofileContentsUrl(api, id, token), (t) => {
+          gofileJsonGet(gofileContentsUrl(api, id), wtHeaders(token), (t) => {
             const p = parseGofileContents(t);
             if (!p) {
               // parse failure -> cooldown; the token may be stale/rotated —
@@ -3756,7 +3868,9 @@
               // of cooldown-looping all session
               gofileTokens.delete(api);
               albumDone(url, null, true, '');
-            } else albumDone(url, p.children, true, p.name);
+            } else if (p.error === 'error-notFound') albumDone(url, [], true, ''); // dead link: resolved-empty
+            else if (p.error) { gofileTokens.delete(api); albumDone(url, null, true, ''); } // error-token / notPremium / …: cooldown + fresh auth next round
+            else albumDone(url, p.children, true, p.name);
           }, onErr);
         };
         if (gofileTokens.has(api)) { walk(gofileTokens.get(api)); return; }
@@ -6196,6 +6310,7 @@
         const inAnim = mkField('force animations (1/0)', settings.forceAnimations ? 1 : 0);
         const inBase = mkField('base path override (auto-detected when blank)', settings.basePath);
         const inAlbumHosts = mkField('album hosts (/d/ links, comma-separated; blank = defaults, none = off)', (settings.albumHosts || []).join(', '));
+        const inGfileSalt = mkField('gofile salt (website-token override)', settings.gofileSalt);
         const save = mkBtn('Save', () => {
           const num = (v, def) => {
             const n = parseInt(v, 10);
@@ -6208,6 +6323,7 @@
           settings.forceAnimations = parseInt(inAnim.value, 10) === 1 ? 1 : 0;
           settings.basePath = inBase.value.trim().replace(/\/+$/, '');
           settings.albumHosts = inAlbumHosts.value.split(',').map((h) => h.trim().toLowerCase().replace(/^[*.]+/, '')).filter((h) => h.length >= 3 && /^[a-z0-9.*-]+$/.test(h));
+          settings.gofileSalt = inGfileSalt.value.trim().slice(0, 64);
           applyAnimOverride();
           saveSettings();
           wrap.hidden = true;

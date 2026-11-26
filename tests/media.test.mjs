@@ -1,7 +1,8 @@
 // Unit tests for the media module (src/media.mjs). Regrouped to mirror the src/ split.
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { albumDisplayName, albumHostMatches, boilerplateUrls, derivedVideoPoster, gofileAccountsUrl, gofileApiOrigin, gofileContentsUrl, hqCandidates, imagePageHref, isAlbumPageUrl, isSmilieUrl, pairUnfurlPosters, parseAlbumApiResponse, parseAlbumPage, parseAlbumTitle, parseCyberdropAuth, parseCyberdropFileAnchors, parseCyberdropFileinfo, parseGofileAccounts, parseGofileContents, parseImageApiResponse, parseImagePage, unwrapExitLink } from '../src/media.mjs';
+import { albumDisplayName, albumHostMatches, boilerplateUrls, derivedVideoPoster, gofileAccountsUrl, gofileApiOrigin, gofileContentsUrl, gofileWebsiteToken, hqCandidates, imagePageHref, isAlbumPageUrl, isSmilieUrl, pairUnfurlPosters, parseAlbumApiResponse, parseAlbumPage, parseAlbumTitle, parseCyberdropAuth, parseCyberdropFileAnchors, parseCyberdropFileinfo, parseGofileAccounts, parseGofileContents, parseImageApiResponse, parseImagePage, sha256Hex, unwrapExitLink } from '../src/media.mjs';
+import { createHash } from 'node:crypto';
 
 
 // ---- boilerplateUrls (signature / "sent via app" footer fingerprint) ----
@@ -323,7 +324,7 @@ test('gofileApiOrigin: drops the first DNS label on 3+ label hosts, keeps ports 
 });
 test('gofile URL builders', () => {
   assert.equal(gofileAccountsUrl('https://api.example.io/'), 'https://api.example.io/accounts');
-  assert.equal(gofileContentsUrl('https://api.example.io', 'aBc/12', 'T K'), 'https://api.example.io/contents/aBc%2F12?wt=T%20K');
+  assert.equal(gofileContentsUrl('https://api.example.io', 'aBc/12'), 'https://api.example.io/contents/aBc%2F12?contentFilter=&page=1&pageSize=1000&sortField=name&sortDirection=1');
 });
 test('parseGofileAccounts / parseGofileContents', () => {
   assert.equal(parseGofileAccounts('{"status":"ok","data":{"token":"tok123"}}'), 'tok123');
@@ -380,6 +381,30 @@ test('derivedVideoPoster: non-matching shapes stay empty', () => {
   assert.equal(derivedVideoPoster('https://forum.example/phpBB2/data/video/abc/x.mp4'), '');  // dir not digits
   assert.equal(derivedVideoPoster('/phpBB2/data/video/5093/x.mp4'), '');               // relative (callers pass absolute)
   assert.equal(derivedVideoPoster(''), '');
+});
+
+// ---- gofile header auth (0.29) ----
+test('sha256Hex: vectors match node:crypto', () => {
+  for (const s of ['', 'abc', 'x'.repeat(55), 'x'.repeat(56), 'x'.repeat(63), 'x'.repeat(64), 'x'.repeat(1000), 'ünïcödé ✓ 漢字']) {
+    assert.equal(sha256Hex(s), createHash('sha256').update(s, 'utf8').digest('hex'), 'len ' + s.length);
+  }
+});
+test('gofileWebsiteToken: recipe = sha256(UA::lang::token::bucket::salt)', () => {
+  // 14400s buckets: same bucket -> same token, bucket+1 -> different
+  const ua = 'TestUA/1.0';
+  const t = gofileWebsiteToken(ua, 'en-US', 'tok', 14400 * 7 + 123, 'salt1');
+  assert.equal(t, createHash('sha256').update('TestUA/1.0::en-US::tok::7::salt1', 'utf8').digest('hex'));
+  assert.equal(gofileWebsiteToken(ua, 'en-US', 'tok', 14400 * 7 + 14400 - 1, 'salt1'), t); // same bucket
+  assert.notEqual(gofileWebsiteToken(ua, 'en-US', 'tok', 14400 * 8, 'salt1'), t);           // next bucket
+  assert.notEqual(gofileWebsiteToken(ua, 'en-US', 'tok', 14400 * 7, 'salt2'), t);           // salt changes it
+});
+test('gofileContentsUrl: paging params, no wt', () => {
+  assert.equal(gofileContentsUrl('https://api.gofile.io/', 'a/b c'), 'https://api.gofile.io/contents/a%2Fb%20c?contentFilter=&page=1&pageSize=1000&sortField=name&sortDirection=1');
+});
+test('parseGofileContents: soft errors surface their status', () => {
+  assert.deepEqual(parseGofileContents('{"status":"error-token","data":{}}'), { children: [], name: '', error: 'error-token' });
+  assert.deepEqual(parseGofileContents('{"status":"error-notFound","data":{}}'), { children: [], name: '', error: 'error-notFound' });
+  assert.equal(parseGofileContents('not json'), null); // hard garbage stays null (fetch-failure semantics)
 });
 
 // ---- cyberdrop-shaped albums (0.27) ----

@@ -54,6 +54,9 @@
     // "opted out", so it adopts the shipped default. 'none' (or any host
     // that never matches) is the explicit opt-out.
     if (!settings.albumHosts.length) settings.albumHosts = DEFAULT_SETTINGS.albumHosts.slice();
+    // gofile wt salt override: keep it a compact token shape when present
+    if (typeof settings.gofileSalt !== 'string') settings.gofileSalt = '';
+    settings.gofileSalt = settings.gofileSalt.trim().slice(0, 64);
     // Ollama-only phase: no provider picker — coerce stale stored presets and
     // drop bases that point at the old default so the UI shows one truth
     if (settings.aiProvider !== 'ollama') settings.aiProvider = 'ollama';

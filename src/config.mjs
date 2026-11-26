@@ -13,6 +13,7 @@ export const DEFAULT_SETTINGS = {
   mediaGroup: 'flat',          // media grid grouping: flat | post | page | user
   mediaOrder: 'default',       // panel item order: default | latest | react (one control, media + links)
   albumHosts: ['gofile.io'],   // hosts whose /d/<id> links are ALBUMS (SPA file hosts with an api.<domain> content API); /d/ otherwise stays video-page routed. gofile default-on (public API); blank/absent adopts this default, 'none' opts out
+  gofileSalt: '',              // override for the gofile X-Website-Token salt ('' = baked constant; gofile rotates it inside wt.obf.js)
   selectors: {},               // per-site selector overrides, merged over BASE_SEL
   aiProvider: 'ollama',        // AI tab provider preset (Ollama-only phase; engine stays provider-generic)
   aiBase: '',                  // '' = provider preset base URL
