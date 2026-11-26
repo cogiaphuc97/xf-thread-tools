@@ -49,6 +49,11 @@
     settings.albumHosts = settings.albumHosts
       .map((h) => String(h || '').trim().toLowerCase().replace(/^[*.]+/, ''))
       .filter((h) => h.length >= 3 && /^[a-z0-9.*-]+$/.test(h));
+    // 0.28.2: gofile albums default-on. Saves from 0.26–0.28.1 baked an
+    // EMPTY list into storage — that empty means "never configured", not
+    // "opted out", so it adopts the shipped default. 'none' (or any host
+    // that never matches) is the explicit opt-out.
+    if (!settings.albumHosts.length) settings.albumHosts = DEFAULT_SETTINGS.albumHosts.slice();
     // Ollama-only phase: no provider picker — coerce stale stored presets and
     // drop bases that point at the old default so the UI shows one truth
     if (settings.aiProvider !== 'ollama') settings.aiProvider = 'ollama';

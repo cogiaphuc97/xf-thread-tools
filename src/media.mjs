@@ -323,8 +323,9 @@ export function pairUnfurlPosters(seq) {
 // These hosts serve an empty app shell for /d/<id> and answer content from
 // a JSON API at api.<registrable-domain> with a guest-account token. The
 // /d/ path shape is shared with the file-page VIDEO adapter family, so
-// album routing is gated by a USER-SET host list (settings.albumHosts) —
-// the committed default is empty and carries no hostname.
+// album routing is gated by a HOST LIST (settings.albumHosts): gofile is
+// default-on (public API, committed in DEFAULT_SETTINGS), anything else
+// opts in via the settings field.
 export function albumHostMatches(url, hosts) {
   let h = '';
   try { h = new URL(String(url || '')).hostname.toLowerCase(); } catch (e) { return false; }

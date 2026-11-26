@@ -12,7 +12,7 @@ export const DEFAULT_SETTINGS = {
   forceAnimations: 0,          // 1 = run UI animations even under prefers-reduced-motion
   mediaGroup: 'flat',          // media grid grouping: flat | post | page | user
   mediaOrder: 'default',       // panel item order: default | latest | react (one control, media + links)
-  albumHosts: [],              // hosts whose /d/<id> links are ALBUMS (SPA file hosts with an api.<domain> content API); /d/ otherwise stays video-page routed
+  albumHosts: ['gofile.io'],   // hosts whose /d/<id> links are ALBUMS (SPA file hosts with an api.<domain> content API); /d/ otherwise stays video-page routed. gofile default-on (public API); blank/absent adopts this default, 'none' opts out
   selectors: {},               // per-site selector overrides, merged over BASE_SEL
   aiProvider: 'ollama',        // AI tab provider preset (Ollama-only phase; engine stays provider-generic)
   aiBase: '',                  // '' = provider preset base URL

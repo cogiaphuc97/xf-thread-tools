@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         xf-thread-tools
 // @namespace    xf-thread-tools
-// @version      0.28.1
+// @version      0.28.2
 // @description  XenForo 2: sort thread posts by reaction count across all pages (cached) + floating media panel (images / external links).
 // @author       xf-thread-tools
 // @match        *://*/threads/*
@@ -33,7 +33,7 @@
     forceAnimations: 0,          // 1 = run UI animations even under prefers-reduced-motion
     mediaGroup: 'flat',          // media grid grouping: flat | post | page | user
     mediaOrder: 'default',       // panel item order: default | latest | react (one control, media + links)
-    albumHosts: [],              // hosts whose /d/<id> links are ALBUMS (SPA file hosts with an api.<domain> content API); /d/ otherwise stays video-page routed
+    albumHosts: ['gofile.io'],   // hosts whose /d/<id> links are ALBUMS (SPA file hosts with an api.<domain> content API); /d/ otherwise stays video-page routed. gofile default-on (public API); blank/absent adopts this default, 'none' opts out
     selectors: {},               // per-site selector overrides, merged over BASE_SEL
     aiProvider: 'ollama',        // AI tab provider preset (Ollama-only phase; engine stays provider-generic)
     aiBase: '',                  // '' = provider preset base URL
@@ -384,8 +384,9 @@
   // These hosts serve an empty app shell for /d/<id> and answer content from
   // a JSON API at api.<registrable-domain> with a guest-account token. The
   // /d/ path shape is shared with the file-page VIDEO adapter family, so
-  // album routing is gated by a USER-SET host list (settings.albumHosts) —
-  // the committed default is empty and carries no hostname.
+  // album routing is gated by a HOST LIST (settings.albumHosts): gofile is
+  // default-on (public API, committed in DEFAULT_SETTINGS), anything else
+  // opts in via the settings field.
   function albumHostMatches(url, hosts) {
     let h = '';
     try { h = new URL(String(url || '')).hostname.toLowerCase(); } catch (e) { return false; }
@@ -1778,6 +1779,11 @@
       settings.albumHosts = settings.albumHosts
         .map((h) => String(h || '').trim().toLowerCase().replace(/^[*.]+/, ''))
         .filter((h) => h.length >= 3 && /^[a-z0-9.*-]+$/.test(h));
+      // 0.28.2: gofile albums default-on. Saves from 0.26–0.28.1 baked an
+      // EMPTY list into storage — that empty means "never configured", not
+      // "opted out", so it adopts the shipped default. 'none' (or any host
+      // that never matches) is the explicit opt-out.
+      if (!settings.albumHosts.length) settings.albumHosts = DEFAULT_SETTINGS.albumHosts.slice();
       // Ollama-only phase: no provider picker — coerce stale stored presets and
       // drop bases that point at the old default so the UI shows one truth
       if (settings.aiProvider !== 'ollama') settings.aiProvider = 'ollama';
@@ -6189,7 +6195,7 @@
         const inAuto = mkField('auto fetch on load (1/0)', settings.autoFetch ? 1 : 0);
         const inAnim = mkField('force animations (1/0)', settings.forceAnimations ? 1 : 0);
         const inBase = mkField('base path override (auto-detected when blank)', settings.basePath);
-        const inAlbumHosts = mkField('album hosts (/d/ links, comma-separated)', (settings.albumHosts || []).join(', '));
+        const inAlbumHosts = mkField('album hosts (/d/ links, comma-separated; blank = defaults, none = off)', (settings.albumHosts || []).join(', '));
         const save = mkBtn('Save', () => {
           const num = (v, def) => {
             const n = parseInt(v, 10);
