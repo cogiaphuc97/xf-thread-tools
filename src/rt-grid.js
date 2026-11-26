@@ -114,6 +114,17 @@
         thumb = document.createElement('div');
         thumb.className = 'xft-vtile';
         attachTilePoster(thumb, it.thumb);
+      } else if (it.album && !IMG_EXT_RE.test(it.url) && !VID_EXT_RE.test(it.url)) {
+        // page-shaped album child with NO thumb (0.27 bunkr window.albumFiles
+        // children: /f/<slug> landing pages, the album page no longer ships
+        // thumbs): the url is a page, never media bytes — hand it to the same
+        // styled-tile + og:image poster flow page-backed videos use, instead
+        // of an <img> whose src is HTML (doomed thumb-cache fetch, error
+        // dance, then a full-res swap). Viewer/downloads keep their own /f/
+        // resolution paths.
+        thumb = document.createElement('div');
+        thumb.className = 'xft-vtile';
+        ensureEmbedPoster(it.url, (p) => setTimeout(() => attachTilePoster(thumb, p), 0));
       } else {
         thumb = buildMediaEl(it.kind, it.url, true, (it.r.imgPages || {})[it.url] || '', it.poster || '');
       }

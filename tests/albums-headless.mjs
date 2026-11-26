@@ -101,9 +101,9 @@ async function main() {
     pages: 1, perPage: 2,
     imgUrl: (n) => (n === 1 ? ['/img/1.png'] : n === 2 ? ['/img/2.png'] : null),
     richPosts: (n, albumOrigin) => (n === 1
-      ? '<a href="' + albumOrigin + '/a/ab12">album a</a><a href="' + albumOrigin + '/a/empty1">album b</a><a href="' + albumOrigin + '/a/netfail1">album c</a>'
+      ? '<a href="' + albumOrigin + '/a/ab12">album a</a><a href="' + albumOrigin + '/a/empty1">album b</a><a href="' + albumOrigin + '/a/netfail1">album c</a><a href="' + albumOrigin + '/a/bunk1">bunkr album</a>'
       : n === 2
-        ? '<a href="' + albumOrigin + '/a/erome1">erome album</a><a href="' + albumOrigin + '/d/gf1">gofile album</a>'
+        ? '<a href="' + albumOrigin + '/a/erome1">erome album</a><a href="' + albumOrigin + '/d/gf1">gofile album</a><a href="' + albumOrigin + '/a/cyb1">cyberdrop album</a>'
         : null)
   });
 
@@ -179,6 +179,77 @@ async function main() {
     }
     check('US-001 sibling album expands to 3 children', nKids === 3, 'kids=' + nKids + ' ' + JSON.stringify(urls));
 
+    // ---- US-002: bunkr albumFiles children render as poster tiles ----
+    // 2 media children (mp4 + jpg; the zip is skipped) whose urls are /f/
+    // LANDING PAGES with no album-page thumbs: styled tile + og:image poster
+    // from the file page — never an <img>/<video> whose src is the page url
+    let bKids = 0;
+    for (let i = 0; i < 60; i++) {
+      urls = await cellUrls(cdp);
+      bKids = urls.filter((u) => /\/f\/slug91[12]$/.test(u)).length;
+      if (bKids === 2) break;
+      await sleep(400);
+    }
+    check('US-002 bunkr albumFiles album expands to 2 media children', bKids === 2, 'kids=' + bKids + ' ' + JSON.stringify(urls));
+    const badSrc = await ev(cdp, `[...document.querySelectorAll('.xft-cell img, .xft-cell video')].filter((e) => /\\/f\\/slug/.test(e.currentSrc || e.src || '')).length`);
+    check('US-002 no cell media element uses the /f/ page url as src', badSrc === 0, 'bad=' + badSrc);
+    const broken = await ev(cdp, `document.querySelectorAll('.xft-cell.xft-broken, .xft-cell.xft-stalled').length`);
+    check('US-002 page-shaped children never enter the broken/stalled path', broken === 0, 'broken=' + broken);
+    // posters land async (2-concurrent poster queue + 350ms gaps) — poll
+    let posters = 0;
+    for (let i = 0; i < 40; i++) {
+      posters = await ev(cdp, `[...document.querySelectorAll('.xft-cell')].filter((c) => /\\/f\\/slug91[12]$/.test(c.dataset.xftUrl || '') && c.querySelectorAll('.xft-vtile img').length).length`);
+      if (posters === 2) break;
+      await sleep(400);
+    }
+    check('US-002 child tiles show og:image posters', posters === 2, 'posters=' + posters);
+    {
+      let p911 = 0, p912 = 0;
+      for (let i = 0; i < 40; i++) {
+        const st = await fx.stats();
+        p911 = st['/f/slug911'] || 0;
+        p912 = st['/f/slug912'] || 0;
+        if (p911 >= 1 && p912 >= 1) break;
+        await sleep(400);
+      }
+      check('US-002 poster page fetched exactly once per child', p911 === 1 && p912 === 1, JSON.stringify({ p911: p911, p912: p912 }));
+    }
+
+    // ---- US-003 (0.27): cyberdrop anchors -> per-file info walk ----
+    let cImgs = 0, cVid = 0;
+    for (let i = 0; i < 60; i++) {
+      urls = await cellUrls(cdp);
+      cImgs = urls.filter((u) => /\/img\/c[12]\.png$/.test(u)).length;
+      cVid = urls.filter((u) => /\/dl\/c3\.mp4/.test(u)).length;
+      if (cImgs === 2 && cVid === 1) break;
+      await sleep(400);
+    }
+    check('US-003 cyberdrop album expands to 2 image + 1 video direct children', cImgs === 2 && cVid === 1, 'imgs=' + cImgs + ' vid=' + cVid + ' ' + JSON.stringify(urls));
+    // kinds: the images land on the Image sub-tab, the video on Video
+    await ev(cdp, `[...document.querySelectorAll('.xft-subtab')].find((b) => /^Image/.test(b.textContent)).click(); true`);
+    await sleep(400);
+    const imgTabUrls = await cellUrls(cdp);
+    const imgOk = imgTabUrls.filter((u) => /\/img\/c[12]\.png$/.test(u)).length === 2;
+    await ev(cdp, `[...document.querySelectorAll('.xft-subtab')].find((b) => /^Video/.test(b.textContent)).click(); true`);
+    await sleep(400);
+    const vidTabUrls = await cellUrls(cdp);
+    const vidOk = vidTabUrls.some((u) => /\/dl\/c3\.mp4/.test(u));
+    await ev(cdp, `[...document.querySelectorAll('.xft-subtab')].find((b) => /^All/.test(b.textContent)).click(); true`);
+    await sleep(400);
+    check('US-003 children carry correct kinds (Image tab has both imgs, Video tab the clip)', imgOk && vidOk, 'imgOk=' + imgOk + ' vidOk=' + vidOk);
+    {
+      let ok3 = false, ladder = false, auth1 = false;
+      for (let i = 0; i < 30; i++) {
+        const st = await fx.stats();
+        ok3 = ['c1', 'c2', 'c3'].every((id) => (st['infook|' + id] || 0) === 1);
+        ladder = ['c1', 'c2', 'c3'].every((id) => (st['info403|' + id] || 0) >= 1);
+        auth1 = ['c1', 'c2', 'c3'].every((id) => (st['auth|' + id] || 0) === 1);
+        if (ok3 && ladder && auth1) break;
+        await sleep(400);
+      }
+      check('US-003 referer ladder: info 403 (forum ref) then 200 (album ref), auth once each', ok3 && ladder && auth1, JSON.stringify(await fx.stats()));
+    }
+
     // ---- US-002: erome-shaped album expands (2 images + highest-res video) ----
     let eImgs = 0, eVid = 0;
     for (let i = 0; i < 60; i++) {
@@ -195,14 +266,21 @@ async function main() {
     await ev(cdp, `[...document.querySelectorAll('.xft-subtab')].find((b) => /^Album/.test(b.textContent)).click(); true`);
     await sleep(500);
     const albumTabUrls = await cellUrls(cdp);
-    const onAlbumTab = albumTabUrls.filter((u) => /\/img\/e[12]\.png$/.test(u) || /\/vz\/e1_720p\.mp4$/.test(u) || /\/f\/slug90[123]$/.test(u)).length;
-    check('US-002 children visible on the Album sub-tab', onAlbumTab === 6, JSON.stringify(albumTabUrls));
+    const onAlbumTab = albumTabUrls.filter((u) => /\/img\/e[12]\.png$/.test(u) || /\/vz\/e1_720p\.mp4$/.test(u) || /\/f\/slug(90[123]|91[12])$/.test(u)).length;
+    check('US-002 children visible on the Album sub-tab', onAlbumTab === 8, JSON.stringify(albumTabUrls));
     // 0.26.3: the Album badge counts ALBUMS (distinct containers), not
-    // child items — 4 albums here (ab12, erome1, gf1 + the unexpanded
-    // netfail tile) with 9 children
-    const badge = await ev(cdp, `[...document.querySelectorAll('.xft-subtab')].find((b) => /^Album/.test(b.textContent)).textContent`);
-    const albumTabTotal = albumTabUrls.length;
-    check('0.26.3 Album badge = album count, not item count', /^Album 4$/.test(badge) && albumTabTotal === 9, 'badge=' + JSON.stringify(badge) + ' items=' + albumTabTotal);
+    // child items — 6 albums here (ab12, erome1, gf1, bunk1, cyb1 + the
+    // unexpanded netfail tile) with 14 children. Poll BOTH (cyberdrop's
+    // sequential walk may still be mid-flight), then re-snapshot the tab.
+    let badge = '';
+    let albumTabTotal = 0;
+    for (let i = 0; i < 40; i++) {
+      badge = await ev(cdp, `[...document.querySelectorAll('.xft-subtab')].find((b) => /^Album/.test(b.textContent)).textContent`);
+      albumTabTotal = (await cellUrls(cdp)).length;
+      if (badge === 'Album 6' && albumTabTotal === 14) break;
+      await sleep(400);
+    }
+    check('0.26.3 Album badge = album count, not item count', /^Album 6$/.test(badge) && albumTabTotal === 14, 'badge=' + JSON.stringify(badge) + ' items=' + albumTabTotal);
     await ev(cdp, `[...document.querySelectorAll('.xft-subtab')].find((b) => /^All/.test(b.textContent)).click(); true`);
     await sleep(400);
 

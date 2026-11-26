@@ -14,7 +14,7 @@ const bundlePath = path.join(path.dirname(fileURLToPath(import.meta.url)), '..',
 test('bundle is a userscript with current version header', () => {
   const text = readFileSync(bundlePath, 'utf8');
   assert.ok(text.startsWith('// ==UserScript=='), 'meta header first');
-  assert.match(text, /@version\s+0\.26\.4/);
+  assert.match(text, /@version\s+0\.27\.0/);
   assert.match(text, /@grant\s+GM_xmlhttpRequest/);
 });
 

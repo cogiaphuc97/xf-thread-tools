@@ -1,7 +1,7 @@
 // Unit tests for the media module (src/media.mjs). Regrouped to mirror the src/ split.
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { albumDisplayName, albumHostMatches, boilerplateUrls, gofileAccountsUrl, gofileApiOrigin, gofileContentsUrl, hqCandidates, imagePageHref, isAlbumPageUrl, isSmilieUrl, pairUnfurlPosters, parseAlbumApiResponse, parseAlbumPage, parseAlbumTitle, parseGofileAccounts, parseGofileContents, parseImageApiResponse, parseImagePage } from '../src/media.mjs';
+import { albumDisplayName, albumHostMatches, boilerplateUrls, gofileAccountsUrl, gofileApiOrigin, gofileContentsUrl, hqCandidates, imagePageHref, isAlbumPageUrl, isSmilieUrl, pairUnfurlPosters, parseAlbumApiResponse, parseAlbumPage, parseAlbumTitle, parseCyberdropAuth, parseCyberdropFileAnchors, parseCyberdropFileinfo, parseGofileAccounts, parseGofileContents, parseImageApiResponse, parseImagePage } from '../src/media.mjs';
 
 
 // ---- boilerplateUrls (signature / "sent via app" footer fingerprint) ----
@@ -102,9 +102,10 @@ test('parseImageApiResponse: {image:{original_url}} extraction', () => {
 test('isAlbumPageUrl: /a/<id> shapes', () => {
   assert.equal(isAlbumPageUrl('https://bunkr.cr/a/EAednZ0S'), true);
   assert.equal(isAlbumPageUrl('https://goonbox.cr/a/YDo0O5'), true);
+  assert.equal(isAlbumPageUrl('https://goonbox.cr/a/some-model-album-pics.3tkY1'), true); // 0.27: XF-style dotted slug (real-world miss)
   assert.equal(isAlbumPageUrl('https://x.invalid/a/abc-123_xyz'), true);
   assert.equal(isAlbumPageUrl('https://x.invalid/a/ab'), false);           // id < 3
-  assert.equal(isAlbumPageUrl('https://x.invalid/a/a.mp4'), false);        // extension = file
+  assert.equal(isAlbumPageUrl('https://x.invalid/a/a.mp4'), true);         // 0.27: dot legal — indistinguishable from a dotted slug; /a/ is the album path family
   assert.equal(isAlbumPageUrl('https://x.invalid/a/one/two'), false);      // nested path
   assert.equal(isAlbumPageUrl('https://x.invalid/f/something'), false);
   assert.equal(isAlbumPageUrl('/a/EAednZ0S'), false);                      // not absolute
@@ -140,6 +141,57 @@ test('parseAlbumPage: empty shell / non-album html -> []', () => {
   assert.deepEqual(parseAlbumPage('<!doctype html><div id="app"></div>', 'https://host.invalid/a/x'), []);
 });
 
+test('parseAlbumPage: bunkr window.albumFiles array -> /f/<slug> children (0.27)', () => {
+  const html = [
+    '<!doctype html><html><head><title>Some Album | BUNKR</title></head><body><div id="app"></div>',
+    '<script>',
+    'window.albumFiles = [{\n',
+    "  id: 1, name: \"b3f0c9d2.mp4\",\n",
+    "  original: 'model - clip \\'01\\'.mp4',\n",
+    "  slug: 'slugV1', size: 1048576 ,\n",
+    '  timestamp: "12:00:00 01/01/2026"\n',
+    '},\n',
+    '{\n',
+    "  id: 2, name: \"aa11bb22.jpg\",\n",
+    "  original: 'photo 02.jpg',\n",
+    "  slug: 'slugI2', size: 2048 ,\n",
+    '  timestamp: "12:00:01 01/01/2026"\n',
+    '},\n',
+    '{\n',
+    "  id: 3, name: \"cc33.zip\",\n",
+    "  original: 'bundle.zip',\n",
+    "  slug: 'slugZ3', size: 4096 ,\n",
+    '  timestamp: "12:00:02 01/01/2026"\n',
+    '}];',
+    '</script>',
+    // stray markup that the OLD branches would match — must be IGNORED
+    // when albumFiles carries media (authoritative list)
+    '<div class="relative group/item theItem" title="stray.mp4">',
+    '  <img class="grid-images_box-img" src="https://static.scdn.st/u1/thumbs/stray.png">',
+    '  <a href="/f/STRAY"></a>',
+    '</div>',
+    '</body></html>'
+  ].join('');
+  const kids = parseAlbumPage(html, 'https://host.invalid/a/alb.dot1');
+  assert.equal(kids.length, 2); // zip skipped
+  assert.deepEqual(kids[0], { url: 'https://host.invalid/f/slugV1', kind: 'video', thumb: '', name: "model - clip '01'.mp4" }); // \\' unescaped
+  assert.deepEqual(kids[1], { url: 'https://host.invalid/f/slugI2', kind: 'image', thumb: '', name: 'photo 02.jpg' });
+  assert.ok(!kids.some((k) => /STRAY/.test(k.url))); // authoritative: stray theItem skipped
+});
+
+test('parseAlbumPage: albumFiles WITHOUT media falls through to the older branches', () => {
+  const html = [
+    '<script>window.albumFiles = [];</script>',
+    '<div class="relative group/item theItem" title="only.mp4">',
+    '  <img src="https://static.scdn.st/u1/thumbs/only.png">',
+    '  <a href="/f/ONLY1"></a>',
+    '</div>'
+  ].join('');
+  const kids = parseAlbumPage(html, 'https://host.invalid/a/x1');
+  assert.equal(kids.length, 1);
+  assert.equal(kids[0].url, 'https://host.invalid/f/ONLY1');
+});
+
 test('parseAlbumTitle: <title> extraction, entity unescape, whitespace collapse', () => {
   assert.equal(parseAlbumTitle('<html><head><title>My Album 2026</title></head><body></body></html>'), 'My Album 2026');
   assert.equal(parseAlbumTitle('<title>  spaced   out &amp;  tidy &quot;x&quot; </title>'), 'spaced out & tidy "x"');
@@ -154,6 +206,7 @@ test('albumDisplayName: parsed title wins, /a/<slug> fallback, garbage url last 
   assert.equal(albumDisplayName('https://h.invalid/a/ab12', ''), 'ab12'); // slug fallback
   assert.equal(albumDisplayName('https://h.invalid/a/ab12', undefined), 'ab12');
   assert.equal(albumDisplayName('https://h.invalid/a/ab12', '   '), 'ab12'); // blank name -> slug
+  assert.equal(albumDisplayName('https://h.invalid/a/pics-gallery.7Qk2x', ''), 'pics-gallery.7Qk2x'); // 0.27: dotted slug
   assert.equal(albumDisplayName('https://h.invalid/other', ''), 'https://h.invalid/other'); // no slug shape
   assert.equal(albumDisplayName('', ''), '?');
 });
@@ -293,4 +346,35 @@ test('parseGofileAccounts / parseGofileContents', () => {
   assert.equal(parseGofileContents('{"status":"ok","data":{}}'), null); // data without children keys later? data exists, children missing -> {children:[],name:''}
   const empty = parseGofileContents('{"status":"ok","data":{"children":{}}}');
   assert.deepEqual(empty, { children: [], name: '' }); // resolved-empty album
+});
+
+// ---- cyberdrop-shaped albums (0.27) ----
+test('parseCyberdropFileAnchors: id="file" /f/ anchors, attribute order + dedupe', () => {
+  const html = [
+    '<a id="file" href="/f/abc123">one</a>',
+    '<a href="/f/def456" id="file" class="x">two</a>',
+    '<a id="file" href="/f/abc123">dup of one</a>',
+    '<a id="other" href="/f/zzz">not a file anchor</a>',
+    '<a id="file" href="/v/nope">wrong path family</a>',
+    '<a id="file" href="/f/ghi.789">dotted id</a>'
+  ].join('');
+  assert.deepEqual(parseCyberdropFileAnchors(html), ['abc123', 'def456', 'ghi.789']);
+  assert.deepEqual(parseCyberdropFileAnchors(''), []);
+  assert.deepEqual(parseCyberdropFileAnchors('<div>no anchors</div>'), []);
+});
+
+test('parseCyberdropFileinfo: filename|name tolerance + auth_url requirement', () => {
+  assert.deepEqual(parseCyberdropFileinfo('{"filename":"pic-12.jpg","auth_url":"https://api.example.io/auth/12"}'), { name: 'pic-12.jpg', authUrl: 'https://api.example.io/auth/12' });
+  assert.deepEqual(parseCyberdropFileinfo('{"name":"clip.mp4","auth_url":"https://api.example.io/auth/13"}'), { name: 'clip.mp4', authUrl: 'https://api.example.io/auth/13' });
+  assert.equal(parseCyberdropFileinfo('{"name":"x.jpg"}'), null);            // no auth_url
+  assert.equal(parseCyberdropFileinfo('{"name":"x.jpg","auth_url":"rel"}'), null); // relative auth
+  assert.equal(parseCyberdropFileinfo('{"auth_url":"https://ok/"}'), null);  // no name
+  assert.equal(parseCyberdropFileinfo('not json'), null);
+});
+
+test('parseCyberdropAuth: direct url from the auth hop', () => {
+  assert.equal(parseCyberdropAuth('{"url":"https://serve.example.io/f/pic-12.jpg"}'), 'https://serve.example.io/f/pic-12.jpg');
+  assert.equal(parseCyberdropAuth('{"url":"/relative"}'), '');
+  assert.equal(parseCyberdropAuth('{}'), '');
+  assert.equal(parseCyberdropAuth('not json'), '');
 });

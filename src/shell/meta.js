@@ -1,11 +1,13 @@
 // ==UserScript==
 // @name         xf-thread-tools
 // @namespace    xf-thread-tools
-// @version      0.26.4
+// @version      0.27.0
 // @description  XenForo 2: sort thread posts by reaction count across all pages (cached) + floating media panel (images / external links).
 // @author       xf-thread-tools
 // @match        *://*/threads/*
 // @match        *://*/t/*
+// @match        *://*/*/threads/*
+// @match        *://*/*/t/*
 // @run-at       document-idle
 // @grant        GM_setValue
 // @grant        GM_getValue

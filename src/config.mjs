@@ -8,7 +8,7 @@ export const DEFAULT_SETTINGS = {
   rowCap: 500,                 // panel rows rendered before "show more" (Links tab)
   capBytes: DEFAULT_CAP_BYTES, // IndexedDB persistence cap
   autoFetch: 1,                // 1 = fetch the whole thread in background on page load
-  basePath: '',                // '' = forum at site root; '/forum' for subpath installs
+  basePath: '',                // '' = auto-detect the subpath the thread route sits under; '/forum' style override for exotic mounts
   forceAnimations: 0,          // 1 = run UI animations even under prefers-reduced-motion
   mediaGroup: 'flat',          // media grid grouping: flat | post | page | user
   mediaOrder: 'default',       // panel item order: default | latest | react (one control, media + links)
@@ -30,7 +30,7 @@ export const BASE_SEL = {
   repliesHost: '.message-main',
   image: 'img.bbImage',
   unfurlImage: 'img.bbCodeBlockUnfurl-image',
-  attachment: 'a[href*="attachments"]',
+  attachment: 'a[href*="attachments"], a.file-preview', // file-preview: XF2 attachment anchors whose file URLs live outside any /attachments/ path (data/<type>/ mounts)
   quote: 'blockquote.bbCodeBlock--quote',
   signature: '.message-signature',
   pageNav: '.pageNav',

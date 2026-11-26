@@ -74,7 +74,7 @@ const ANIM_GIF_B64 =
   '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';
 export function animGif() { return Buffer.from(ANIM_GIF_B64, 'base64'); }
 
-function postHtml(n, imgs, reactCounts = null, richHtml = null) {
+function postHtml(n, imgs, reactCounts = null, richHtml = null, attachHtml = null) {
   // image URLs embed as bbImage <img>; page-like URLs (video file-pages,
   // album links) must be plain <a> links — extraction classifies those into
   // videos/albums, while an <img> tag would force image classification
@@ -96,13 +96,13 @@ function postHtml(n, imgs, reactCounts = null, richHtml = null) {
   return `<article class="message message--post" data-content="post-${n}">
     <div class="message-inner"><div class="message-cell"><div class="message-main js-quickEditTarget">
       <header><a class="username message-name">u${n % 17}</a></header>
-      <div class="message-body"><div class="bbWrapper">${inner}${richHtml || ''}</div></div>
+      <div class="message-body"><div class="bbWrapper">${inner}${richHtml || ''}</div>${attachHtml || ''}</div>
       <footer>${bar}</footer>
     </div></div></div>
   </article>`;
 }
 
-export function threadHtml(pages, perPage, imgUrl, reactCounts = null, richPosts = null) {
+export function threadHtml(pages, perPage, imgUrl, reactCounts = null, richPosts = null, attachPosts = null) {
   let n = 1;
   const nav = Array.from({ length: pages }, (_, i) =>
     i === 0 ? `<span class="pageNav-page pageNav-page--current">1</span>`
@@ -113,7 +113,7 @@ export function threadHtml(pages, perPage, imgUrl, reactCounts = null, richPosts
     for (let k = 0; k < perPage; k++, n++) {
       const u = imgUrl(n, pageNo);
       // array return = multi-anchor post (links-probe fixtures)
-      if (u) out.push(postHtml(n, Array.isArray(u) ? u : [u], reactCounts, richPosts ? richPosts(n) : null));
+      if (u) out.push(postHtml(n, Array.isArray(u) ? u : [u], reactCounts, richPosts ? richPosts(n) : null, attachPosts ? attachPosts(n) : null));
     }
     return out.join('\n');
   };
@@ -145,7 +145,7 @@ function searchHtml(k, ids) {
   </body></html>`;
 }
 
-export function startFixtureServer({ pages = 30, perPage = 50, port = 0, imgUrl = null, reactCounts = null, richPosts = null } = {}) {
+export function startFixtureServer({ pages = 30, perPage = 50, port = 0, imgUrl = null, reactCounts = null, richPosts = null, attachPosts = null } = {}) {
   const png = tinyPng();
   const bmp = bigBmp();
   const gif = animGif();
@@ -197,11 +197,71 @@ export function startFixtureServer({ pages = 30, perPage = 50, port = 0, imgUrl 
       return;
     }
     // album-child file pages (/f/<slug> resolved against the album origin):
-    // og:video absolute URL is what parseVideoPage reads as the carrier
+    // og:video absolute URL is what parseVideoPage reads as the carrier;
+    // og:image (0.27) is what the album-child poster tile reads (MAIN
+    // origin — the album host serves /ximg/, not /img/)
     if (/^\/f\/slug\d+$/.test(u.pathname)) {
       const m = u.pathname.match(/slug(\d+)$/);
+      hits.set(u.pathname, (hits.get(u.pathname) || 0) + 1);
       ACAO(res); res.setHeader('content-type', 'text/html; charset=utf-8');
-      res.end('<!doctype html><html><head><meta property="og:video" content="http://127.0.0.1:' + albumPort + '/dl/' + (m ? m[1] : '1') + '.jpg?b=2000"></head><body>file page</body></html>');
+      res.end('<!doctype html><html><head><meta property="og:image" content="http://127.0.0.1:' + mainPort + '/img/' + (m ? m[1] : '901') + '.png"><meta property="og:video" content="http://127.0.0.1:' + albumPort + '/dl/' + (m ? m[1] : '1') + '.jpg?b=2000"></head><body>file page</body></html>');
+      return;
+    }
+    // 0.27 US-002: bunkr-shaped album page — the .theItem grid is GONE, the
+    // file list ships as a window.albumFiles JS array (2 media + 1 archive);
+    // /f/<slug> children have no album-page thumbs (poster from the file
+    // page's og:image)
+    if (u.pathname === '/a/bunk1') {
+      hits.set(u.pathname, (hits.get(u.pathname) || 0) + 1);
+      ACAO(res); res.setHeader('content-type', 'text/html; charset=utf-8');
+      const items = [
+        "  id: 1, name: \"b3f0.mp4\",\n  original: 'clip \\'01\\'.mp4',\n  slug: 'slug911', size: 1048576 ,\n  timestamp: \"12:00:00 01/01/2026\"\n",
+        "  id: 2, name: \"aa11.jpg\",\n  original: 'photo 02.jpg',\n  slug: 'slug912', size: 2048 ,\n  timestamp: \"12:00:01 01/01/2026\"\n",
+        "  id: 3, name: \"cc33.zip\",\n  original: 'bundle.zip',\n  slug: 'slug913', size: 4096 ,\n  timestamp: \"12:00:02 01/01/2026\"\n"
+      ];
+      res.end('<!doctype html><html><head><title>bunkr album</title></head><body><div id="app"></div><script>window.albumFiles = [{' + items.join('},\n{') + '}];</script></body></html>');
+      return;
+    }
+    // 0.27 US-003: cyberdrop-shaped album — server-rendered id="file" /f/
+    // anchors; direct urls via the per-file info API (info -> auth hop).
+    // The info endpoint is REFERER-WALLED: 403 unless the request carries
+    // the ALBUM origin as referer (first GM attempt sends the forum page
+    // referer -> 403 -> the ladder retries with the album origin -> 200).
+    if (u.pathname === '/a/cyb1') {
+      hits.set(u.pathname, (hits.get(u.pathname) || 0) + 1);
+      ACAO(res); res.setHeader('content-type', 'text/html; charset=utf-8');
+      res.end('<!doctype html><html><head><title>cyb album</title></head><body>'
+        + '<a id="file" href="/f/c1">f1</a><a href="/f/c2" id="file">f2</a><a id="file" href="/f/c3">f3</a>'
+        + '</body></html>');
+      return;
+    }
+    if (/^\/api\/file\/info\/c[123]$/.test(u.pathname)) {
+      const id = u.pathname.split('/').pop();
+      const ref = req.headers.referer || '';
+      // cross-origin fetch DOWNGRADES an explicit referrer to origin-only
+      // (strict-origin-when-cross-origin) — accept both forms
+      const albumOk = ref === 'http://127.0.0.1:' + albumPort || ref.indexOf('http://127.0.0.1:' + albumPort + '/') === 0;
+      hits.set((albumOk ? 'infook|' : 'info403|') + id, (hits.get((albumOk ? 'infook|' : 'info403|') + id) || 0) + 1);
+      ACAO(res); res.setHeader('content-type', 'application/json');
+      if (!albumOk) { res.statusCode = 403; res.end('{"error":"forbidden"}'); return; }
+      const meta = {
+        c1: { filename: 'pic-one.jpg', auth_url: 'http://127.0.0.1:' + albumPort + '/auth/c1' },
+        c2: { filename: 'pic-two.jpg', auth_url: 'http://127.0.0.1:' + albumPort + '/auth/c2' },
+        c3: { filename: 'clip.mp4', auth_url: 'http://127.0.0.1:' + albumPort + '/auth/c3' }
+      }[id];
+      res.end(JSON.stringify(meta));
+      return;
+    }
+    if (/^\/auth\/c[123]$/.test(u.pathname)) {
+      const id = u.pathname.split('/').pop();
+      hits.set('auth|' + id, (hits.get('auth|' + id) || 0) + 1);
+      ACAO(res); res.setHeader('content-type', 'application/json');
+      const direct = {
+        c1: 'http://127.0.0.1:' + mainPort + '/img/c1.png',
+        c2: 'http://127.0.0.1:' + mainPort + '/img/c2.png',
+        c3: 'http://127.0.0.1:' + albumPort + '/dl/c3.mp4?b=2500'
+      }[id];
+      res.end(JSON.stringify({ url: direct }));
       return;
     }
     if (u.pathname === '/a/ab12') {
@@ -330,6 +390,14 @@ export function startFixtureServer({ pages = 30, perPage = 50, port = 0, imgUrl 
       res.end(want > png.length ? Buffer.concat([png, Buffer.alloc(want - png.length)]) : png);
       return;
     }
+    // subpath-install attachment thumbs (/phpBB2/data/attachments/…): the
+    // attachmentList <img> render 404s otherwise — png bytes, no hit counting
+    // (the extractor never scans it)
+    if (u.pathname.startsWith('/phpBB2/data/attachments/')) {
+      ACAO(res); res.setHeader('content-type', 'image/png');
+      res.end(png);
+      return;
+    }
     if (u.pathname.startsWith('/img/') || u.pathname.startsWith('/big/') || u.pathname === '/anim.gif') {
       hits.set(u.pathname, (hits.get(u.pathname) || 0) + 1);
       if (u.pathname.startsWith('/img/')) logTl(res, u, 'main'); // thumb-traffic timing only for /img/
@@ -340,8 +408,9 @@ export function startFixtureServer({ pages = 30, perPage = 50, port = 0, imgUrl 
       sendDelayed(res, d, u.pathname.startsWith('/big/') ? bmp : u.pathname === '/anim.gif' ? gif : png);
       return;
     }
-    const pm = u.pathname.match(/^\/threads\/777\/(?:page-(\d+))?\/?$/);
+    const pm = u.pathname.match(/^\/(?:phpBB2\/)?threads\/777\/(?:page-(\d+))?\/?$/);
     if (pm) {
+      hits.set(u.pathname, (hits.get(u.pathname) || 0) + 1);
       ACAO(res); res.setHeader('content-type', 'text/html; charset=utf-8');
       res.end(page(Math.min(pages, parseInt(pm[1] || '1', 10))));
       return;
@@ -374,7 +443,7 @@ export function startFixtureServer({ pages = 30, perPage = 50, port = 0, imgUrl 
   return Promise.all([listen(server, port), listen(albumHost, 0)]).then(([mp, ap]) => {
     mainPort = mp;
     albumPort = ap;
-    page = threadHtml(pages, perPage, (n, p) => (imgUrl || mixImg)(n, p, 'http://127.0.0.1:' + albumPort), reactCounts, richPosts ? (n) => richPosts(n, 'http://127.0.0.1:' + albumPort) : null);
+    page = threadHtml(pages, perPage, (n, p) => (imgUrl || mixImg)(n, p, 'http://127.0.0.1:' + albumPort), reactCounts, richPosts ? (n) => richPosts(n, 'http://127.0.0.1:' + albumPort) : null, attachPosts);
     return {
       port: mp,
       albumPort: ap,

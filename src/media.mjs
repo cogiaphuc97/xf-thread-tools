@@ -108,14 +108,18 @@ export function hqCandidates(url) {
   cands.push(url);
   return cands;
 }
-// Album pages (path /a/<id>, no extension): hosts that group many files
-// behind one landing page. Cross-host callers also guard against the
-// forum's own /a/ routes (same test the /d/ reclassification uses).
+// Album pages (path /a/<id>): hosts that group many files behind one
+// landing page. The id charset allows dots — XF-style keys are
+// `<slug>.<id>` (e.g. /a/some-model-album-pics.3tkY1 — shape from a
+// real-world miss), and a dot was what silently dropped such albums at
+// CLASSIFICATION.
+// Cross-host callers also guard against the forum's own /a/ routes (same
+// test the /d/ reclassification uses).
 export function isAlbumPageUrl(u) {
   const s = String(u || '');
   if (!/^https?:\/\//i.test(s)) return false;
   const path = s.replace(/^https?:\/\/[^/]+/i, '').split(/[?#]/)[0];
-  return /^\/a\/[A-Za-z0-9_-]{3,64}$/.test(path);
+  return /^\/a\/[A-Za-z0-9_.-]{3,64}$/.test(path);
 }
 
 // Album display name from the album page HTML <title> (pure). Empty string
@@ -133,7 +137,7 @@ export function albumDisplayName(url, name) {
   const nm = String(name || '').trim();
   if (nm) return nm;
   const s = String(url || '');
-  const m = s.match(/\/a\/([A-Za-z0-9_-]{3,64})$/);
+  const m = s.match(/\/a\/([A-Za-z0-9_.-]{3,64})$/);
   return m ? m[1] : (s || '?');
 }
 
@@ -147,6 +151,33 @@ export function parseAlbumPage(html, baseUrl) {
   const out = [];
   if (!h) return out;
   const unesc = (s) => s.replace(/&quot;/g, '"').replace(/&#39;/g, "'").replace(/&amp;/g, '&');
+  // ---- bunkr-shaped album pages (0.27): the server-rendered .theItem grid
+  // is gone — the file list ships as a JS array assignment inside a script
+  // tag (the visual grid hydrates from it client-side):
+  //   window.albumFiles = [ { id: 1, name: "uuid.ext",
+  //     original: 'Pretty Name.jpg', slug: 'abc123', size: 123 ,
+  //     timestamp: "…" }, … ];
+  // When the array carries media it IS the authoritative list — stray markup
+  // elsewhere on the page cannot inject junk children (the old parser's
+  // exactly-one-stray-match bug). Children point at the /f/<slug> file page
+  // with thumb '' (styled tile + poster fetch at the cell; the /f/ resolver
+  // carries the direct stream). Escaped \' inside names unescapes.
+  const af = h.match(/window\.albumFiles\s*=\s*\[([\s\S]*?)\][\s\S]*?<\/script>/);
+  if (af) {
+    const jsUnesc = (s) => s.replace(/\\'/g, "'").replace(/\\\\/g, '\\');
+    for (const b of af[1].split('\n},\n')) {
+      const om = b.match(/original:\s*'((?:\\.|[^'])*)'/);
+      const sm = b.match(/slug:\s*'([^']*)'/);
+      if (!om || !sm || !sm[1]) continue;
+      const name = jsUnesc(om[1]);
+      const kind = VID_EXT_RE.test(name) ? 'video' : (IMG_EXT_RE.test(name) ? 'image' : '');
+      if (!kind) continue; // archives / unknown — not grid media
+      let url = '';
+      try { url = new URL('/f/' + sm[1], baseUrl).href; } catch (e) { continue; }
+      out.push({ url: url, kind: kind, thumb: '', name: name });
+    }
+    if (out.length) return out;
+  }
   // split on the item-block class marker; each chunk is one item's markup
   const blocks = h.split(/class="[^"]*\btheItem\b/).slice(1);
   for (const b of blocks) {
@@ -269,6 +300,48 @@ export function gofileApiOrigin(pageUrl) {
     const parts = u.hostname.split('.');
     const dom = parts.length > 2 ? parts.slice(-2).join('.') : u.hostname;
     return u.protocol + '//api.' + dom;
+  } catch (e) { return ''; }
+}
+
+// ---- cyberdrop-shaped server-rendered albums (0.27) ----
+// The /a/ page lists files as anchors <a id="file" href="/f/<id>"> (attr
+// order varies); the direct url is NOT in the page — a public per-file
+// info API carries it, with the final url one auth hop further:
+//   GET <api-origin>/api/file/info/<id> -> {name|filename, auth_url}
+//   GET <auth_url>                      -> {url}
+export function parseCyberdropFileAnchors(html) {
+  const h = String(html || '');
+  const out = [];
+  const seen = new Set();
+  for (const m of h.matchAll(/<a\b([^>]*)>/g)) {
+    const attrs = m[1] || '';
+    if (!/(?:^|\s)id=["']file["'](?:\s|$)/.test(attrs)) continue;
+    const href = attrs.match(/href=["']\/f\/([A-Za-z0-9_.-]{1,64})["']/);
+    if (!href || seen.has(href[1])) continue;
+    seen.add(href[1]);
+    out.push(href[1]);
+  }
+  return out;
+}
+
+// info response -> {name, authUrl} | null (parse failure)
+export function parseCyberdropFileinfo(text) {
+  try {
+    const j = JSON.parse(String(text || ''));
+    if (!j || typeof j !== 'object') return null;
+    const name = typeof j.filename === 'string' && j.filename ? j.filename : (typeof j.name === 'string' ? j.name : '');
+    const authUrl = typeof j.auth_url === 'string' ? j.auth_url : '';
+    if (!name || !/^https?:\/\//.test(authUrl)) return null;
+    return { name: name, authUrl: authUrl };
+  } catch (e) { return null; }
+}
+
+// auth response -> direct url | ''
+export function parseCyberdropAuth(text) {
+  try {
+    const j = JSON.parse(String(text || ''));
+    const u = j && typeof j.url === 'string' ? j.url : '';
+    return /^https?:\/\//.test(u) ? u : '';
   } catch (e) { return ''; }
 }
 

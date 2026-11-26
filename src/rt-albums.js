@@ -135,6 +135,85 @@
         walk(tok);
       }, onErr);
     }
+    // one JSON GET with status split + the 403 referer ladder (0.27): hot-
+    // link-walled API families 403 the FORUM referer a page-context fetch
+    // sends by default; retry once with Referer <album origin>/ (same-origin
+    // semantics — the SPA's own XHRs carry it) before the hop fails. Mirrors
+    // the download ladder: one alternate-policy retry, then give up.
+    function cyberJsonGet(url, albumOrigin, onOk, onFail, onGone) {
+      const go = (withRef) => {
+        if (typeof GM_xmlhttpRequest === 'function') {
+          try {
+            GM_xmlhttpRequest({
+              method: 'GET', url: url, timeout: 10000,
+              headers: withRef ? { Referer: albumOrigin + '/' } : undefined,
+              onload: (r) => {
+                const st = r && r.status || 0;
+                if (st === 403 && !withRef) { go(true); return; }
+                if (st === 404 || st === 410) onGone();
+                else if (st >= 200 && st < 400) onOk(r && r.responseText || '');
+                else onFail();
+              },
+              onerror: onFail, ontimeout: onFail
+            });
+            return;
+          } catch (e) { /* fall through to fetch */ }
+        }
+        const ctl = new AbortController();
+        let fired = false;
+        const err = () => { if (fired) return; fired = true; onFail(); };
+        const t = setTimeout(() => { try { ctl.abort(); } catch (e) {} err(); }, 10000);
+        fetch(url, Object.assign(
+          { signal: ctl.signal, credentials: 'omit' },
+          withRef ? { referrer: albumOrigin + '/' } : null
+        ))
+          .then(async (r) => {
+            clearTimeout(t);
+            if (r.status === 403 && !withRef) { try { await r.text(); } catch (e) {} go(true); return; }
+            if (r.status === 404 || r.status === 410) { try { await r.text(); } catch (e) {} if (fired) return; fired = true; onGone(); }
+            else if (r.status >= 200 && r.status < 400) onOk(await r.text());
+            else err();
+          })
+          .catch(err);
+      };
+      go(false);
+    }
+    // cyberdrop-shaped expansion (0.27): the page's id="file" /f/ anchors
+    // resolve one-by-one through the public per-file info API (info ->
+    // auth hop -> direct url). ALL anchors resolved persists for the TTL;
+    // zero resolved is a fetch failure (cooldown, tile stays); a partial
+    // set stays session-only — same truncation rule as the API walk.
+    function expandCyberdropAlbum(url, ids, title) {
+      const api = gofileApiOrigin(url);
+      let origin = '';
+      try { origin = new URL(url).origin; } catch (e) {}
+      if (!api || !origin || !ids.length) { albumDone(url, null, true, ''); return; }
+      const kids = [];
+      const seen = new Set();
+      let i = 0;
+      const step = () => {
+        if (i >= ids.length) {
+          if (!kids.length) albumDone(url, null, true, '');
+          else albumDone(url, kids, kids.length === ids.length, title || '');
+          return;
+        }
+        const id = ids[i++];
+        cyberJsonGet(api + '/api/file/info/' + encodeURIComponent(id), origin, (t) => {
+          const info = parseCyberdropFileinfo(t);
+          if (!info) { step(); return; }
+          cyberJsonGet(info.authUrl, origin, (t2) => {
+            const direct = parseCyberdropAuth(t2);
+            if (direct && !seen.has(direct)) {
+              seen.add(direct);
+              const kind = VID_EXT_RE.test(info.name) ? 'video' : (IMG_EXT_RE.test(info.name) ? 'image' : '');
+              if (kind) kids.push({ url: direct, kind: kind, thumb: '', name: info.name });
+            }
+            step();
+          }, step, step);
+        }, step, step);
+      };
+      step();
+    }
     function expandAlbum(url) {
       // HTML first: server-rendered hosts answer the full item grid in the
       // page (one request, children + thumbs together). An SPA shell (no
@@ -147,6 +226,12 @@
           expandGofileAlbum(url, () => albumDone(url, null, true, ''));
           return;
         }
+        // cyberdrop-shaped server-rendered anchors: per-file info walk (the
+        // direct urls are not in the page, and these hosts have no
+        // /api/albums — the generic walk below would just 404 the album
+        // into a resolved-empty drop)
+        const cfIds = parseCyberdropFileAnchors(text);
+        if (cfIds.length) { expandCyberdropAlbum(url, cfIds, parseAlbumTitle(text)); return; }
         const acc = [];
         const seen = new Set();
         let nm = '';

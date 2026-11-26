@@ -20,7 +20,7 @@
       const inRows = mkField('panel row cap (Links)', settings.rowCap);
       const inAuto = mkField('auto fetch on load (1/0)', settings.autoFetch ? 1 : 0);
       const inAnim = mkField('force animations (1/0)', settings.forceAnimations ? 1 : 0);
-      const inBase = mkField('base path (subpath installs)', settings.basePath);
+      const inBase = mkField('base path override (auto-detected when blank)', settings.basePath);
       const inAlbumHosts = mkField('album hosts (/d/ links, comma-separated)', (settings.albumHosts || []).join(', '));
       const save = mkBtn('Save', () => {
         const num = (v, def) => {

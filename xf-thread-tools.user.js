@@ -1,11 +1,13 @@
 // ==UserScript==
 // @name         xf-thread-tools
 // @namespace    xf-thread-tools
-// @version      0.26.4
+// @version      0.27.0
 // @description  XenForo 2: sort thread posts by reaction count across all pages (cached) + floating media panel (images / external links).
 // @author       xf-thread-tools
 // @match        *://*/threads/*
 // @match        *://*/t/*
+// @match        *://*/*/threads/*
+// @match        *://*/*/t/*
 // @run-at       document-idle
 // @grant        GM_setValue
 // @grant        GM_getValue
@@ -27,7 +29,7 @@
     rowCap: 500,                 // panel rows rendered before "show more" (Links tab)
     capBytes: DEFAULT_CAP_BYTES, // IndexedDB persistence cap
     autoFetch: 1,                // 1 = fetch the whole thread in background on page load
-    basePath: '',                // '' = forum at site root; '/forum' for subpath installs
+    basePath: '',                // '' = auto-detect the subpath the thread route sits under; '/forum' style override for exotic mounts
     forceAnimations: 0,          // 1 = run UI animations even under prefers-reduced-motion
     mediaGroup: 'flat',          // media grid grouping: flat | post | page | user
     mediaOrder: 'default',       // panel item order: default | latest | react (one control, media + links)
@@ -49,7 +51,7 @@
     repliesHost: '.message-main',
     image: 'img.bbImage',
     unfurlImage: 'img.bbCodeBlockUnfurl-image',
-    attachment: 'a[href*="attachments"]',
+    attachment: 'a[href*="attachments"], a.file-preview', // file-preview: XF2 attachment anchors whose file URLs live outside any /attachments/ path (data/<type>/ mounts)
     quote: 'blockquote.bbCodeBlock--quote',
     signature: '.message-signature',
     pageNav: '.pageNav',
@@ -168,14 +170,18 @@
     cands.push(url);
     return cands;
   }
-  // Album pages (path /a/<id>, no extension): hosts that group many files
-  // behind one landing page. Cross-host callers also guard against the
-  // forum's own /a/ routes (same test the /d/ reclassification uses).
+  // Album pages (path /a/<id>): hosts that group many files behind one
+  // landing page. The id charset allows dots — XF-style keys are
+  // `<slug>.<id>` (e.g. /a/some-model-album-pics.3tkY1 — shape from a
+  // real-world miss), and a dot was what silently dropped such albums at
+  // CLASSIFICATION.
+  // Cross-host callers also guard against the forum's own /a/ routes (same
+  // test the /d/ reclassification uses).
   function isAlbumPageUrl(u) {
     const s = String(u || '');
     if (!/^https?:\/\//i.test(s)) return false;
     const path = s.replace(/^https?:\/\/[^/]+/i, '').split(/[?#]/)[0];
-    return /^\/a\/[A-Za-z0-9_-]{3,64}$/.test(path);
+    return /^\/a\/[A-Za-z0-9_.-]{3,64}$/.test(path);
   }
   
   // Album display name from the album page HTML <title> (pure). Empty string
@@ -193,7 +199,7 @@
     const nm = String(name || '').trim();
     if (nm) return nm;
     const s = String(url || '');
-    const m = s.match(/\/a\/([A-Za-z0-9_-]{3,64})$/);
+    const m = s.match(/\/a\/([A-Za-z0-9_.-]{3,64})$/);
     return m ? m[1] : (s || '?');
   }
   
@@ -207,6 +213,33 @@
     const out = [];
     if (!h) return out;
     const unesc = (s) => s.replace(/&quot;/g, '"').replace(/&#39;/g, "'").replace(/&amp;/g, '&');
+    // ---- bunkr-shaped album pages (0.27): the server-rendered .theItem grid
+    // is gone — the file list ships as a JS array assignment inside a script
+    // tag (the visual grid hydrates from it client-side):
+    //   window.albumFiles = [ { id: 1, name: "uuid.ext",
+    //     original: 'Pretty Name.jpg', slug: 'abc123', size: 123 ,
+    //     timestamp: "…" }, … ];
+    // When the array carries media it IS the authoritative list — stray markup
+    // elsewhere on the page cannot inject junk children (the old parser's
+    // exactly-one-stray-match bug). Children point at the /f/<slug> file page
+    // with thumb '' (styled tile + poster fetch at the cell; the /f/ resolver
+    // carries the direct stream). Escaped \' inside names unescapes.
+    const af = h.match(/window\.albumFiles\s*=\s*\[([\s\S]*?)\][\s\S]*?<\/script>/);
+    if (af) {
+      const jsUnesc = (s) => s.replace(/\\'/g, "'").replace(/\\\\/g, '\\');
+      for (const b of af[1].split('\n},\n')) {
+        const om = b.match(/original:\s*'((?:\\.|[^'])*)'/);
+        const sm = b.match(/slug:\s*'([^']*)'/);
+        if (!om || !sm || !sm[1]) continue;
+        const name = jsUnesc(om[1]);
+        const kind = VID_EXT_RE.test(name) ? 'video' : (IMG_EXT_RE.test(name) ? 'image' : '');
+        if (!kind) continue; // archives / unknown — not grid media
+        let url = '';
+        try { url = new URL('/f/' + sm[1], baseUrl).href; } catch (e) { continue; }
+        out.push({ url: url, kind: kind, thumb: '', name: name });
+      }
+      if (out.length) return out;
+    }
     // split on the item-block class marker; each chunk is one item's markup
     const blocks = h.split(/class="[^"]*\btheItem\b/).slice(1);
     for (const b of blocks) {
@@ -328,6 +361,48 @@
       const parts = u.hostname.split('.');
       const dom = parts.length > 2 ? parts.slice(-2).join('.') : u.hostname;
       return u.protocol + '//api.' + dom;
+    } catch (e) { return ''; }
+  }
+  
+  // ---- cyberdrop-shaped server-rendered albums (0.27) ----
+  // The /a/ page lists files as anchors <a id="file" href="/f/<id>"> (attr
+  // order varies); the direct url is NOT in the page — a public per-file
+  // info API carries it, with the final url one auth hop further:
+  //   GET <api-origin>/api/file/info/<id> -> {name|filename, auth_url}
+  //   GET <auth_url>                      -> {url}
+  function parseCyberdropFileAnchors(html) {
+    const h = String(html || '');
+    const out = [];
+    const seen = new Set();
+    for (const m of h.matchAll(/<a\b([^>]*)>/g)) {
+      const attrs = m[1] || '';
+      if (!/(?:^|\s)id=["']file["'](?:\s|$)/.test(attrs)) continue;
+      const href = attrs.match(/href=["']\/f\/([A-Za-z0-9_.-]{1,64})["']/);
+      if (!href || seen.has(href[1])) continue;
+      seen.add(href[1]);
+      out.push(href[1]);
+    }
+    return out;
+  }
+  
+  // info response -> {name, authUrl} | null (parse failure)
+  function parseCyberdropFileinfo(text) {
+    try {
+      const j = JSON.parse(String(text || ''));
+      if (!j || typeof j !== 'object') return null;
+      const name = typeof j.filename === 'string' && j.filename ? j.filename : (typeof j.name === 'string' ? j.name : '');
+      const authUrl = typeof j.auth_url === 'string' ? j.auth_url : '';
+      if (!name || !/^https?:\/\//.test(authUrl)) return null;
+      return { name: name, authUrl: authUrl };
+    } catch (e) { return null; }
+  }
+  
+  // auth response -> direct url | ''
+  function parseCyberdropAuth(text) {
+    try {
+      const j = JSON.parse(String(text || ''));
+      const u = j && typeof j.url === 'string' ? j.url : '';
+      return /^https?:\/\//.test(u) ? u : '';
     } catch (e) { return ''; }
   }
   
@@ -1674,17 +1749,24 @@
       // XF ships two thread routes: /threads/{slug}.{id} and the short /t/{slug}.{id}.
       // Remember BOTH the prefix and the full slug segment: rebuilt URLs must
       // reuse the exact route the user is on (some sites' WAF/SEO rules 404 or
-      // redirect slugless /threads/{id} shapes).
+      // redirect slugless /threads/{id} shapes). Subpath installs
+      // (/phpBB2/threads/…) are captured too: everything before the route
+      // prefix becomes the default basePath (user-set basePath still wins).
       const route = (function () {
-        const m = location.pathname.match(/\/(threads|t)\/([^/?#]+)/);
+        const m = location.pathname.match(/^(.*?\/)?(threads|t)\/([^/?#]+)/);
         if (!m) return null;
-        const seg = decodeURIComponent(m[2]);
+        const seg = decodeURIComponent(m[3]);
         const dot = seg.lastIndexOf('.');
         const tail = dot >= 0 ? seg.slice(dot + 1) : seg;
-        return { prefix: m[1], seg: seg, id: /^\d+$/.test(tail) ? tail : seg };
+        return { prefix: m[2], seg: seg, id: /^\d+$/.test(tail) ? tail : seg, base: m[1] ? m[1].replace(/\/+$/, '') : '' };
       })();
       if (!route) return; // non-standard thread route: stay silent
       const threadId = route.id;
+      // basePath '' = auto: page-walk URLs reuse the subpath the thread was
+      // actually browsed under (root installs collapse to ''). An explicitly
+      // stored basePath overrides (exotic mounts where fetching must target a
+      // different base than browsing).
+      if (!settings.basePath) settings.basePath = route.base;
 
       const threadKey = threadId;
 
@@ -2489,6 +2571,17 @@
           thumb = document.createElement('div');
           thumb.className = 'xft-vtile';
           attachTilePoster(thumb, it.thumb);
+        } else if (it.album && !IMG_EXT_RE.test(it.url) && !VID_EXT_RE.test(it.url)) {
+          // page-shaped album child with NO thumb (0.27 bunkr window.albumFiles
+          // children: /f/<slug> landing pages, the album page no longer ships
+          // thumbs): the url is a page, never media bytes — hand it to the same
+          // styled-tile + og:image poster flow page-backed videos use, instead
+          // of an <img> whose src is HTML (doomed thumb-cache fetch, error
+          // dance, then a full-res swap). Viewer/downloads keep their own /f/
+          // resolution paths.
+          thumb = document.createElement('div');
+          thumb.className = 'xft-vtile';
+          ensureEmbedPoster(it.url, (p) => setTimeout(() => attachTilePoster(thumb, p), 0));
         } else {
           thumb = buildMediaEl(it.kind, it.url, true, (it.r.imgPages || {})[it.url] || '', it.poster || '');
         }
@@ -3609,6 +3702,85 @@
           walk(tok);
         }, onErr);
       }
+      // one JSON GET with status split + the 403 referer ladder (0.27): hot-
+      // link-walled API families 403 the FORUM referer a page-context fetch
+      // sends by default; retry once with Referer <album origin>/ (same-origin
+      // semantics — the SPA's own XHRs carry it) before the hop fails. Mirrors
+      // the download ladder: one alternate-policy retry, then give up.
+      function cyberJsonGet(url, albumOrigin, onOk, onFail, onGone) {
+        const go = (withRef) => {
+          if (typeof GM_xmlhttpRequest === 'function') {
+            try {
+              GM_xmlhttpRequest({
+                method: 'GET', url: url, timeout: 10000,
+                headers: withRef ? { Referer: albumOrigin + '/' } : undefined,
+                onload: (r) => {
+                  const st = r && r.status || 0;
+                  if (st === 403 && !withRef) { go(true); return; }
+                  if (st === 404 || st === 410) onGone();
+                  else if (st >= 200 && st < 400) onOk(r && r.responseText || '');
+                  else onFail();
+                },
+                onerror: onFail, ontimeout: onFail
+              });
+              return;
+            } catch (e) { /* fall through to fetch */ }
+          }
+          const ctl = new AbortController();
+          let fired = false;
+          const err = () => { if (fired) return; fired = true; onFail(); };
+          const t = setTimeout(() => { try { ctl.abort(); } catch (e) {} err(); }, 10000);
+          fetch(url, Object.assign(
+            { signal: ctl.signal, credentials: 'omit' },
+            withRef ? { referrer: albumOrigin + '/' } : null
+          ))
+            .then(async (r) => {
+              clearTimeout(t);
+              if (r.status === 403 && !withRef) { try { await r.text(); } catch (e) {} go(true); return; }
+              if (r.status === 404 || r.status === 410) { try { await r.text(); } catch (e) {} if (fired) return; fired = true; onGone(); }
+              else if (r.status >= 200 && r.status < 400) onOk(await r.text());
+              else err();
+            })
+            .catch(err);
+        };
+        go(false);
+      }
+      // cyberdrop-shaped expansion (0.27): the page's id="file" /f/ anchors
+      // resolve one-by-one through the public per-file info API (info ->
+      // auth hop -> direct url). ALL anchors resolved persists for the TTL;
+      // zero resolved is a fetch failure (cooldown, tile stays); a partial
+      // set stays session-only — same truncation rule as the API walk.
+      function expandCyberdropAlbum(url, ids, title) {
+        const api = gofileApiOrigin(url);
+        let origin = '';
+        try { origin = new URL(url).origin; } catch (e) {}
+        if (!api || !origin || !ids.length) { albumDone(url, null, true, ''); return; }
+        const kids = [];
+        const seen = new Set();
+        let i = 0;
+        const step = () => {
+          if (i >= ids.length) {
+            if (!kids.length) albumDone(url, null, true, '');
+            else albumDone(url, kids, kids.length === ids.length, title || '');
+            return;
+          }
+          const id = ids[i++];
+          cyberJsonGet(api + '/api/file/info/' + encodeURIComponent(id), origin, (t) => {
+            const info = parseCyberdropFileinfo(t);
+            if (!info) { step(); return; }
+            cyberJsonGet(info.authUrl, origin, (t2) => {
+              const direct = parseCyberdropAuth(t2);
+              if (direct && !seen.has(direct)) {
+                seen.add(direct);
+                const kind = VID_EXT_RE.test(info.name) ? 'video' : (IMG_EXT_RE.test(info.name) ? 'image' : '');
+                if (kind) kids.push({ url: direct, kind: kind, thumb: '', name: info.name });
+              }
+              step();
+            }, step, step);
+          }, step, step);
+        };
+        step();
+      }
       function expandAlbum(url) {
         // HTML first: server-rendered hosts answer the full item grid in the
         // page (one request, children + thumbs together). An SPA shell (no
@@ -3621,6 +3793,12 @@
             expandGofileAlbum(url, () => albumDone(url, null, true, ''));
             return;
           }
+          // cyberdrop-shaped server-rendered anchors: per-file info walk (the
+          // direct urls are not in the page, and these hosts have no
+          // /api/albums — the generic walk below would just 404 the album
+          // into a resolved-empty drop)
+          const cfIds = parseCyberdropFileAnchors(text);
+          if (cfIds.length) { expandCyberdropAlbum(url, cfIds, parseAlbumTitle(text)); return; }
           const acc = [];
           const seen = new Set();
           let nm = '';
@@ -5948,7 +6126,7 @@
         const inRows = mkField('panel row cap (Links)', settings.rowCap);
         const inAuto = mkField('auto fetch on load (1/0)', settings.autoFetch ? 1 : 0);
         const inAnim = mkField('force animations (1/0)', settings.forceAnimations ? 1 : 0);
-        const inBase = mkField('base path (subpath installs)', settings.basePath);
+        const inBase = mkField('base path override (auto-detected when blank)', settings.basePath);
         const inAlbumHosts = mkField('album hosts (/d/ links, comma-separated)', (settings.albumHosts || []).join(', '));
         const save = mkBtn('Save', () => {
           const num = (v, def) => {
@@ -7210,5 +7388,5 @@
       })();
   }
 // UMD export of the pure functions for node:test (no DOM / GM usage in them).
-  if (typeof module !== 'undefined' && module.exports) module.exports = { parseReactionCount, filterLinks, sortPosts, estimateSize, partitionLinks, extractDomain, groupLinkItems, applyLinkFilters, boilerplateUrls, isSmilieUrl, parseEmbedPoster, embedSignUrl, parseSignResponse, parseSignToken, parseVideoPage, isVideoPageUrl, isFileDPageUrl, embedViewApiUrl, parseViewApiResponse, isAlbumPageUrl, parseAlbumPage, parseAlbumApiResponse, hqCandidates, sanitizeFileSeg, siteTagFromHost, cleanThreadTitle, zipKindTag, zipFileName, imagePageHref, parseImagePage, parseImageApiResponse, dlBasename, buildDlJobs, dlChunkPlan, dlFailClass, crc32, zipStoreU8, layoutMetrics, windowRange, originBurstingFromHist, hostKey, dosDateTime, fmtSpeed, fmtEta, buildMediaLayout, htmlToText, buildAiTranscript, aiMessages, aiEndpoint, aiOllamaOrigin, aiNativeChatUrl, aiContextStats, aiNumCtx, aiTranscriptBudget, aiQueryTerms, aiScorePost, aiSearchPosts, parseAiModels, parseAiReply, mdInlineTokens, mdParse, aiSseParser, repliesSearchUrl, parseRepliesPage, pairUnfurlPosters, albumHostMatches, gofileApiOrigin, gofileAccountsUrl, gofileContentsUrl, parseGofileAccounts, parseGofileContents };
+  if (typeof module !== 'undefined' && module.exports) module.exports = { parseReactionCount, filterLinks, sortPosts, estimateSize, partitionLinks, extractDomain, groupLinkItems, applyLinkFilters, boilerplateUrls, isSmilieUrl, parseEmbedPoster, embedSignUrl, parseSignResponse, parseSignToken, parseVideoPage, isVideoPageUrl, isFileDPageUrl, embedViewApiUrl, parseViewApiResponse, isAlbumPageUrl, parseAlbumPage, parseAlbumApiResponse, hqCandidates, sanitizeFileSeg, siteTagFromHost, cleanThreadTitle, zipKindTag, zipFileName, imagePageHref, parseImagePage, parseImageApiResponse, dlBasename, buildDlJobs, dlChunkPlan, dlFailClass, crc32, zipStoreU8, layoutMetrics, windowRange, originBurstingFromHist, hostKey, dosDateTime, fmtSpeed, fmtEta, buildMediaLayout, htmlToText, buildAiTranscript, aiMessages, aiEndpoint, aiOllamaOrigin, aiNativeChatUrl, aiContextStats, aiNumCtx, aiTranscriptBudget, aiQueryTerms, aiScorePost, aiSearchPosts, parseAiModels, parseAiReply, mdInlineTokens, mdParse, aiSseParser, repliesSearchUrl, parseRepliesPage, pairUnfurlPosters, albumHostMatches, gofileApiOrigin, gofileAccountsUrl, gofileContentsUrl, parseGofileAccounts, parseGofileContents, parseCyberdropFileAnchors, parseCyberdropFileinfo, parseCyberdropAuth };
 })();
