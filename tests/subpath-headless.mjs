@@ -156,6 +156,15 @@ async function main() {
       await sleep(400);
     }
     check('file-preview video attachments collected (3 of 3)', vids === 3, JSON.stringify(urls.filter((u) => u.indexOf('data/video') >= 0)));
+    // 0.27.1: file-preview anchors WRAP a thumb img — video tiles must show
+    // it as the poster (.xft-vtile img), no landing-page fetch involved
+    let pv = 0;
+    for (let i = 0; i < 30; i++) {
+      pv = await ev(cdp, `[...document.querySelectorAll('.xft-cell')].filter((c) => /\\/phpBB2\\/data\\/video\\/77\\/7[123]-/.test(c.dataset.xftUrl || '') && c.querySelectorAll('.xft-vtile img').length).length`);
+      if (pv === 3) break;
+      await sleep(400);
+    }
+    check('file-preview video tiles carry the wrapped thumb as poster', pv === 3, 'posters=' + pv);
     // no regression: plain bbWrapper images still collected
     check('bbWrapper images still collected', urls.some((u) => /\/img\/[12]\.png$/.test(u)), JSON.stringify(urls.filter((u) => u.indexOf('/img/') >= 0)));
   } finally {

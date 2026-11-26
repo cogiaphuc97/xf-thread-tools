@@ -125,12 +125,20 @@
       }
       // XF2 attachment blocks (.message-attachments) sit OUTSIDE .bbWrapper —
       // scan the whole article; video-file attachments go to Videos by extension
+      // file-preview anchors WRAP a thumb <img> (attachment servers render one
+      // even for videos — no og:image anywhere else): record it as the tile
+      // poster (same record.posters map the unfurl pairing feeds)
       art.querySelectorAll(SEL.attachment).forEach((a) => {
         if (skip(a)) return;
         const h = a.getAttribute('href') || '';
         if (!h) return;
         const abs = absolutize(h);
-        if (VID_EXT_RE.test(abs)) videos.push(abs);
+        if (VID_EXT_RE.test(abs)) {
+          videos.push(abs);
+          const im = a.querySelector('img[src]');
+          const s = im ? (im.getAttribute('src') || '') : '';
+          if (s && !/^(data|blob):/i.test(s)) (posters || (posters = {}))[abs] = absolutize(s);
+        }
         else images.push(abs);
       });
 
