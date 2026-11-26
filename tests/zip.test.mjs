@@ -115,10 +115,10 @@ test('dosDateTime: exact DOS bit-packing for a known date', () => {
 });
 
 test('partZipName: suffix only for multi-part runs, extension handled', () => {
-  assert.equal(partZipName('[Site] Thread (Images).zip', 1), '[Site] Thread (Images).part1.zip');
-  assert.equal(partZipName('[Site] Thread.zip', 12), '[Site] Thread.part12.zip');
-  assert.equal(partZipName('noext', 2), 'noext.part2.zip'); // missing .zip still suffixes
-  assert.equal(partZipName('UPPER.ZIP', 3), 'UPPER.part3.zip'); // case-insensitive strip
+  assert.equal(partZipName('[Site] Thread (Images).zip', 1), '[Site] Thread (Images).zip.001');
+  assert.equal(partZipName('[Site] Thread.zip', 12), '[Site] Thread.zip.012');
+  assert.equal(partZipName('noext', 2), 'noext.zip.002'); // missing .zip still suffixes
+  assert.equal(partZipName('UPPER.ZIP', 3), 'UPPER.zip.003'); // case-insensitive strip
 });
 
 test('safeOuterName: Unicode kept, illegals die, host:port colon underscored', () => {

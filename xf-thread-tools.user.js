@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         xf-thread-tools
 // @namespace    xf-thread-tools
-// @version      0.29.2
+// @version      0.29.3
 // @description  XenForo 2: sort thread posts by reaction count across all pages (cached) + floating media panel (images / external links).
 // @author       xf-thread-tools
 // @match        *://*/threads/*
@@ -954,7 +954,9 @@
   // an under-cap run never seals early and keeps the single-zip name exactly.
   function partZipName(base, n) {
     const s = String(base || '');
-    return (/\.zip$/i.test(s) ? s.slice(0, -4) : s) + '.part' + (n | 0) + '.zip';
+    // .zip.001 style (user ask 0.29.3): the standard split-archive suffix
+    // joiners recognize, zero-padded so filesystem sorts parts in order
+    return (/\.zip$/i.test(s) ? s.slice(0, -4) : s) + '.zip.' + String(n | 0).padStart(3, '0');
   }
   // Outer (download-attribute) name for album zips: Unicode + spaces stay
   // readable like zipFileName; filesystem-illegal characters die, and ':'
@@ -7277,6 +7279,13 @@
           '.xft-btn:hover{background:hsl(var(--xft-accent));color:hsl(var(--xft-accent-fg))}',
           '.xft-btn:focus-visible,#xft-edge-btn:focus-visible,.xft-cell:focus-visible,.xft-vthumb:focus-visible{outline:2px solid transparent;box-shadow:0 0 0 2px hsl(var(--xft-bg)),0 0 0 4px hsl(var(--xft-ring))}',
           '.xft-btn:disabled{opacity:.45;cursor:default;pointer-events:none}',
+          // 0.29.3: our own display rules (inline-flex on buttons, flex/grid on
+          // rows/bars) outrank the UA's [hidden]{display:none} — every element
+          // we toggle via el.hidden stayed VISIBLE (download Stop button never
+          // disappeared after a run). Scoped hard reset, !important against our
+          // own non-important display rules; matches only our namespaced
+          // elements so the host page is untouched.
+          '#xft-panel [hidden],#xft-viewer [hidden],#xft-edge-btn[hidden],[class^="xft-"][hidden],[class*=" xft-"][hidden]{display:none!important}',
           // fetch spinner (page-loading indicator)
           '.xft-spinner{display:inline-block;vertical-align:-1px;width:11px;height:11px;margin-right:4px;border:2px solid hsl(var(--xft-border));border-top-color:hsl(var(--xft-primary));border-radius:50%;animation:xft-rot .7s linear infinite}',
           '@keyframes xft-rot{to{transform:rotate(360deg)}}',

@@ -40,7 +40,9 @@ export function zipFileName(tag, title, kind) {
 // an under-cap run never seals early and keeps the single-zip name exactly.
 export function partZipName(base, n) {
   const s = String(base || '');
-  return (/\.zip$/i.test(s) ? s.slice(0, -4) : s) + '.part' + (n | 0) + '.zip';
+  // .zip.001 style (user ask 0.29.3): the standard split-archive suffix
+  // joiners recognize, zero-padded so filesystem sorts parts in order
+  return (/\.zip$/i.test(s) ? s.slice(0, -4) : s) + '.zip.' + String(n | 0).padStart(3, '0');
 }
 // Outer (download-attribute) name for album zips: Unicode + spaces stay
 // readable like zipFileName; filesystem-illegal characters die, and ':'

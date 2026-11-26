@@ -202,8 +202,14 @@ async function main() {
   const stats1 = await fx.stats();
 
   check('AC-DL-2: run completed, no truncation', /Saved/.test(statsText) && !/truncated/.test(statsText), JSON.stringify(statsText));
+  // 0.29.3: a finished run must hide the download-bar Stop and show ✕.
+  // COMPTED STYLE, not the hidden attribute: .xft-btn's own display rule
+  // defeats the attribute (the original bug — attribute-only asserts were
+  // false-green)
+  const dlEnd = await ev(cdp, `(() => { const v = (b) => b ? getComputedStyle(b).display !== 'none' : null; return { stop: v(document.querySelector('#xft-panel .xft-dlstop')), close: v(document.querySelector('#xft-panel .xft-dlclose')) }; })()`);
+  check('AC-UI-3: download Stop hidden + ✕ visible after run completes', dlEnd.stop === false && dlEnd.close === true, JSON.stringify(dlEnd));
   check('AC-DL-2: split into >=2 parts', saves1.length >= 2, 'saves=' + saves1.length);
-  check('AC-DL-2: part naming', saves1.length > 0 && saves1.every((s) => /\.part\d+\.zip$/.test(s.name)), (saves1[0] || {}).name + ' …');
+  check('AC-DL-2: part naming', saves1.length > 0 && saves1.every((s) => /\.zip\.\d{3}$/.test(s.name)), (saves1[0] || {}).name + ' …');
 
   // parse every saved part (bytes snapshotted at click time), union entries
   let parts1 = [];
