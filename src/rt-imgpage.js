@@ -72,11 +72,17 @@
         originCaps: originCaps
       };
     }
-    function imgNetUrgent(el) {
-      if (!el) return true; // no element = user-initiated fetch
-      if (!el.isConnected) return false; // recycled cell — ages out, never jumps the queue
+    // pick key for netPick (0.29.1): tier 0 user (no el), 1 visible, 2
+    // attached-by-layout-position, 3 detached-FIFO. rank = visual position
+    // (top*1e5 + left) so loading follows the CURRENT layout left-to-right,
+    // top-to-bottom — a mid-session re-sort re-ranks on the next pump
+    // because cells are pooled and their rects are re-read every pump
+    function imgNetKey(el, at) {
+      if (!el) return { tier: 0, rank: 0 };
+      if (!el.isConnected) return { tier: 3, rank: at };
       const r = el.getBoundingClientRect();
-      return r.bottom > -300 && r.top < (innerHeight || 1e9) + 300;
+      const vis = r.bottom > -300 && r.top < (innerHeight || 1e9) + 300;
+      return { tier: vis ? 1 : 2, rank: Math.round(r.top) * 1e5 + Math.round(r.left) };
     }
     let imgNetPumpQueued = false;
     function runImgPageNet(job, url, el) {
@@ -99,8 +105,8 @@
         if (!imgPageNet.queue.length) return;
         // pick-time truth, refreshed once per pump: nothing mutates the DOM
         // inside the burst loop, so one pass covers every start it makes
-        for (const j of imgPageNet.queue) j.urgent = imgNetUrgent(j.el);
-        const i = netPick(imgPageNet.queue, imgPageNet.active, imgPageNet.perOrigin, o, Date.now());
+        for (const j of imgPageNet.queue) { const k = imgNetKey(j.el, j.at); j.tier = k.tier; j.rank = k.rank; }
+        const i = netPick(imgPageNet.queue, imgPageNet.active, imgPageNet.perOrigin, o);
         if (i < 0) return;
         const job = imgPageNet.queue.splice(i, 1)[0];
         imgPageNet.active++; // slot reserved at schedule time

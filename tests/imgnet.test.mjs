@@ -3,68 +3,71 @@ import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { netPick } from '../src/imgnet.mjs';
 
-const job = (origin, at, urgent) => ({ origin: origin, at: at, urgent: !!urgent });
+// tier: 0 user (no el) / 1 visible / 2 attached / 3 detached; rank = visual
+// position for tiers 1-2, enqueue time for tier 3
+const job = (origin, at, tier, rank) => ({ origin: origin, at: at, tier: tier, rank: rank });
 
 test('netPick: -1 when the global cap is reached, regardless of queue contents', () => {
-  const q = [job('a.test', 0, true), job('b.test', 1, true)];
-  assert.equal(netPick(q, 12, {}, {}, 20000), -1); // active >= default global 12
-  assert.equal(netPick(q, 2, {}, { global: 2 }, 20000), -1); // explicit cap
+  const q = [job('a.test', 0, 0), job('b.test', 1, 1, 0)];
+  assert.equal(netPick(q, 12, {}, {}), -1); // active >= default global 12
+  assert.equal(netPick(q, 2, {}, { global: 2 }), -1); // explicit cap
 });
 
 test('netPick: skips a saturated origin and starts a later job from another origin', () => {
-  const q = [job('a.test', 0), job('a.test', 1), job('b.test', 2)];
-  // origin a has all 4 slots busy; the earliest b job still starts
-  assert.equal(netPick(q, 2, { 'a.test': 4 }, {}, 100), 2);
+  const q = [job('a.test', 0, 2, 100), job('a.test', 1, 2, 200), job('b.test', 2, 2, 300)];
+  // origin a has all 4 slots busy; the b job still starts
+  assert.equal(netPick(q, 2, { 'a.test': 4 }, {}), 2);
   // nothing eligible when every represented origin is saturated
-  assert.equal(netPick(q, 2, { 'a.test': 4, 'b.test': 4 }, {}, 100), -1);
+  assert.equal(netPick(q, 2, { 'a.test': 4, 'b.test': 4 }, {}), -1);
 });
 
-test('netPick: urgent job behind an earlier non-urgent job wins (visible-first)', () => {
-  const q = [job('a.test', 0), job('a.test', 1), job('a.test', 2, true)];
-  assert.equal(netPick(q, 0, {}, {}, 100), 2);
-});
-
-test('netPick: aged jobs promote to urgent (starvation bound)', () => {
-  const q = [job('a.test', 0), job('b.test', 1000)];
-  // at=0 aged past ageMs 500 -> urgent even though the later job is FIFO-first
-  assert.equal(netPick(q, 0, {}, { ageMs: 500 }, 1000), 0);
-  // nothing aged, nothing urgent -> FIFO
-  assert.equal(netPick(q, 0, {}, { ageMs: 500 }, 1200), 0);
-});
-
-test('netPick: FIFO fallback when no job is urgent; defaults apply for 0/undefined opts', () => {
-  const q = [job('a.test', 30), job('b.test', 10), job('a.test', 20)];
-  // earliest eligible job by QUEUE order (index 0), not by timestamp
-  assert.equal(netPick(q, 0, {}, {}, 100), 0);
-  assert.equal(netPick(q, 11, {}, {}, 100), 0); // active below default global 12
-  // perOrigin 0 -> default 4: a saturated, only the b job is startable
-  assert.equal(netPick(q, 2, { 'a.test': 4 }, { perOrigin: 0 }, 100), 1);
-});
-
-test('netPick: mixed field exercise — caps, urgency, aging, FIFO together', () => {
+test('netPick: tier order user(0) > visible(1) > attached(2) > detached(3)', () => {
   const q = [
-    job('cdn1.test', 0),        // 0: non-urgent, origin saturated
-    job('cdn1.test', 100),      // 1: non-urgent, origin saturated
-    job('cdn2.test', 200),      // 2: non-urgent, eligible
-    job('cdn3.test', 300, true) // 3: urgent, eligible
+    job('a.test', 30, 3, 30),  // detached, oldest
+    job('a.test', 20, 2, 500), // attached, low on screen
+    job('a.test', 10, 1, 900), // visible but visually LOWEST
+    job('a.test', 0, 0, 0)     // user-initiated
   ];
-  // urgent cdn3 beats eligible cdn2 even though cdn2 is earlier
-  assert.equal(netPick(q, 1, { 'cdn1.test': 4 }, {}, 1000), 3);
-  // late `now`: cdn1 jobs aged but still origin-blocked; cdn2 aged too ->
-  // first AGED eligible is cdn2 (index 2), still ahead of plain fallback
-  assert.equal(netPick(q, 1, { 'cdn1.test': 4 }, {}, 10400), 2);
+  assert.equal(netPick(q, 0, {}, {}), 3); // tier 0 wins despite being queued last
 });
 
-test('netPick: originCaps override throttles one origin, others keep the default', () => {
-  // penalized origin a capped at 2 while default stays 4: a 3rd in-flight
-  // a-job blocks the a head, so the later b job starts
-  const q = [job('a.test', 0), job('a.test', 1), job('b.test', 2)];
-  const caps = { 'a.test': 2 };
-  assert.equal(netPick(q, 2, { 'a.test': 2 }, { originCaps: caps }, 100), 2);
-  // every represented origin saturated under its own cap -> nothing startable
-  assert.equal(netPick(q, 2, { 'a.test': 2, 'b.test': 4 }, { originCaps: caps }, 100), -1);
-  // default cap still governs unlisted origins: 3 < 4 so b remains startable
-  assert.equal(netPick([job('b.test', 0)], 3, { 'b.test': 3 }, { originCaps: caps }, 100), 0);
-  // override 0 is not a valid cap -> the default 4 applies (a at 3 passes)
-  assert.equal(netPick(q, 3, { 'a.test': 3 }, { originCaps: { 'a.test': 0 } }, 100), 0);
+test('netPick: visible cells load top-left first (rank = top*1e5 + left)', () => {
+  const q = [
+    job('a.test', 0, 1, 400 * 1e5 + 300),  // visible, lower row
+    job('a.test', 1, 1, 400 * 1e5 + 100),  // same row, left cell
+    job('a.test', 2, 1, 100 * 1e5 + 900),  // top row, right cell
+    job('a.test', 3, 1, 100 * 1e5 + 100)   // top row, left cell — smallest rank
+  ];
+  assert.equal(netPick(q, 0, {}, {}), 3);
+  q.splice(3, 1);
+  assert.equal(netPick(q, 0, {}, {}), 2); // next: top row right
+  q.splice(2, 1);
+  assert.equal(netPick(q, 0, {}, {}), 1); // then lower row left-to-right
+});
+
+test('netPick: off-screen attached cells follow layout order (tier 2), not enqueue order', () => {
+  // the bottom-to-top report: enqueue order is REVERSED display order;
+  // tier-2 rank must still load top rows first
+  const q = [
+    job('a.test', 0, 2, 900 * 1e5 + 400), // bottom row (enqueued first under latest sort)
+    job('a.test', 1, 2, 500 * 1e5 + 400),
+    job('a.test', 2, 2, 100 * 1e5 + 400)  // top row
+  ];
+  assert.equal(netPick(q, 0, {}, {}), 2);
+});
+
+test('netPick: detached jobs FIFO by age once nothing else is startable', () => {
+  const q = [job('a.test', 50, 3, 50), job('a.test', 10, 3, 10)];
+  assert.equal(netPick(q, 0, {}, {}), 1); // earlier at first
+});
+
+test('netPick: jobs missing tier/rank default to detached-FIFO (legacy shape)', () => {
+  const q = [{ origin: 'a.test', at: 5 }, job('a.test', 9, 1, 0)];
+  assert.equal(netPick(q, 0, {}, {}), 1); // explicit visible beats legacy default
+});
+
+test('netPick: originCaps override shrinks a saturated origin', () => {
+  const q = [job('a.test', 0, 1, 0), job('b.test', 1, 2, 0)];
+  // a capped at 2 with 2 in flight -> b starts despite lower priority
+  assert.equal(netPick(q, 2, { 'a.test': 2 }, { originCaps: { 'a.test': 2 } }), 1);
 });

@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         xf-thread-tools
 // @namespace    xf-thread-tools
-// @version      0.29.0
+// @version      0.29.1
 // @description  XenForo 2: sort thread posts by reaction count across all pages (cached) + floating media panel (images / external links).
 // @author       xf-thread-tools
 // @match        *://*/threads/*
@@ -1638,13 +1638,27 @@
   }
   /* ==== pure module: imgnet ==== */
   // imgnet: pure scheduling math for the shared preview-net queue (imgPageNet).
-  // DOM-free on purpose: the runtime computes each job's `urgent` flag (no
-  // element = user-initiated fetch; element = connected + viewport-visible)
-  // and hands the queue here. The picker owns the three invariants that are
-  // easy to get wrong inline: per-origin politeness caps, visible-first pick
-  // order, and the aging bound that keeps off-screen jobs from starving.
+  // DOM-free on purpose: the runtime computes each job's pick key (element
+  // viewport state + visual position) and hands the queue here. The picker
+  // owns the invariants that are easy to get wrong inline: per-origin
+  // politeness caps and the tiered visible-first / layout-order pick.
   //
-  // Job shape (fields read here): { origin: string, at: number, urgent: boolean }
+  // Job shape (fields read here): { origin: string, at: number,
+  //   tier: number, rank: number }
+  // tier 0 = no element (user-initiated: viewer, downloads, landing pages)
+  // tier 1 = element connected AND inside viewport±300px — what the viewer
+  //          is looking at loads first
+  // tier 2 = element connected anywhere — picked by VISUAL position
+  //          (rank = top*1e5 + left), so off-screen rows follow the CURRENT
+  //          layout left-to-right, top-to-bottom; a mid-session re-sort
+  //          re-ranks automatically because the DOM is re-read every pump
+  // tier 3 = element detached (recycled cell) — FIFO by age, drains when
+  //          nothing else is startable
+  // The old aging-as-urgent escape is gone on purpose: on a long thread
+  // everything aged past 10s within the first minute, which flattened the
+  // queue back to enqueue order and starved the viewport (the bottom-to-top
+  // loading report). Detached jobs cannot starve: tiers 0-2 drain strictly
+  // before tier 3, and a re-attached cell jumps back to tier 1/2.
   
   // Next job index to start, or -1 when nothing is startable.
   //  - `active`      : jobs currently in flight, all origins combined
@@ -1655,26 +1669,30 @@
   //    (adaptive penalty: an origin that served failures runs 2-concurrent —
   //    some CDN families challenge bursts above 2 — while healthy origins
   //    keep the fast default; behavior-based, no hostnames)
-  //  - `opts.ageMs`  : queued this long => urgent (default 10000, starvation bound)
-  // Order: an eligible urgent job (flagged, or aged) beats any earlier
-  // non-urgent job; otherwise the earliest eligible job wins (FIFO).
-  // A job whose origin is saturated is skipped, never started.
-  function netPick(queue, active, perOrigin, opts, now) {
+  // Order: smallest (tier, rank, at) among startable jobs. A job whose
+  // origin is saturated is skipped, never started.
+  function netPick(queue, active, perOrigin, opts) {
     const o = opts || {};
     const global = o.global > 0 ? o.global | 0 : 12;
     const cap = o.perOrigin > 0 ? o.perOrigin | 0 : 4;
     const caps = o.originCaps || null;
-    const ageMs = o.ageMs > 0 ? o.ageMs : 10000;
     if (active >= global) return -1;
-    let fallback = -1;
+    let best = -1;
     for (let i = 0; i < queue.length; i++) {
       const j = queue[i];
       const c = caps && caps[j.origin] > 0 ? caps[j.origin] | 0 : cap;
       if ((perOrigin[j.origin] || 0) >= c) continue; // origin saturated — keep scanning
-      if (j.urgent || (now - (j.at || 0)) >= ageMs) return i; // visible/aged first
-      if (fallback < 0) fallback = i; // first startable non-urgent (FIFO)
+      if (best < 0) { best = i; continue; }
+      const b = queue[best];
+      const jt = j.tier == null ? 3 : j.tier;
+      const bt = b.tier == null ? 3 : b.tier;
+      if (jt !== bt) { if (jt < bt) best = i; continue; }
+      const jr = j.rank == null ? j.at : j.rank;
+      const br = b.rank == null ? b.at : b.rank;
+      if (jr !== br) { if (jr < br) best = i; continue; }
+      if ((j.at || 0) < (b.at || 0)) best = i;
     }
-    return fallback;
+    return best;
   }
   /* ==== pure module: replies ==== */
   // replies: pure helpers for the per-post replies lookup (0.25.0).
@@ -3333,11 +3351,17 @@
           originCaps: originCaps
         };
       }
-      function imgNetUrgent(el) {
-        if (!el) return true; // no element = user-initiated fetch
-        if (!el.isConnected) return false; // recycled cell — ages out, never jumps the queue
+      // pick key for netPick (0.29.1): tier 0 user (no el), 1 visible, 2
+      // attached-by-layout-position, 3 detached-FIFO. rank = visual position
+      // (top*1e5 + left) so loading follows the CURRENT layout left-to-right,
+      // top-to-bottom — a mid-session re-sort re-ranks on the next pump
+      // because cells are pooled and their rects are re-read every pump
+      function imgNetKey(el, at) {
+        if (!el) return { tier: 0, rank: 0 };
+        if (!el.isConnected) return { tier: 3, rank: at };
         const r = el.getBoundingClientRect();
-        return r.bottom > -300 && r.top < (innerHeight || 1e9) + 300;
+        const vis = r.bottom > -300 && r.top < (innerHeight || 1e9) + 300;
+        return { tier: vis ? 1 : 2, rank: Math.round(r.top) * 1e5 + Math.round(r.left) };
       }
       let imgNetPumpQueued = false;
       function runImgPageNet(job, url, el) {
@@ -3360,8 +3384,8 @@
           if (!imgPageNet.queue.length) return;
           // pick-time truth, refreshed once per pump: nothing mutates the DOM
           // inside the burst loop, so one pass covers every start it makes
-          for (const j of imgPageNet.queue) j.urgent = imgNetUrgent(j.el);
-          const i = netPick(imgPageNet.queue, imgPageNet.active, imgPageNet.perOrigin, o, Date.now());
+          for (const j of imgPageNet.queue) { const k = imgNetKey(j.el, j.at); j.tier = k.tier; j.rank = k.rank; }
+          const i = netPick(imgPageNet.queue, imgPageNet.active, imgPageNet.perOrigin, o);
           if (i < 0) return;
           const job = imgPageNet.queue.splice(i, 1)[0];
           imgPageNet.active++; // slot reserved at schedule time

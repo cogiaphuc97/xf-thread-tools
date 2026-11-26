@@ -14,7 +14,7 @@ const bundlePath = path.join(path.dirname(fileURLToPath(import.meta.url)), '..',
 test('bundle is a userscript with current version header', () => {
   const text = readFileSync(bundlePath, 'utf8');
   assert.ok(text.startsWith('// ==UserScript=='), 'meta header first');
-  assert.match(text, /@version\s+0\.29\.0/);
+  assert.match(text, /@version\s+0\.29\.1/);
   // 0.28.2: gofile albums default-on — the shipped default must carry the host
   assert.match(text, /albumHosts:\s*\['gofile\.io'\]/);
   assert.match(text, /@grant\s+GM_xmlhttpRequest/);
