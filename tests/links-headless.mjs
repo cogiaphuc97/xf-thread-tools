@@ -5,10 +5,11 @@
 // One post carries: a cross-host album link (repeated twice — dedup), a
 // cross-host /d/ file page, a cross-host image anchor, an ordinary external
 // link, plus anchors that must stay dropped (same-host, /members/, external
-// post- permalink, non-http). Proves AC-LK-1..4: re-routed media anchors
-// keep Links rows, drop rules survive, rows carry the author label, no URL
-// appears twice. Requires Chrome (headless) + the BUILT bundle. Not part of
-// npm test.
+// post- permalink, non-http). 0.28: two exit-gate anchors (text-unwrap and
+// t=v1 token-unwrap) must land as their REAL target rows. Proves AC-LK-1..4:
+// re-routed media anchors keep Links rows, drop rules survive, rows carry
+// the author label, no URL appears twice. Requires Chrome (headless) + the
+// BUILT bundle. Not part of npm test.
 import { spawn } from 'node:child_process';
 import { readFileSync, writeFileSync, mkdirSync } from 'node:fs';
 import { startFixtureServer } from './fixture-server.mjs';
@@ -97,6 +98,12 @@ async function main() {
   mkdirSync(TMP, { recursive: true });
   const fx = await startFixtureServer({
     pages: 1, perPage: 1,
+    // 0.28 exit-gate anchors: href = forum-internal interstitial, real
+    // target in the anchor text (XF autolink) or the t=v1 base64url token
+    richPosts: (n) => n === 1 ? (
+      '<a href="/external-link-exit/?t=v1.' + Buffer.from('https://ext.example/from-gate').toString('base64url') + '.9c24794ea3a02900" class="link link--external" rel="nofollow ugc noopener">https://ext.example/from-gate</a>' +
+      '<a href="/external-link-exit/?t=v1.' + Buffer.from('https://ext.example/from-token').toString('base64url') + '.9c24794ea3a02900" class="link link--external" rel="nofollow ugc noopener">download here</a>'
+    ) : null,
     imgUrl: (n, pageNo, albumOrigin) => n === 1 ? [
       albumOrigin + '/a/ab12',              // cross-host album -> Media + Links row
       albumOrigin + '/a/ab12',              // duplicate URL -> deduped to one row
@@ -168,13 +175,18 @@ async function main() {
   const dupes = [...counts.entries()].filter(([, c]) => c > 1);
   check('AC-LK-4: no URL appears twice', dupes.length === 0, JSON.stringify(dupes));
 
+  const gateRows = rows.filter((r) => /^https:\/\/ext\.example\/from-(gate|token)$/.test(r));
+  check('AC-LK-5: exit-gate anchors unwrap to real-target rows (text + token)', gateRows.length === 2, JSON.stringify(rows.filter((r) => /gate|token|exit/.test(r))));
+  const rawGates = rows.filter((r) => /external-link-exit/.test(r));
+  check('AC-LK-5: raw gate hrefs never appear as rows', rawGates.length === 0, JSON.stringify(rawGates));
+
   // ---- Album sub-tab (AC-AB-1/2) ---------------------------------------
   await ev(cdp, `[...document.querySelectorAll('#xft-panel .xft-tab')].find((b) => b.textContent === 'Media').click(); true`);
   await sleep(300);
   await ev(cdp, `[...document.querySelectorAll('#xft-panel .xft-subtab')].find((b) => /^Album/.test(b.textContent)).click(); true`);
   await sleep(1200); // children render + name parsed from the album page <title>
   const albumBtn = await ev(cdp, `(([...document.querySelectorAll('#xft-panel .xft-subtab')].find((b) => /^Album/.test(b.textContent))||{textContent:''}).textContent)`);
-  check('AC-AB-1: Album sub-tab shows the child count', /^Album 3/.test(albumBtn), JSON.stringify(albumBtn));
+  check('AC-AB-1: Album sub-tab badge = album count (0.26.3 semantics: containers, not items)', /^Album 1/.test(albumBtn), JSON.stringify(albumBtn));
   const heads = await ev(cdp, `[...document.querySelectorAll('#xft-panel .xft-ghead:not(.xft-gsub) .xft-glabel')].map((e) => e.textContent)`);
   const wantHead = '[127.0.0.1:' + fx.albumPort + '] - album  ·  3'; // fixture album page <title>album</title>
   check('AC-AB-2: group header = [host] - [name] + count', heads.length === 1 && heads[0] === wantHead, JSON.stringify(heads) + ' want=' + JSON.stringify(wantHead));

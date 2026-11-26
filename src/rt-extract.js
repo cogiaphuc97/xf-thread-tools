@@ -61,7 +61,12 @@
       const skip = (el) => !!((el.closest && (el.closest(SEL.quote) || el.closest(SEL.signature))));
       if (body) {
         body.querySelectorAll('a[href]').forEach((a) => {
-          if (!skip(a)) rawLinks.push(a.getAttribute('href') || '');
+          if (skip(a)) return;
+          const href = a.getAttribute('href') || '';
+          // forum "exit gate" anchors: unwrap the real target from the text
+          // or the t=v1 token before classification — rawLinks feed link
+          // rows, media reclassification, and album routing alike
+          rawLinks.push(unwrapExitLink(href, a.textContent, location.origin) || href);
         });
         body.querySelectorAll(SEL.image).forEach((im) => {
           if (skip(im)) return;

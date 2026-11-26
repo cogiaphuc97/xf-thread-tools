@@ -1,7 +1,7 @@
 // Unit tests for the media module (src/media.mjs). Regrouped to mirror the src/ split.
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { albumDisplayName, albumHostMatches, boilerplateUrls, gofileAccountsUrl, gofileApiOrigin, gofileContentsUrl, hqCandidates, imagePageHref, isAlbumPageUrl, isSmilieUrl, pairUnfurlPosters, parseAlbumApiResponse, parseAlbumPage, parseAlbumTitle, parseCyberdropAuth, parseCyberdropFileAnchors, parseCyberdropFileinfo, parseGofileAccounts, parseGofileContents, parseImageApiResponse, parseImagePage } from '../src/media.mjs';
+import { albumDisplayName, albumHostMatches, boilerplateUrls, gofileAccountsUrl, gofileApiOrigin, gofileContentsUrl, hqCandidates, imagePageHref, isAlbumPageUrl, isSmilieUrl, pairUnfurlPosters, parseAlbumApiResponse, parseAlbumPage, parseAlbumTitle, parseCyberdropAuth, parseCyberdropFileAnchors, parseCyberdropFileinfo, parseGofileAccounts, parseGofileContents, parseImageApiResponse, parseImagePage, unwrapExitLink } from '../src/media.mjs';
 
 
 // ---- boilerplateUrls (signature / "sent via app" footer fingerprint) ----
@@ -346,6 +346,27 @@ test('parseGofileAccounts / parseGofileContents', () => {
   assert.equal(parseGofileContents('{"status":"ok","data":{}}'), null); // data without children keys later? data exists, children missing -> {children:[],name:''}
   const empty = parseGofileContents('{"status":"ok","data":{"children":{}}}');
   assert.deepEqual(empty, { children: [], name: '' }); // resolved-empty album
+});
+
+// ---- unwrapExitLink (forum external-link gates, 0.28) ----
+test('unwrapExitLink: anchor TEXT is the target (XF autolink shape)', () => {
+  assert.equal(unwrapExitLink('/phpBB2/external-link-exit/?t=v1.whatever.sig', 'https://gofile.io/d/3jrpC7', 'https://forum.example'), 'https://gofile.io/d/3jrpC7');
+  assert.equal(unwrapExitLink('/exit/', '  https://ext.example/x  ', 'https://forum.example'), 'https://ext.example/x'); // whitespace-trimmed
+});
+test('unwrapExitLink: t=v1 base64url token (caption text, no URL)', () => {
+  const tok = Buffer.from('https://gofile.io/d/3jrpC7').toString('base64url');
+  assert.equal(unwrapExitLink('https://forum.example/external-link-exit/?t=v1.' + tok + '.9c24794ea3a02900', 'download here', 'https://forum.example'), 'https://gofile.io/d/3jrpC7');
+  assert.equal(unwrapExitLink('https://forum.example/exit/?t=v1.####.x', 'download here', 'https://forum.example'), ''); // malformed token
+});
+test('unwrapExitLink: generic url=-style gate params', () => {
+  assert.equal(unwrapExitLink('/redirect/?url=' + encodeURIComponent('https://ext.example/r'), 'r', 'https://forum.example'), 'https://ext.example/r');
+  assert.equal(unwrapExitLink('/away/?to=https%3A%2F%2Fext.example%2Ft', 't', 'https://forum.example'), 'https://ext.example/t');
+});
+test('unwrapExitLink: keeps plain / same-host / non-gate anchors', () => {
+  assert.equal(unwrapExitLink('https://ext.example/page', 'https://ext.example/page', 'https://forum.example'), ''); // href already external: not a gate
+  assert.equal(unwrapExitLink('/threads/777/', 'https://forum.example/threads/777/', 'https://forum.example'), ''); // text same host
+  assert.equal(unwrapExitLink('/attachments/a-b.jpg', 'pic.jpg', 'https://forum.example'), ''); // no URL text, no token
+  assert.equal(unwrapExitLink('not a url', 'nope', 'https://forum.example'), ''); // unparseable href
 });
 
 // ---- cyberdrop-shaped albums (0.27) ----

@@ -108,6 +108,41 @@ export function hqCandidates(url) {
   cands.push(url);
   return cands;
 }
+// Forum "external link exit" gates: the href points back at the forum
+// itself (an interstitial the addon serves) while the real target is the
+// anchor's visible text (XF autolinks render the full URL) or a base64url
+// token in a t=v1.<b64>.<sig> query param. Shape-based — no gate path or
+// hostname is matched, so it works for any forum running such a gate.
+// Returns the unwrapped absolute URL, or '' when nothing unwrap-safe was
+// found (caller keeps the raw href).
+export function unwrapExitLink(href, text, forumOrigin) {
+  const h = String(href || '');
+  const t = String(text || '').trim();
+  let u = null;
+  try { u = new URL(h, forumOrigin); } catch (e) { return ''; }
+  if (u.origin !== forumOrigin) return ''; // only forum-internal hrefs are gates
+  if (/^https?:\/\/\S+$/i.test(t)) {
+    try { if (new URL(t).origin !== forumOrigin) return t; } catch (e) { /* text not a parseable URL */ }
+  }
+  const tok = u.searchParams.get('t') || '';
+  const b = tok.match(/^v1\.([A-Za-z0-9_-]+)\./);
+  if (b) {
+    try {
+      const pad = '='.repeat((4 - (b[1].length % 4)) % 4);
+      const d = atob(b[1].replace(/-/g, '+').replace(/_/g, '/') + pad);
+      if (/^https?:\/\//i.test(d)) return d;
+    } catch (e) { /* malformed token */ }
+  }
+  // other redirect-gate families: plain absolute-URL query params
+  for (const k of ['url', 'u', 'to', 'target', 'link']) {
+    const v = u.searchParams.get(k) || '';
+    if (/^https?:\/\//i.test(v)) {
+      try { if (new URL(v).origin !== forumOrigin) return v; } catch (e) { /* skip */ }
+    }
+  }
+  return '';
+}
+
 // Album pages (path /a/<id>): hosts that group many files behind one
 // landing page. The id charset allows dots — XF-style keys are
 // `<slug>.<id>` (e.g. /a/some-model-album-pics.3tkY1 — shape from a
